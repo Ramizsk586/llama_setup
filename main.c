@@ -35,9 +35,9 @@
 /* ──────────────────────────────────────────────
    Layout Constants (Compact Style)
    ────────────────────────────────────────────── */
-#define APP_W       680
-#define APP_H       520
-#define CARD_MAX_W  540
+#define APP_W       740
+#define APP_H       550
+#define CARD_MAX_W  600
 #define HEADER_H    70
 #define FOOTER_H    20
 #define PAD         12
@@ -75,11 +75,11 @@ static int  nLastDetectedGpu = -1;       // Store last auto-detected value
    ────────────────────────────────────────────── */
 static HWND hServerEdit, hFolderEdit, hModelCombo;
 static HWND hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit;
-static HWND hServerTypeCombo;
+static HWND hServerTypeCombo, hCommandTypeCombo;
 static HWND hOutputEdit;
 static HWND hBtnServer, hBtnFolder, hBtnPrev, hBtnNext, hBtnGenerate, hBtnCopy;
 // NEW: Static controls for labels so they align perfectly
-static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads, hLblServerType;
+static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads, hLblServerType, hLblCommandType;
 
 /* ──────────────────────────────────────────────
    GDI resources
@@ -291,6 +291,7 @@ static void ShowOnlyOnPage(HWND hwnd)
     ShowWindow(hPortEdit,      SW_SHOW);
     ShowWindow(hThreadsEdit,   SW_SHOW);
     ShowWindow(hServerTypeCombo, SW_SHOW);
+    ShowWindow(hCommandTypeCombo, SW_SHOW);
     ShowWindow(hLblServer,     SW_SHOW);
     ShowWindow(hLblFolder,     SW_SHOW);
     ShowWindow(hLblModel,      SW_SHOW);
@@ -299,6 +300,7 @@ static void ShowOnlyOnPage(HWND hwnd)
     ShowWindow(hLblPort,       SW_SHOW);
     ShowWindow(hLblThreads,    SW_SHOW);
     ShowWindow(hLblServerType, SW_SHOW);
+    ShowWindow(hLblCommandType, SW_SHOW);
     
     ShowWindow(hOutputEdit,    SW_HIDE);
     ShowWindow(hBtnGenerate,   SW_HIDE);
@@ -387,6 +389,28 @@ static void SelectFolder(HWND hwnd)
     CoTaskMemFree(pidl);
 }
 
+/* Derive CLI executable path from server path */
+static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int cliPathLen)
+{
+    if (!serverPath || !cliPath || cliPathLen <= 0) {
+        if (cliPath && cliPathLen > 0) cliPath[0] = '\0';
+        return;
+    }
+
+    /* Copy server path */
+    lstrcpynA(cliPath, serverPath, cliPathLen);
+    
+    /* Find the last backslash */
+    char *lastSlash = strrchr(cliPath, '\\');
+    if (lastSlash) {
+        /* Replace filename with llama-cli.exe */
+        lstrcpynA(lastSlash + 1, "llama-cli.exe", cliPathLen - (int)(lastSlash - cliPath + 1));
+    } else {
+        /* No path, just replace with llama-cli.exe */
+        lstrcpynA(cliPath, "llama-cli.exe", cliPathLen);
+    }
+}
+
 static void GenerateCommand(HWND hwnd)
 {
     int idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
@@ -394,6 +418,10 @@ static void GenerateCommand(HWND hwnd)
         MessageBoxA(hwnd, "No model selected. Browse a model folder first.", "Error", MB_ICONERROR);
         return;
     }
+
+    /* Get command type: Server or CLI */
+    int cmdTypeIdx = (int)SendMessageA(hCommandTypeCombo, CB_GETCURSEL, 0, 0);
+    int isCliMode = (cmdTypeIdx == 1);  /* Index 1 = CLI (Server is 0) */
 
     int serverTypeIdx = (int)SendMessageA(hServerTypeCombo, CB_GETCURSEL, 0, 0);
     char serverType[64] = {0};
@@ -421,21 +449,38 @@ static void GenerateCommand(HWND hwnd)
         return;
     }
 
-    // Determine host based on server type
-    const char *host = (serverTypeIdx == 1) ? "0.0.0.0" : "127.0.0.1";
+    if (isCliMode) {
+        /* Generate llama-cli command */
+        char cliPath[MAX_PATH] = {0};
+        GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
 
-    snprintf(
-        sCommand, sizeof(sCommand),
-        "& \"%s\" -m \"%s\\%s\" -c %s -ngl %s --port %s -t %s --host %s",
-        sServer,
-        sFolder,
-        model,
-        ctx[0] ? ctx : "2048",
-        gpu[0] ? gpu : "-1",
-        port[0] ? port : "8000",
-        threads[0] ? threads : "4",
-        host
-    );
+        snprintf(
+            sCommand, sizeof(sCommand),
+            "& \"%s\" -m \"%s\\%s\" -c %s -ngl %s -t %s -color auto",
+            cliPath,
+            sFolder,
+            model,
+            ctx[0] ? ctx : "2048",
+            gpu[0] ? gpu : "-1",
+            threads[0] ? threads : "4"
+        );
+    } else {
+        /* Generate llama-server command (original behavior) */
+        const char *host = (serverTypeIdx == 1) ? "0.0.0.0" : "127.0.0.1";
+
+        snprintf(
+            sCommand, sizeof(sCommand),
+            "& \"%s\" -m \"%s\\%s\" -c %s -ngl %s --port %s -t %s --host %s",
+            sServer,
+            sFolder,
+            model,
+            ctx[0] ? ctx : "2048",
+            gpu[0] ? gpu : "-1",
+            port[0] ? port : "8000",
+            threads[0] ? threads : "4",
+            host
+        );
+    }
 
     CopyToClipboardA(hwnd, sCommand);
     MessageBoxA(hwnd, "Command copied to clipboard successfully!", "Success", MB_OK | MB_ICONINFORMATION);
@@ -518,6 +563,12 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(hServerTypeCombo, innerX, y, innerW, 100, TRUE);
     y += rowH + gapY + 4;
 
+    // Command Type (Server vs CLI)
+    MoveWindow(hLblCommandType, innerX, y, innerW, labelH, TRUE);
+    y += labelH + 2;
+    MoveWindow(hCommandTypeCombo, innerX, y, innerW, 100, TRUE);
+    y += rowH + gapY + 4;
+
     // Server Executable
     MoveWindow(hLblServer, innerX, y, innerW, labelH, TRUE);
     y += labelH + 2;
@@ -558,9 +609,9 @@ static void LayoutControls(HWND hwnd)
     // Right column: Threads (at same y level)
     MoveWindow(hLblThreads, rightColX, y - labelH - 2, colW, labelH, TRUE);
     MoveWindow(hThreadsEdit, rightColX, y, colW, rowH, TRUE);
-    y += rowH + 8;
+    y += rowH + 20;
 
-    // Generate button - positioned tightly
+    // Generate button - positioned with more spacing
     MoveWindow(hBtnNext, innerX, y, innerW, 32, TRUE);
 }
 
@@ -595,6 +646,7 @@ static void CreateControls(HWND hwnd)
 
     // Labels
     hLblServerType = CreateWindowA("STATIC", "Server Type", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblCommandType = CreateWindowA("STATIC", "Command Type", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblServer = CreateWindowA("STATIC", "Server Executable File", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblFolder = CreateWindowA("STATIC", "Models Directory", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblModel  = CreateWindowA("STATIC", "Target Model", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
@@ -610,6 +662,14 @@ static void CreateControls(HWND hwnd)
     SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Local - same device only");
     SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"LAN/IP - same Wi-Fi network");
     SendMessageA(hServerTypeCombo, CB_SETCURSEL, 0, 0);
+
+    // Command Type Combo
+    hCommandTypeCombo = CreateWindowA("COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
+        0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    SendMessageA(hCommandTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Llama Server");
+    SendMessageA(hCommandTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Llama CLI");
+    SendMessageA(hCommandTypeCombo, CB_SETCURSEL, 0, 0);
 
     // Inputs
     hServerEdit = CreateWindowA("EDIT", "",
@@ -670,10 +730,10 @@ static void CreateControls(HWND hwnd)
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_COPY, hi, NULL);
 
     // Apply Fonts
-    HWND ctrls[] = { hServerTypeCombo, hServerEdit, hFolderEdit, hModelCombo, hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit, hOutputEdit };
+    HWND ctrls[] = { hServerTypeCombo, hCommandTypeCombo, hServerEdit, hFolderEdit, hModelCombo, hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit, hOutputEdit };
     for (int i = 0; i < (int)(sizeof(ctrls) / sizeof(ctrls[0])); i++) SetCtlFont(ctrls[i], hFontBody);
 
-    HWND labels[] = { hLblServerType, hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads };
+    HWND labels[] = { hLblServerType, hLblCommandType, hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads };
     for (int i = 0; i < (int)(sizeof(labels) / sizeof(labels[0])); i++) SetCtlFont(labels[i], hFontLabel);
 
     SetCtlFont(hBtnServer, hFontBody);
@@ -832,7 +892,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HWND hCtl = (HWND)lp;
 
             // Labels inside the card get the Panel background color
-            if (hCtl == hLblServerType || hCtl == hLblServer || hCtl == hLblFolder || hCtl == hLblModel || hCtl == hLblCtx || 
+            if (hCtl == hLblServerType || hCtl == hLblCommandType || hCtl == hLblServer || hCtl == hLblFolder || hCtl == hLblModel || hCtl == hLblCtx || 
                 hCtl == hLblGpu || hCtl == hLblPort || hCtl == hLblThreads) {
                 SetTextColor(hdc, C_MUTED);
                 SetBkColor(hdc, C_PANEL);
