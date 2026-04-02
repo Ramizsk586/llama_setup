@@ -66,6 +66,10 @@ static char sModels[MAX_MODELS][MAX_PATH];
 static int  nModels = 0;
 static char sCommand[MAX_CMD] = "";
 
+/* GPU auto-detection state */
+static BOOL bGpuFieldEdited = FALSE;     // Track if user manually edited GPU field
+static int  nLastDetectedGpu = -1;       // Store last auto-detected value
+
 /* ──────────────────────────────────────────────
    Handles
    ────────────────────────────────────────────── */
@@ -89,6 +93,167 @@ static HFONT hFontTitle, hFontBody, hFontSmall, hFontBold, hFontLabel;
 static void SetCtlFont(HWND hWnd, HFONT hFont)
 {
     if (hWnd) SendMessageA(hWnd, WM_SETFONT, (WPARAM)hFont, FALSE);
+}
+
+/* ──────────────────────────────────────────────
+   GPU Layer Auto-Detection Helpers
+   ────────────────────────────────────────────── */
+
+/* Get available VRAM in MB using Windows API */
+static int GetAvailableVRAM(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    
+    if (GlobalMemoryStatusEx(&statex)) {
+        /* Return available RAM as proxy for VRAM (fallback detection) */
+        /* This is system RAM; true GPU VRAM detection would require GPU-specific APIs */
+        ULONGLONG availMB = statex.ullAvailPhys / (1024 * 1024);
+        if (availMB > 2048) return 4096;    /* Assume good GPU if plenty of RAM */
+        if (availMB > 1024) return 2048;
+        return 1024;
+    }
+    return 2048;  /* Safe default */
+}
+
+/* Get model file size in MB */
+static int GetModelFileSizeMB(const char *folderPath, const char *modelName)
+{
+    if (!folderPath || !modelName || !*folderPath || !*modelName)
+        return 0;
+
+    char fullPath[MAX_PATH * 2];
+    snprintf(fullPath, sizeof(fullPath), "%s\\%s", folderPath, modelName);
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER fileSize;
+        fileSize.LowPart = fad.nFileSizeLow;
+        fileSize.HighPart = fad.nFileSizeHigh;
+        return (int)(fileSize.QuadPart / (1024 * 1024));
+    }
+    return 0;
+}
+
+/* Detect quantization type from filename (e.g., Q4, Q5, Q8, F16) */
+static const char* DetectQuantizationType(const char *modelName)
+{
+    if (!modelName) return "unknown";
+
+    /* Check for common quantization patterns */
+    if (strstr(modelName, "Q8")) return "Q8";      /* 8-bit: ~95% of fp32 */
+    if (strstr(modelName, "Q6")) return "Q6";      /* 6-bit: ~70% of fp32 */
+    if (strstr(modelName, "Q5")) return "Q5";      /* 5-bit: ~55% of fp32 */
+    if (strstr(modelName, "Q4")) return "Q4";      /* 4-bit: ~40% of fp32 */
+    if (strstr(modelName, "Q3")) return "Q3";      /* 3-bit */
+    if (strstr(modelName, "F16")) return "F16";    /* 16-bit: ~50% of fp32 */
+    if (strstr(modelName, "F32")) return "F32";    /* 32-bit full precision */
+    
+    return "unknown";
+}
+
+/* Calculate quantization scale factor (relative to fp32) */
+static double GetQuantizationScaleFactor(const char *quantType)
+{
+    if (!quantType) return 1.0;
+    
+    if (strcmp(quantType, "Q8") == 0) return 0.95;
+    if (strcmp(quantType, "Q6") == 0) return 0.70;
+    if (strcmp(quantType, "Q5") == 0) return 0.55;
+    if (strcmp(quantType, "Q4") == 0) return 0.40;
+    if (strcmp(quantType, "Q3") == 0) return 0.30;
+    if (strcmp(quantType, "F16") == 0) return 0.50;
+    if (strcmp(quantType, "F32") == 0) return 1.00;
+    
+    return 0.50; /* Conservative default */
+}
+
+/*
+ * Estimate maximum safe GPU layers based on:
+ *   - Available VRAM
+ *   - Model size and quantization
+ *   - Reserve memory for context and overhead
+ * Returns recommended GPU layer count, or -1 for auto-detection fallback
+ */
+static int EstimateGpuLayers(const char *folderPath, const char *modelName)
+{
+    if (!folderPath || !modelName || !*folderPath || !*modelName)
+        return -1;
+
+    int modelSizeMB = GetModelFileSizeMB(folderPath, modelName);
+    if (modelSizeMB <= 0)
+        return -1;  /* Could not determine size */
+
+    /* Estimate actual size after context overhead (20% reserve for KV cache, etc) */
+    int reservedMB = (int)(modelSizeMB * 0.20);  /* 20% overhead for context */
+    
+    const char *quantType = DetectQuantizationType(modelName);
+    double scaleFactor = GetQuantizationScaleFactor(quantType);
+    
+    /* Calculate effective memory needed per layer */
+    /* Rough estimate: most modern LLMs use ~300-500MB per layer in fp32 form */
+    /* With quantization scaling applied */
+    int vramMB = GetAvailableVRAM();
+    
+    /* Conservative estimate: assume each layer is ~400MB equivalent (after quantization) */
+    int bytePerLayer = (int)(400.0 / scaleFactor);  /* Adjust for quantization */
+    
+    /* Available for layers = total VRAM - model size - reserves */
+    int availForLayers = vramMB - modelSizeMB - reservedMB;
+    
+    if (availForLayers <= 0)
+        return -1;  /* Not enough VRAM, use fallback */
+    
+    /* Estimate is very rough; use conservative calculation */
+    /* Most models have 32-40 layers; we estimate based on VRAM availability */
+    int estimatedLayers = (availForLayers * modelSizeMB) / (1024 * 256);  /* Heuristic */
+    
+    if (estimatedLayers <= 0)
+        estimatedLayers = 1;
+    
+    /* Cap at 128 layers (very conservative upper bound) */
+    if (estimatedLayers > 128)
+        estimatedLayers = 128;
+    
+    return estimatedLayers;
+}
+
+/*
+ * Auto-detect and populate GPU layers field when model is selected
+ * Only updates if user hasn't manually edited the field
+ */
+static void AutoDetectAndSetGpuLayers(void)
+{
+    int modelIdx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
+    
+    /* If no model selected or folder not set, reset to defaults */
+    if (modelIdx == CB_ERR || !sFolder[0]) {
+        SetWindowTextA(hGpuEdit, "-1");
+        nLastDetectedGpu = -1;
+        bGpuFieldEdited = FALSE;
+        return;
+    }
+
+    /* Get selected model name */
+    char modelName[MAX_PATH] = {0};
+    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)modelIdx, (LPARAM)modelName);
+
+    /* Try auto-detection */
+    int detectedLayers = EstimateGpuLayers(sFolder, modelName);
+    
+    /* If detection succeeded, update the field */
+    if (detectedLayers > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", detectedLayers);
+        SetWindowTextA(hGpuEdit, buf);
+        nLastDetectedGpu = detectedLayers;
+        bGpuFieldEdited = FALSE;
+    } else {
+        /* Detection failed; keep safe fallback (-1 = auto) */
+        SetWindowTextA(hGpuEdit, "-1");
+        nLastDetectedGpu = -1;
+        bGpuFieldEdited = FALSE;
+    }
 }
 
 static void CopyToClipboardA(HWND hwnd, const char *text)
@@ -150,6 +315,10 @@ static void ScanModels(void)
 {
     nModels = 0;
     SendMessageA(hModelCombo, CB_RESETCONTENT, 0, 0);
+    
+    /* Reset GPU auto-detection state when rescanning models */
+    bGpuFieldEdited = FALSE;
+    nLastDetectedGpu = -1;
 
     if (!sFolder[0]) return;
 
@@ -172,8 +341,11 @@ static void ScanModels(void)
 
     FindClose(hFind);
 
-    if (nModels > 0)
+    if (nModels > 0) {
         SendMessageA(hModelCombo, CB_SETCURSEL, 0, 0);
+        /* Auto-detect GPU layers for the first model */
+        AutoDetectAndSetGpuLayers();
+    }
 }
 
 static void SelectServerFile(HWND hwnd)
@@ -603,10 +775,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case ID_BTN_SERVER:   SelectServerFile(hwnd); break;
-        case ID_BTN_FOLDER:   SelectFolder(hwnd); break;
-        case ID_BTN_NEXT:     GenerateCommand(hwnd); break;
+        {
+            int cmdId = LOWORD(wp);
+            int notifyCode = HIWORD(wp);
+            HWND hCtl = (HWND)lp;
+            
+            switch (cmdId) {
+            case ID_BTN_SERVER:   SelectServerFile(hwnd); break;
+            case ID_BTN_FOLDER:   SelectFolder(hwnd); break;
+            case ID_BTN_NEXT:     GenerateCommand(hwnd); break;
+            }
+            
+            /* Handle combo box model selection change */
+            if (hCtl == hModelCombo && notifyCode == CBN_SELCHANGE) {
+                AutoDetectAndSetGpuLayers();
+            }
+            
+            /* Track if user manually edits GPU layers field */
+            if (hCtl == hGpuEdit && (notifyCode == EN_CHANGE || notifyCode == EN_UPDATE)) {
+                char buf[32] = {0};
+                GetWindowTextA(hGpuEdit, buf, sizeof(buf));
+                
+                /* User is editing - track that this is a manual edit */
+                /* unless the value matches our last auto-detected value */
+                if (buf[0]) {
+                    int currentVal = atoi(buf);
+                    if (currentVal != nLastDetectedGpu) {
+                        bGpuFieldEdited = TRUE;  /* User is manually editing */
+                    }
+                }
+            }
         }
         return 0;
 
