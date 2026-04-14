@@ -11,8 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <conio.h>
+#include <wininet.h>
 
 #define IDI_ICON1 101
+#define VALORA_APP_DIR "Valora"
+#define VALORA_CONFIG_NAME "config.ini"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -20,25 +24,26 @@
 /* ──────────────────────────────────────────────
    Modern Dark Theme Colors (OpenWebUI Style)
    ────────────────────────────────────────────── */
-#define C_BG        RGB(20, 20, 20)      // App background - darker
-#define C_PANEL     RGB(32, 32, 32)      // Card background
-#define C_PANEL2    RGB(45, 45, 45)      // Button hover/secondary
-#define C_BORDER    RGB(55, 55, 55)      // Subtle borders
-#define C_ACCENT    RGB(0, 180, 180)     // Teal/Cyan Primary (OpenWebUI style)
-#define C_ACCENT2   RGB(0, 200, 200)     // Teal Hover
-#define C_TEXT      RGB(240, 240, 240)   // Main text
-#define C_MUTED     RGB(140, 140, 140)   // Labels and subtext
-#define C_INPUT     RGB(40, 40, 40)      // Input boxes - darker
-#define C_INPUT_BORDER RGB(70, 70, 70)   // Input border
-#define C_SUCCESS   RGB(34, 197, 94)     // Green for status
+#define C_BG        RGB(15, 18, 24)
+#define C_PANEL     RGB(24, 28, 36)
+#define C_PANEL2    RGB(38, 44, 54)
+#define C_BORDER    RGB(58, 66, 79)
+#define C_ACCENT    RGB(35, 184, 190)
+#define C_ACCENT2   RGB(67, 208, 214)
+#define C_ACCENT_SOFT RGB(24, 86, 98)
+#define C_TEXT      RGB(244, 247, 251)
+#define C_MUTED     RGB(160, 171, 188)
+#define C_INPUT     RGB(19, 23, 31)
+#define C_INPUT_BORDER RGB(83, 94, 110)
+#define C_SUCCESS   RGB(34, 197, 94)
 
 /* ──────────────────────────────────────────────
    Layout Constants (Compact Style)
    ────────────────────────────────────────────── */
-#define APP_W       740
-#define APP_H       550
-#define CARD_MAX_W  600
-#define HEADER_H    70
+#define APP_W       820
+#define APP_H       620
+#define CARD_MAX_W  660
+#define HEADER_H    88
 #define FOOTER_H    20
 #define PAD         12
 
@@ -62,9 +67,12 @@ enum {
    ────────────────────────────────────────────── */
 static char sServer[MAX_PATH] = "";
 static char sFolder[MAX_PATH] = "";
+static char sSelectedModel[MAX_PATH] = "";
 static char sModels[MAX_MODELS][MAX_PATH];
 static int  nModels = 0;
 static char sCommand[MAX_CMD] = "";
+static char sConfigPath[MAX_PATH] = "";
+static int  nServerType = 0;
 
 /* GPU auto-detection state */
 static BOOL bGpuFieldEdited = FALSE;     // Track if user manually edited GPU field
@@ -87,6 +95,18 @@ static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblT
 static HBRUSH brBg, brPanel, brPanel2, brInput;
 static HFONT hFontTitle, hFontBody, hFontSmall, hFontBold, hFontLabel;
 
+static void ScanModels(void);
+static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int cliPathLen);
+static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen);
+static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *gpu, int gpuLen, char *threads, int threadsLen);
+static BOOL HasModelConfig(const char *modelName);
+static BOOL NormalizeHuggingFaceRepo(const char *input, char *repo, int repoLen);
+static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen);
+static int EnsureModelsFolderReady(void);
+
+/* HuggingFace model download */
+static int DownloadFromHuggingFace(const char *hfUrl);
+
 /* ──────────────────────────────────────────────
    Utility
    ────────────────────────────────────────────── */
@@ -95,35 +115,281 @@ static void SetCtlFont(HWND hWnd, HFONT hFont)
     if (hWnd) SendMessageA(hWnd, WM_SETFONT, (WPARAM)hFont, FALSE);
 }
 
-/* ──────────────────────────────────────────────
-   GPU Layer Auto-Detection Helpers
-   ────────────────────────────────────────────── */
+static void AttachConsoleStreams(void)
+{
+    FILE *dummy;
 
-/* Get available VRAM in MB using Windows API */
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (!AllocConsole())
+            return;
+    }
+
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
+    freopen_s(&dummy, "CONOUT$", "w", stderr);
+    freopen_s(&dummy, "CONIN$", "r", stdin);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+static void OpenOwnedConsole(const char *title)
+{
+    FreeConsole();
+    if (!AllocConsole())
+        return;
+
+    if (title && *title)
+        SetConsoleTitleA(title);
+
+    AttachConsoleStreams();
+}
+
+static void HideStandaloneConsoleWindow(void)
+{
+    DWORD processList[4];
+    DWORD processCount;
+    HWND consoleHwnd;
+
+    consoleHwnd = GetConsoleWindow();
+    if (!consoleHwnd)
+        return;
+
+    processCount = GetConsoleProcessList(processList, (DWORD)(sizeof(processList) / sizeof(processList[0])));
+    if (processCount <= 1)
+        ShowWindow(consoleHwnd, SW_HIDE);
+}
+
+static BOOL FileExistsA_(const char *path)
+{
+    DWORD attrs;
+
+    if (!path || !*path)
+        return FALSE;
+
+    attrs = GetFileAttributesA(path);
+    return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL DirectoryExistsA_(const char *path)
+{
+    DWORD attrs;
+
+    if (!path || !*path)
+        return FALSE;
+
+    attrs = GetFileAttributesA(path);
+    return (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL BuildConfigPath(char *configPath, int configPathLen)
+{
+    char appData[MAX_PATH];
+    char dirPath[MAX_PATH];
+
+    if (!configPath || configPathLen <= 0)
+        return FALSE;
+
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appData) != S_OK)
+        return FALSE;
+
+    snprintf(dirPath, sizeof(dirPath), "%s\\%s", appData, VALORA_APP_DIR);
+    CreateDirectoryA(dirPath, NULL);
+    snprintf(configPath, configPathLen, "%s\\%s", dirPath, VALORA_CONFIG_NAME);
+    return TRUE;
+}
+
+static void SaveUiStateToGlobals(void)
+{
+    int idx;
+
+    if (!hServerEdit || !hFolderEdit || !hModelCombo)
+        return;
+
+    GetWindowTextA(hServerEdit, sServer, sizeof(sServer));
+    GetWindowTextA(hFolderEdit, sFolder, sizeof(sFolder));
+
+    idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
+    if (idx != CB_ERR) {
+        SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
+    } else {
+        sSelectedModel[0] = '\0';
+    }
+}
+
+static BOOL SaveConfigToDisk(void)
+{
+    char ctx[32] = "2048";
+    char gpu[32] = "-1";
+    char port[32] = "8000";
+    char threads[32] = "4";
+    char serverType[16];
+
+    if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath)))
+        return FALSE;
+
+    SaveUiStateToGlobals();
+
+    if (hCtxEdit) GetWindowTextA(hCtxEdit, ctx, sizeof(ctx));
+    if (hGpuEdit) GetWindowTextA(hGpuEdit, gpu, sizeof(gpu));
+    if (hPortEdit) GetWindowTextA(hPortEdit, port, sizeof(port));
+    if (hThreadsEdit) GetWindowTextA(hThreadsEdit, threads, sizeof(threads));
+    if (hServerTypeCombo)
+        nServerType = (int)SendMessageA(hServerTypeCombo, CB_GETCURSEL, 0, 0);
+
+    snprintf(serverType, sizeof(serverType), "%d", nServerType);
+
+    WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
+    WritePrivateProfileStringA("paths", "models_folder", sFolder, sConfigPath);
+    WritePrivateProfileStringA("paths", "default_model", sSelectedModel, sConfigPath);
+    WritePrivateProfileStringA("settings", "ctx", ctx, sConfigPath);
+    WritePrivateProfileStringA("settings", "gpu", gpu, sConfigPath);
+    WritePrivateProfileStringA("settings", "port", port, sConfigPath);
+    WritePrivateProfileStringA("settings", "threads", threads, sConfigPath);
+    WritePrivateProfileStringA("settings", "server_type", serverType, sConfigPath);
+
+    return TRUE;
+}
+
+static BOOL LoadConfigFromDisk(void)
+{
+    if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath)))
+        return FALSE;
+
+    GetPrivateProfileStringA("paths", "server", "", sServer, sizeof(sServer), sConfigPath);
+    GetPrivateProfileStringA("paths", "models_folder", "", sFolder, sizeof(sFolder), sConfigPath);
+    GetPrivateProfileStringA("paths", "default_model", "", sSelectedModel, sizeof(sSelectedModel), sConfigPath);
+    nServerType = GetPrivateProfileIntA("settings", "server_type", 0, sConfigPath);
+
+    return sServer[0] != '\0' && sFolder[0] != '\0';
+}
+
+static void ApplyLoadedConfigToControls(void)
+{
+    char value[32];
+
+    if (!hServerEdit || !hFolderEdit)
+        return;
+
+    SetWindowTextA(hServerEdit, sServer);
+    SetWindowTextA(hFolderEdit, sFolder);
+
+    GetPrivateProfileStringA("settings", "ctx", "2048", value, sizeof(value), sConfigPath);
+    SetWindowTextA(hCtxEdit, value);
+
+    GetPrivateProfileStringA("settings", "gpu", "-1", value, sizeof(value), sConfigPath);
+    SetWindowTextA(hGpuEdit, value);
+
+    GetPrivateProfileStringA("settings", "port", "8000", value, sizeof(value), sConfigPath);
+    SetWindowTextA(hPortEdit, value);
+
+    GetPrivateProfileStringA("settings", "threads", "4", value, sizeof(value), sConfigPath);
+    SetWindowTextA(hThreadsEdit, value);
+
+    SendMessageA(hServerTypeCombo, CB_SETCURSEL, (WPARAM)nServerType, 0);
+}
+
+static BOOL EnsureSelectedModelExists(void)
+{
+    int i;
+
+    if (nModels <= 0)
+        return FALSE;
+
+    if (sSelectedModel[0]) {
+        for (i = 0; i < nModels; ++i) {
+            if (lstrcmpiA(sModels[i], sSelectedModel) == 0)
+                return TRUE;
+        }
+    }
+
+    lstrcpynA(sSelectedModel, sModels[0], sizeof(sSelectedModel));
+    return TRUE;
+}
+
+static void BuildModelPath(char *dst, int dstLen, const char *modelName)
+{
+    if (!dst || dstLen <= 0) return;
+    snprintf(dst, dstLen, "%s\\%s", sFolder, modelName);
+}
+
+static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen)
+{
+    if (ctx && ctxLen > 0) GetPrivateProfileStringA("settings", "ctx", "2048", ctx, ctxLen, sConfigPath);
+    if (gpu && gpuLen > 0) GetPrivateProfileStringA("settings", "gpu", "-1", gpu, gpuLen, sConfigPath);
+    if (port && portLen > 0) GetPrivateProfileStringA("settings", "port", "8000", port, portLen, sConfigPath);
+    if (threads && threadsLen > 0) GetPrivateProfileStringA("settings", "threads", "4", threads, threadsLen, sConfigPath);
+}
+
+/* Check if a model has saved configuration */
+static BOOL HasModelConfig(const char *modelName)
+{
+    char section[64];
+    char value[32];
+
+    if (!modelName || !*modelName)
+        return FALSE;
+
+    /* Create section name like [model_modelname.gguf] */
+    snprintf(section, sizeof(section), "model_%s", modelName);
+
+    /* Check if ctx value exists in model section */
+    GetPrivateProfileStringA(section, "ctx", "", value, sizeof(value), sConfigPath);
+    return value[0] != '\0';
+}
+
+/* Get per-model configuration, fall back to defaults if not set */
+static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *gpu, int gpuLen, char *threads, int threadsLen)
+{
+    char section[64];
+
+    if (!modelName || !*modelName) {
+        /* Use global defaults */
+        if (ctx && ctxLen > 0) snprintf(ctx, ctxLen, "2048");
+        if (gpu && gpuLen > 0) snprintf(gpu, gpuLen, "-1");
+        if (threads && threadsLen > 0) snprintf(threads, threadsLen, "4");
+        return;
+    }
+
+    /* Create section name like [model_modelname.gguf] */
+    snprintf(section, sizeof(section), "model_%s", modelName);
+
+    /* Try to get from model-specific section */
+    if (ctx && ctxLen > 0) GetPrivateProfileStringA(section, "ctx", "2048", ctx, ctxLen, sConfigPath);
+    if (gpu && gpuLen > 0) GetPrivateProfileStringA(section, "gpu", "-1", gpu, gpuLen, sConfigPath);
+    if (threads && threadsLen > 0) GetPrivateProfileStringA(section, "threads", "4", threads, threadsLen, sConfigPath);
+}
+
+/* Interactive model selector using console API */
+
+/* Animation states for realtime feedback */
+static const char* animationFrames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+static int animFrame = 0;
+
+/* Get available VRAM in MB */
 static int GetAvailableVRAM(void)
 {
+    /* Try to get GPU memory from WMI */
     MEMORYSTATUSEX statex;
     statex.dwLength = sizeof(statex);
     
     if (GlobalMemoryStatusEx(&statex)) {
-        /* Return available RAM as proxy for VRAM (fallback detection) */
-        /* This is system RAM; true GPU VRAM detection would require GPU-specific APIs */
         ULONGLONG availMB = statex.ullAvailPhys / (1024 * 1024);
-        if (availMB > 2048) return 4096;    /* Assume good GPU if plenty of RAM */
+        if (availMB > 8192) return 16384;
+        if (availMB > 4096) return 8192;
+        if (availMB > 2048) return 4096;
         if (availMB > 1024) return 2048;
         return 1024;
     }
-    return 2048;  /* Safe default */
+    return 2048;
 }
 
 /* Get model file size in MB */
-static int GetModelFileSizeMB(const char *folderPath, const char *modelName)
+static int GetModelFileSizeMB(const char *modelName)
 {
-    if (!folderPath || !modelName || !*folderPath || !*modelName)
+    if (!modelName || !*modelName || !sFolder[0])
         return 0;
 
     char fullPath[MAX_PATH * 2];
-    snprintf(fullPath, sizeof(fullPath), "%s\\%s", folderPath, modelName);
+    snprintf(fullPath, sizeof(fullPath), "%s\\%s", sFolder, modelName);
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
@@ -135,22 +401,753 @@ static int GetModelFileSizeMB(const char *folderPath, const char *modelName)
     return 0;
 }
 
-/* Detect quantization type from filename (e.g., Q4, Q5, Q8, F16) */
+/* Detect quantization type from filename */
 static const char* DetectQuantizationType(const char *modelName)
 {
-    if (!modelName) return "unknown";
-
-    /* Check for common quantization patterns */
-    if (strstr(modelName, "Q8")) return "Q8";      /* 8-bit: ~95% of fp32 */
-    if (strstr(modelName, "Q6")) return "Q6";      /* 6-bit: ~70% of fp32 */
-    if (strstr(modelName, "Q5")) return "Q5";      /* 5-bit: ~55% of fp32 */
-    if (strstr(modelName, "Q4")) return "Q4";      /* 4-bit: ~40% of fp32 */
-    if (strstr(modelName, "Q3")) return "Q3";      /* 3-bit */
-    if (strstr(modelName, "F16")) return "F16";    /* 16-bit: ~50% of fp32 */
-    if (strstr(modelName, "F32")) return "F32";    /* 32-bit full precision */
+    if (!modelName) return "Unknown";
     
-    return "unknown";
+    /* Check for various quantization patterns */
+    if (strstr(modelName, "IQ2_XXS") || strstr(modelName, "iq2_xxs")) return "IQ2-XXS";
+    if (strstr(modelName, "IQ2_XS") || strstr(modelName, "iq2_xs")) return "IQ2-XS";
+    if (strstr(modelName, "IQ2_S") || strstr(modelName, "iq2_s")) return "IQ2-S";
+    if (strstr(modelName, "IQ2_M") || strstr(modelName, "iq2_m")) return "IQ2-M";
+    if (strstr(modelName, "IQ3_XXS") || strstr(modelName, "iq3_xxs")) return "IQ3-XXS";
+    if (strstr(modelName, "IQ1_S") || strstr(modelName, "iq1_s")) return "IQ1-S";
+    if (strstr(modelName, "Q5_K_S") || strstr(modelName, "q5_k_s")) return "Q5-K_S";
+    if (strstr(modelName, "Q5_K_M") || strstr(modelName, "q5_k_m")) return "Q5-K_M";
+    if (strstr(modelName, "Q4_K_S") || strstr(modelName, "q4_k_s")) return "Q4-K_S";
+    if (strstr(modelName, "Q4_K_M") || strstr(modelName, "q4_k_m")) return "Q4-K_M";
+    if (strstr(modelName, "Q4_0") || strstr(modelName, "q4_0")) return "Q4_0";
+    if (strstr(modelName, "Q4_1") || strstr(modelName, "q4_1")) return "Q4_1";
+    if (strstr(modelName, "Q5_0") || strstr(modelName, "q5_0")) return "Q5_0";
+    if (strstr(modelName, "Q5_1") || strstr(modelName, "q5_1")) return "Q5_1";
+    if (strstr(modelName, "Q6_K") || strstr(modelName, "q6_k")) return "Q6_K";
+    if (strstr(modelName, "Q8_0") || strstr(modelName, "q8_0")) return "Q8_0";
+    if (strstr(modelName, "F16") || strstr(modelName, "f16")) return "F16";
+    if (strstr(modelName, "F32") || strstr(modelName, "f32")) return "F32";
+    if (strstr(modelName, "BF16") || strstr(modelName, "bf16")) return "BF16";
+    
+    return "Unknown";
 }
+
+/* Format file size for display */
+static void FormatFileSize(int sizeMB, char *buffer, int bufferLen)
+{
+    if (!buffer || bufferLen <= 0) return;
+    
+    if (sizeMB >= 1024) {
+        snprintf(buffer, bufferLen, "%.1f GB", sizeMB / 1024.0);
+    } else if (sizeMB > 0) {
+        snprintf(buffer, bufferLen, "%d MB", sizeMB);
+    } else {
+        snprintf(buffer, bufferLen, "Unknown");
+    }
+}
+
+/* Check if model fits in available VRAM - returns TRUE if usable */
+static BOOL IsModelUsable(const char *modelName, int vramMB)
+{
+    int modelSizeMB = GetModelFileSizeMB(modelName);
+    if (modelSizeMB == 0) return FALSE;  /* Can't determine, assume not usable */
+    
+    /* Rough estimate: model needs ~35% of its size in VRAM for loading */
+    int requiredVRAM = (int)(modelSizeMB * 0.35);
+    return (vramMB >= requiredVRAM);
+}
+
+/* Print animation frame */
+static void PrintAnimation(const char *message)
+{
+    printf("\r%s %s", animationFrames[animFrame], message);
+    fflush(stdout);
+    animFrame = (animFrame + 1) % 10;
+}
+
+/* Print table header */
+static void PrintTableHeader(void)
+{
+    printf("\n┌─────────────────────────────────────────────────────────────────────────────┐\n");
+    printf("│ %-45s │ %10s │ %10s │ %8s │\n", "Model Name", "Size", "Quant", "Usable");
+    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
+}
+
+/* Print table row with color coding */
+static void PrintTableRow(int index, int selectedIndex, const char *modelName, int sizeMB, const char *quant, BOOL usable)
+{
+    BOOL isSelected = (index == selectedIndex);
+    
+    if (isSelected) {
+        /* Selected row - bright cyan background */
+        if (usable) {
+            printf("│ \x1b[46;30m%45s\x1b[0m │ \x1b[46;30m%10s\x1b[0m │ \x1b[46;30m%10s\x1b[0m │ \x1b[46;30m  ✓ OK  \x1b[0m │\n", modelName, "", quant);
+        } else {
+            printf("│ \x1b[41;30m%45s\x1b[0m │ \x1b[41;30m%10s\x1b[0m │ \x1b[41;30m%10s\x1b[0m │ \x1b[41;30m LOWMEM \x1b[0m │\n", modelName, "", quant);
+        }
+    } else {
+        /* Non-selected row */
+        char sizeStr[32];
+        FormatFileSize(sizeMB, sizeStr, sizeof(sizeStr));
+        
+        if (usable) {
+            /* Green for usable */
+            printf("│ %-45s │ %10s │ %10s │ \x1b[32m  ✓ OK  \x1b[0m │\n", modelName, sizeStr, quant);
+        } else {
+            /* Red for not usable */
+            printf("│ %-45s │ %10s │ %10s │ \x1b[31mLOWMEM\x1b[0m │\n", modelName, sizeStr, quant);
+        }
+    }
+}
+
+/* Print table footer */
+static void PrintTableFooter(void)
+{
+    printf("└─────────────────────────────────────────────────────────────────────────────┘\n");
+}
+
+static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen)
+{
+    int selectedIndex = 0;
+    int i;
+    int ch;
+    DWORD mode;
+    HANDLE hConsole;
+    int availableVRAM;
+    
+    /* Array to store model sizes */
+    static int modelSizes[MAX_MODELS];
+    
+    if (!selectedModel || selectedModelLen <= 0)
+        return -1;
+
+    /* Scan models first with animation */
+    printf("\n");
+    PrintAnimation("Scanning models...");
+    ScanModels();
+    
+    /* Get VRAM info */
+    availableVRAM = GetAvailableVRAM();
+    
+    /* Calculate sizes for all models */
+    for (i = 0; i < nModels; i++) {
+        modelSizes[i] = GetModelFileSizeMB(sModels[i]);
+    }
+    
+    /* Clear animation line */
+    printf("\r                     \r");
+    
+    if (nModels == 0) {
+        fprintf(stderr, "No .gguf models found in %s\n", sFolder);
+        return -1;
+    }
+
+    /* Get console handle */
+    hConsole = GetStdHandle(STD_INPUT_HANDLE);
+    if (hConsole == INVALID_HANDLE_VALUE)
+        return -1;
+
+    /* Save current console mode */
+    GetConsoleMode(hConsole, &mode);
+    /* Disable mouse input and window resizing */
+    SetConsoleMode(hConsole, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+
+    /* Initial display */
+    printf("\n=== \x1b[36mValora Model Selector\x1b[0m ===\n\n");
+    printf("\x1b[90mUse UP/DOWN arrow keys to navigate, ENTER to select, ESC to cancel\x1b[0m\n");
+    printf("\x1b[90mAvailable VRAM: %d MB\x1b[0m\n\n", availableVRAM);
+
+    /* Find default selection (currently selected model or first) */
+    for (i = 0; i < nModels; ++i) {
+        if (lstrcmpiA(sModels[i], sSelectedModel) == 0) {
+            selectedIndex = i;
+            break;
+        }
+    }
+
+    /* Draw initial table */
+    PrintTableHeader();
+    for (i = 0; i < nModels; ++i) {
+        const char *quant = DetectQuantizationType(sModels[i]);
+        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
+        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
+    }
+    PrintTableFooter();
+    
+    /* Input loop */
+    while (1) {
+        ch = _getch();
+        if (ch == 224) { /* Arrow key prefix */
+            ch = _getch();
+            if (ch == 72) { /* Up arrow */
+                if (selectedIndex > 0) {
+                    selectedIndex--;
+                    /* Redraw table */
+                    printf("\r");
+                    for (i = 0; i < nModels + 3; i++) {
+                        printf("\x1b[2K\r\n");  /* Clear lines */
+                    }
+                    /* Move cursor back up */
+                    printf("\x1b[%dA", nModels + 4);
+                    
+                    PrintTableHeader();
+                    for (i = 0; i < nModels; ++i) {
+                        const char *quant = DetectQuantizationType(sModels[i]);
+                        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
+                        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
+                    }
+                    PrintTableFooter();
+                }
+            } else if (ch == 80) { /* Down arrow */
+                if (selectedIndex < nModels - 1) {
+                    selectedIndex++;
+                    /* Redraw table */
+                    printf("\r");
+                    for (i = 0; i < nModels + 3; i++) {
+                        printf("\x1b[2K\r\n");
+                    }
+                    printf("\x1b[%dA", nModels + 4);
+                    
+                    PrintTableHeader();
+                    for (i = 0; i < nModels; ++i) {
+                        const char *quant = DetectQuantizationType(sModels[i]);
+                        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
+                        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
+                    }
+                    PrintTableFooter();
+                }
+            }
+        } else if (ch == 13) { /* Enter */
+            lstrcpynA(selectedModel, sModels[selectedIndex], selectedModelLen);
+            /* Restore console mode */
+            SetConsoleMode(hConsole, mode);
+            printf("\n\x1b[32mSelected: %s\x1b[0m\n", selectedModel);
+            return selectedIndex;
+        } else if (ch == 27) { /* Escape */
+            /* Restore console mode */
+            SetConsoleMode(hConsole, mode);
+            return -1;
+        }
+    }
+}
+
+static void BuildServeCommand(char *dst, int dstLen)
+{
+    char modelPath[MAX_PATH * 2];
+    char ctx[32], gpu[32], port[32], threads[32];
+    const char *host = (nServerType == 1) ? "0.0.0.0" : "127.0.0.1";
+
+    BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), port, sizeof(port), threads, sizeof(threads));
+
+    snprintf(
+        dst, dstLen,
+        "\"%s\" -m \"%s\" -c %s -ngl %s --port %s -t %s --host %s",
+        sServer, modelPath, ctx, gpu, port, threads, host
+    );
+}
+
+static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
+{
+    char cliPath[MAX_PATH];
+    char modelPath[MAX_PATH * 2];
+    char ctx[32], gpu[32], threads[32];
+
+    GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
+    BuildModelPath(modelPath, sizeof(modelPath), modelName ? modelName : sSelectedModel);
+    GetModelConfig(modelName, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+
+    snprintf(
+        dst, dstLen,
+        "\"%s\" -m \"%s\" -c %s -ngl %s -t %s",
+        cliPath, modelPath, ctx, gpu, threads
+    );
+}
+
+static int RunChildProcess(const char *commandLine)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char mutableCmd[MAX_CMD];
+    DWORD exitCode = 1;
+
+    if (!commandLine || !*commandLine)
+        return 1;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    lstrcpynA(mutableCmd, commandLine, sizeof(mutableCmd));
+
+    if (!CreateProcessA(NULL, mutableCmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "Failed to start command.\n");
+        return 1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)exitCode;
+}
+
+static BOOL NormalizeHuggingFaceRepo(const char *input, char *repo, int repoLen)
+{
+    const char *start;
+    char temp[512];
+    char *slash1, *slash2, *end;
+
+    if (!input || !*input || !repo || repoLen <= 0)
+        return FALSE;
+
+    while (*input == ' ' || *input == '\t')
+        input++;
+
+    start = strstr(input, "huggingface.co/");
+    if (start) {
+        start += lstrlenA("huggingface.co/");
+    } else {
+        start = input;
+    }
+
+    while (*start == '/')
+        start++;
+
+    lstrcpynA(temp, start, sizeof(temp));
+
+    end = temp;
+    while (*end) {
+        if (*end == '?' || *end == '#') {
+            *end = '\0';
+            break;
+        }
+        end++;
+    }
+
+    slash1 = strchr(temp, '/');
+    if (!slash1)
+        return FALSE;
+
+    slash2 = strchr(slash1 + 1, '/');
+    if (slash2)
+        *slash2 = '\0';
+
+    if (!temp[0] || !slash1[1])
+        return FALSE;
+
+    lstrcpynA(repo, temp, repoLen);
+    return TRUE;
+}
+
+static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen)
+{
+    char tempPath[MAX_PATH];
+    FILE *fp;
+
+    if (!scriptPath || scriptPathLen <= 0)
+        return FALSE;
+
+    if (!GetTempPathA(sizeof(tempPath), tempPath))
+        return FALSE;
+
+    snprintf(scriptPath, scriptPathLen, "%svalora_hf_get.ps1", tempPath);
+
+    fp = fopen(scriptPath, "w");
+    if (!fp)
+        return FALSE;
+
+    fputs("param([string]$Repo,[string]$ModelsFolder)\n", fp);
+    fputs("$ErrorActionPreference = 'Stop'\n", fp);
+    fputs("$ProgressPreference = 'SilentlyContinue'\n", fp);
+    fputs("\n", fp);
+    fputs("function Format-Bytes([Int64]$Bytes) {\n", fp);
+    fputs("  if ($Bytes -le 0) { return 'Unknown size' }\n", fp);
+    fputs("  if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }\n", fp);
+    fputs("  if ($Bytes -ge 1MB) { return ('{0:N0} MB' -f ($Bytes / 1MB)) }\n", fp);
+    fputs("  return ('{0:N0} KB' -f ($Bytes / 1KB))\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-Quant([string]$Name) {\n", fp);
+    fputs("  $patterns = @('IQ\\d+_[A-Z]+','Q\\d+_K_[A-Z]+','Q\\d+_[A-Z0-9]+','Q\\d+','BF16','F16','F32')\n", fp);
+    fputs("  foreach ($pattern in $patterns) {\n", fp);
+    fputs("    $match = [regex]::Match($Name.ToUpperInvariant(), $pattern)\n", fp);
+    fputs("    if ($match.Success) { return $match.Value }\n", fp);
+    fputs("  }\n", fp);
+    fputs("  return 'Unknown'\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Trim-Cell([string]$Text, [int]$Width) {\n", fp);
+    fputs("  if (-not $Text) { return ''.PadRight($Width) }\n", fp);
+    fputs("  if ($Text.Length -le $Width) { return $Text.PadRight($Width) }\n", fp);
+    fputs("  if ($Width -le 3) { return $Text.Substring(0, $Width) }\n", fp);
+    fputs("  return ($Text.Substring(0, $Width - 3) + '...')\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Show-Table($Items) {\n", fp);
+    fputs("  $line = '+' + ('-' * 4) + '+' + ('-' * 44) + '+' + ('-' * 12) + '+' + ('-' * 12) + '+' + ('-' * 15) + '+'\n", fp);
+    fputs("  Write-Host $line\n", fp);
+    fputs("  Write-Host ('| ' + (Trim-Cell 'No' 2) + ' | ' + (Trim-Cell 'Model' 42) + ' | ' + (Trim-Cell 'Size' 10) + ' | ' + (Trim-Cell 'Quant' 10) + ' | ' + (Trim-Cell 'GPU Offload' 13) + ' |')\n", fp);
+    fputs("  Write-Host $line\n", fp);
+    fputs("  for ($i = 0; $i -lt $Items.Count; $i++) {\n", fp);
+    fputs("    $item = $Items[$i]\n", fp);
+    fputs("    $row = '| ' + (Trim-Cell ([string]($i + 1)) 2) + ' | ' + (Trim-Cell $item.Name 42) + ' | ' + (Trim-Cell (Format-Bytes $item.Size) 10) + ' | ' + (Trim-Cell $item.Quant 10) + ' | ' + (Trim-Cell $item.Gpu 13) + ' |'\n", fp);
+    fputs("    Write-Host $row\n", fp);
+    fputs("  }\n", fp);
+    fputs("  Write-Host $line\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Render-DownloadBar([string]$Label, [Int64]$Done, [Int64]$Total, [datetime]$Started) {\n", fp);
+    fputs("  $width = 42\n", fp);
+    fputs("  $elapsed = [Math]::Max(([datetime]::UtcNow - $Started).TotalSeconds, 0.1)\n", fp);
+    fputs("  $speed = $Done / $elapsed\n", fp);
+    fputs("  if ($Total -gt 0) {\n", fp);
+    fputs("    $percent = [Math]::Min(100, [Math]::Max(0, [int](($Done * 100) / $Total)))\n", fp);
+    fputs("    $filled = [Math]::Min($width, [int](($Done * $width) / $Total))\n", fp);
+    fputs("  } else {\n", fp);
+    fputs("    $percent = 0\n", fp);
+    fputs("    $filled = 0\n", fp);
+    fputs("  }\n", fp);
+    fputs("  $bar = ('=' * $filled) + (' ' * ($width - $filled))\n", fp);
+    fputs("  $left = (Trim-Cell $Label 18)\n", fp);
+    fputs("  $elapsedText = [TimeSpan]::FromSeconds([int]$elapsed).ToString('hh\\:mm\\:ss')\n", fp);
+    fputs("  $line = ('{0} {1,3}% [{2}] {3,8} {4,8}/s {5}' -f $left, $percent, $bar, (Format-Bytes $Total), (Format-Bytes ([Int64]$speed)), $elapsedText)\n", fp);
+    fputs("  [Console]::Write(\"`r\" + $line.PadRight(120))\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Download-WithWebRequest([string]$Url, [string]$Path, [string]$Label) {\n", fp);
+    fputs("  $request = [System.Net.HttpWebRequest]::Create($Url)\n", fp);
+    fputs("  $request.AllowAutoRedirect = $true\n", fp);
+    fputs("  $request.Timeout = [int][TimeSpan]::FromMinutes(30).TotalMilliseconds\n", fp);
+    fputs("  $request.ReadWriteTimeout = [int][TimeSpan]::FromHours(12).TotalMilliseconds\n", fp);
+    fputs("  $request.UserAgent = 'valora/1.0'\n", fp);
+    fputs("  $response = $request.GetResponse()\n", fp);
+    fputs("  $total = [Int64]$response.ContentLength\n", fp);
+    fputs("  $stream = $response.GetResponseStream()\n", fp);
+    fputs("  $file = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)\n", fp);
+    fputs("  $buffer = New-Object byte[] 262144\n", fp);
+    fputs("  $done = [Int64]0\n", fp);
+    fputs("  $started = [datetime]::UtcNow\n", fp);
+    fputs("  try {\n", fp);
+    fputs("    while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {\n", fp);
+    fputs("      $file.Write($buffer, 0, $read)\n", fp);
+    fputs("      $done += $read\n", fp);
+    fputs("      Render-DownloadBar $Label $done $total $started\n", fp);
+    fputs("    }\n", fp);
+    fputs("    if ($total -gt 0) { Render-DownloadBar $Label $total $total $started }\n", fp);
+    fputs("    [Console]::WriteLine('')\n", fp);
+    fputs("  } finally {\n", fp);
+    fputs("    $file.Dispose()\n", fp);
+    fputs("    $stream.Dispose()\n", fp);
+    fputs("    $response.Dispose()\n", fp);
+    fputs("  }\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Download-WithProgress([string]$Url, [string]$Path) {\n", fp);
+    fputs("  try {\n", fp);
+    fputs("    $label = 'pulling ' + [System.IO.Path]::GetFileName($Path)\n", fp);
+    fputs("    try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop | Out-Null } catch {}\n", fp);
+    fputs("    try {\n", fp);
+    fputs("      $handler = New-Object System.Net.Http.HttpClientHandler\n", fp);
+    fputs("      $handler.AllowAutoRedirect = $true\n", fp);
+    fputs("      $client = New-Object System.Net.Http.HttpClient($handler)\n", fp);
+    fputs("      $client.Timeout = [TimeSpan]::FromHours(12)\n", fp);
+    fputs("      $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n", fp);
+    fputs("      [void]$response.EnsureSuccessStatusCode()\n", fp);
+    fputs("      $total = 0\n", fp);
+    fputs("      if ($response.Content.Headers.ContentLength) { $total = [Int64]$response.Content.Headers.ContentLength }\n", fp);
+    fputs("      $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n", fp);
+    fputs("      $file = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)\n", fp);
+    fputs("      $buffer = New-Object byte[] 262144\n", fp);
+    fputs("      $done = [Int64]0\n", fp);
+    fputs("      $started = [datetime]::UtcNow\n", fp);
+    fputs("      try {\n", fp);
+    fputs("        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {\n", fp);
+    fputs("          $file.Write($buffer, 0, $read)\n", fp);
+    fputs("          $done += $read\n", fp);
+    fputs("          Render-DownloadBar $label $done $total $started\n", fp);
+    fputs("        }\n", fp);
+    fputs("        if ($total -gt 0) { Render-DownloadBar $label $total $total $started }\n", fp);
+    fputs("        [Console]::WriteLine('')\n", fp);
+    fputs("      } finally {\n", fp);
+    fputs("        $file.Dispose()\n", fp);
+    fputs("        $stream.Dispose()\n", fp);
+    fputs("        $response.Dispose()\n", fp);
+    fputs("        $client.Dispose()\n", fp);
+    fputs("        $handler.Dispose()\n", fp);
+    fputs("      }\n", fp);
+    fputs("    } catch [System.Management.Automation.RuntimeException] {\n", fp);
+    fputs("      Download-WithWebRequest $Url $Path $label\n", fp);
+    fputs("    }\n", fp);
+    fputs("  } catch {\n", fp);
+    fputs("    Write-Host \"Download failed: $_\" -ForegroundColor Red\n", fp);
+    fputs("    if (Test-Path $Path) { Remove-Item $Path -Force }\n", fp);
+    fputs("    exit 1\n", fp);
+    fputs("  }\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-GpuOffload([Int64]$Bytes) {\n", fp);
+    fputs("  try {\n", fp);
+    fputs("    $gpuRam = (Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterRAM -gt 0 } | Measure-Object -Maximum AdapterRAM).Maximum\n", fp);
+    fputs("    if (-not $gpuRam) { return 'Unknown' }\n", fp);
+    fputs("    $threshold = [Math]::Max(2GB, [Int64]($Bytes * 0.35))\n", fp);
+    fputs("    if ($gpuRam -ge $threshold) { return 'Yes' }\n", fp);
+    fputs("    return 'No'\n", fp);
+    fputs("  } catch { return 'Unknown' }\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-DefaultModel($Files) {\n", fp);
+    fputs("  $preferred = $Files | Sort-Object @{ Expression = {\n", fp);
+    fputs("    $name = $_.Name.ToLowerInvariant()\n", fp);
+    fputs("    if ($name -match 'q4_k_m') { return 0 }\n", fp);
+    fputs("    if ($name -match 'q4_0') { return 1 }\n", fp);
+    fputs("    if ($name -match 'q5') { return 2 }\n", fp);
+    fputs("    if ($name -match 'q6') { return 3 }\n", fp);
+    fputs("    if ($name -match 'q8') { return 4 }\n", fp);
+    fputs("    if ($name -match 'f16|bf16') { return 5 }\n", fp);
+    fputs("    return 6\n", fp);
+    fputs("  } }, @{ Expression = { $_.Size }; Descending = $false }, Name\n", fp);
+    fputs("  return $preferred[0]\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("if (-not (Test-Path -LiteralPath $ModelsFolder)) { New-Item -ItemType Directory -Path $ModelsFolder | Out-Null }\n", fp);
+    fputs("Write-Host ''\n", fp);
+    fputs("Write-Host ('Checking Hugging Face repo: ' + $Repo) -ForegroundColor Cyan\n", fp);
+    fputs("Write-Host 'Fetching repository metadata...' -ForegroundColor DarkGray\n", fp);
+    fputs("$repoUrl = 'https://huggingface.co/api/models/' + $Repo\n", fp);
+    fputs("$repoInfo = Invoke-RestMethod -Uri $repoUrl\n", fp);
+    fputs("$ggufFiles = @($repoInfo.siblings | Where-Object { $_.rfilename -match '\\.gguf$' })\n", fp);
+    fputs("if ($ggufFiles.Count -eq 0) { Write-Host 'No GGUF files found in this repository.' -ForegroundColor Yellow; exit 1 }\n", fp);
+    fputs("$files = @()\n", fp);
+    fputs("foreach ($entry in $ggufFiles) {\n", fp);
+    fputs("  $name = $entry.rfilename\n", fp);
+    fputs("  $escapedName = [System.Uri]::EscapeDataString($name) -replace '%2F', '/'\n", fp);
+    fputs("  $downloadUrl = 'https://huggingface.co/' + $Repo + '/resolve/main/' + $escapedName + '?download=true'\n", fp);
+    fputs("  Write-Host ('Inspecting ' + $name + ' ...') -ForegroundColor DarkGray\n", fp);
+    fputs("  $size = 0\n", fp);
+    fputs("  try {\n", fp);
+    fputs("    $head = Invoke-WebRequest -Uri $downloadUrl -Method Head -UseBasicParsing\n", fp);
+    fputs("    if ($head.Headers['Content-Length']) { $size = [Int64]$head.Headers['Content-Length'] }\n", fp);
+    fputs("  } catch {}\n", fp);
+    fputs("  $files += [PSCustomObject]@{ Name = $name; Url = $downloadUrl; Size = $size; Quant = (Get-Quant $name); Gpu = (Get-GpuOffload $size) }\n", fp);
+    fputs("}\n", fp);
+    fputs("$files = @($files | Sort-Object Name)\n", fp);
+    fputs("$defaultModel = Get-DefaultModel $files\n", fp);
+    fputs("$selected = $defaultModel\n", fp);
+    fputs("\n", fp);
+    fputs("if ($files.Count -gt 1) {\n", fp);
+    fputs("  Write-Host ('Found ' + $files.Count + ' GGUF models in this repo.') -ForegroundColor Green\n", fp);
+    fputs("  Write-Host ('Default: ' + $defaultModel.Name + ' | ' + (Format-Bytes $defaultModel.Size) + ' | ' + $defaultModel.Quant + ' | GPU offload: ' + $defaultModel.Gpu)\n", fp);
+    fputs("  Write-Host ''\n", fp);
+    fputs("  Write-Host '1. Continue with default model'\n", fp);
+    fputs("  Write-Host '2. Change model'\n", fp);
+    fputs("  Write-Host '3. Cancel'\n", fp);
+    fputs("  do { $choice = Read-Host 'Choose 1, 2 or 3' } until ($choice -match '^[123]$')\n", fp);
+    fputs("  if ($choice -eq '3') { Write-Host 'Cancelled.'; exit 0 }\n", fp);
+    fputs("  if ($choice -eq '2') {\n", fp);
+    fputs("    Write-Host ''\n", fp);
+    fputs("    Show-Table $files\n", fp);
+    fputs("    do { $pick = Read-Host 'Choose model number' } until ($pick -match '^\\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $files.Count)\n", fp);
+    fputs("    $selected = $files[[int]$pick - 1]\n", fp);
+    fputs("  }\n", fp);
+    fputs("} else {\n", fp);
+    fputs("  Write-Host ('One GGUF model found: ' + $selected.Name + ' | ' + (Format-Bytes $selected.Size) + ' | ' + $selected.Quant + ' | GPU offload: ' + $selected.Gpu) -ForegroundColor Green\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("$targetPath = Join-Path $ModelsFolder ([System.IO.Path]::GetFileName($selected.Name))\n", fp);
+    fputs("if (Test-Path -LiteralPath $targetPath) {\n", fp);
+    fputs("  do { $overwrite = Read-Host 'File already exists. Overwrite? (y/n)' } until ($overwrite -match '^[YyNn]$')\n", fp);
+    fputs("  if ($overwrite -match '^[Nn]$') { Write-Host 'Cancelled.'; exit 0 }\n", fp);
+    fputs("}\n", fp);
+    fputs("Write-Host ''\n", fp);
+    fputs("Write-Host ('Downloading ' + $selected.Name) -ForegroundColor Cyan\n", fp);
+    fputs("Write-Host ('Saving to ' + $targetPath)\n", fp);
+    fputs("Write-Host 'Download progress:' -ForegroundColor DarkGray\n", fp);
+    fputs("Download-WithProgress $selected.Url $targetPath\n", fp);
+    fputs("Write-Host ''\n", fp);
+    fputs("Write-Host ('Installed model to ' + $targetPath) -ForegroundColor Green\n", fp);
+
+    fclose(fp);
+    return TRUE;
+}
+
+static int DownloadFromHuggingFaceLegacy(const char *hfUrl)
+{
+    char repo[256];
+    char scriptPath[MAX_PATH];
+    char command[MAX_CMD];
+    int startTime;
+    
+    /* Animation state */
+    int animCounter = 0;
+    
+    if (!EnsureModelsFolderReady())
+        return 1;
+
+    if (!NormalizeHuggingFaceRepo(hfUrl, repo, sizeof(repo))) {
+        fprintf(stderr, "Invalid Hugging Face repo. Use owner/repo or a huggingface.co URL.\n");
+        return 1;
+    }
+
+    if (!WriteHuggingFaceDownloaderScript(scriptPath, sizeof(scriptPath))) {
+        fprintf(stderr, "Failed to prepare the Hugging Face downloader script.\n");
+        return 1;
+    }
+
+    printf("\n\x1b[36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n");
+    printf("\x1b[36m  Downloading model from Hugging Face\x1b[0m\n");
+    printf("\x1b[36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n\n");
+    printf("\x1b[90mRepository:\x1b[0m %s\n", repo);
+    printf("\x1b[90mDestination:\x1b[0m %s\n\n", sFolder);
+    
+    /* Show animation while preparing */
+    printf("\x1b[33m");
+    for (int i = 0; i < 3; i++) {
+        printf("\r%s Preparing download...", animationFrames[animCounter]);
+        fflush(stdout);
+        Sleep(100);
+        animCounter = (animCounter + 1) % 10;
+    }
+    printf("\x1b[0m\n\n");
+    
+    printf("\x1b[90mStarting download (this may take a while depending on model size)...\x1b[0m\n\n");
+    
+    startTime = GetTickCount();
+    
+    snprintf(
+        command, sizeof(command),
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Repo \"%s\" -ModelsFolder \"%s\"",
+        scriptPath, repo, sFolder
+    );
+
+    /* Run with animation showing progress */
+    printf("\x1b[90m[");
+    fflush(stdout);
+    
+    int result = RunChildProcess(command);
+    
+    /* Complete animation */
+    printf("\x1b[90m]\x1b[0m\n");
+    
+    int elapsed = (GetTickCount() - startTime) / 1000;
+    if (result == 0) {
+        printf("\n\x1b[32m✓ Download completed successfully!\x1b[0m\n");
+        printf("\x1b[90mTime taken: %d seconds\x1b[0m\n", elapsed);
+        
+        /* Rescan models after download */
+        printf("\n\x1b[90mScanning new models...");
+        ScanModels();
+        printf(" \x1b[32mFound %d model(s)\x1b[0m\n", nModels);
+    } else {
+        printf("\n\x1b[31m✗ Download failed with exit code %d\x1b[0m\n", result);
+        printf("\x1b[90mTime taken: %d seconds\x1b[0m\n", elapsed);
+    }
+    
+    return result;
+}
+
+static int DownloadFromHuggingFace(const char *hfUrl)
+{
+    char repo[256];
+    char scriptPath[MAX_PATH];
+    char command[MAX_CMD];
+    int startTime;
+    int animCounter = 0;
+    int i;
+    int result;
+    int elapsed;
+
+    if (!EnsureModelsFolderReady())
+        return 1;
+
+    if (!NormalizeHuggingFaceRepo(hfUrl, repo, sizeof(repo))) {
+        fprintf(stderr, "Invalid Hugging Face repo. Use owner/repo or a huggingface.co URL.\n");
+        return 1;
+    }
+
+    if (!WriteHuggingFaceDownloaderScript(scriptPath, sizeof(scriptPath))) {
+        fprintf(stderr, "Failed to prepare the Hugging Face downloader script.\n");
+        return 1;
+    }
+
+    printf("\n================================================================\n");
+    printf("  Downloading model from Hugging Face\n");
+    printf("================================================================\n\n");
+    printf("Repository:  %s\n", repo);
+    printf("Destination: %s\n\n", sFolder);
+
+    for (i = 0; i < 3; i++) {
+        printf("\r%s Preparing download...", animationFrames[animCounter]);
+        fflush(stdout);
+        Sleep(100);
+        animCounter = (animCounter + 1) % 10;
+    }
+    printf("\r[ok] Preparing download...          \n\n");
+    printf("Starting download (this may take a while depending on model size)...\n\n");
+
+    startTime = GetTickCount();
+
+    snprintf(
+        command, sizeof(command),
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Repo \"%s\" -ModelsFolder \"%s\"",
+        scriptPath, repo, sFolder
+    );
+
+    result = RunChildProcess(command);
+    elapsed = (GetTickCount() - startTime) / 1000;
+
+    if (result == 0) {
+        printf("\n[ok] Download completed successfully!\n");
+        printf("Time taken: %d seconds\n", elapsed);
+
+        printf("\nScanning new models...");
+        ScanModels();
+        printf(" Found %d model(s)\n", nModels);
+    } else {
+        printf("\n[error] Download failed with exit code %d\n", result);
+        printf("Time taken: %d seconds\n", elapsed);
+    }
+
+    return result;
+}
+
+static int PrintModels(void)
+{
+    int i;
+
+    if (!DirectoryExistsA_(sFolder)) {
+        fprintf(stderr, "Configured models folder does not exist: %s\n", sFolder);
+        return 1;
+    }
+
+    ScanModels();
+    if (nModels == 0) {
+        fprintf(stderr, "No .gguf models found in %s\n", sFolder);
+        return 1;
+    }
+
+    EnsureSelectedModelExists();
+    printf("Configured models in %s\n", sFolder);
+    for (i = 0; i < nModels; ++i) {
+        printf("%s %s\n", lstrcmpiA(sModels[i], sSelectedModel) == 0 ? "*" : "-", sModels[i]);
+    }
+    fflush(stdout);
+    return 0;
+}
+
+static int PrintUsage(void)
+{
+    printf("Valora commands:\n");
+    printf("  valora setup   Open the GUI setup window\n");
+    printf("  valora list    Alias for valora models\n");
+    printf("  valora models  List configured models\n");
+    printf("  valora run     Run the saved model in llama-cli\n");
+    printf("  valora serve [model]  Start a model in llama-server (optional model name)\n");
+    printf("  valora get <owner/repo|hf_url>  Download a GGUF model from Hugging Face\n");
+    fflush(stdout);
+    return 1;
+}
+
+/* ──────────────────────────────────────────────
+   GPU Layer Auto-Detection Helpers
+   ────────────────────────────────────────────── */
 
 /* Calculate quantization scale factor (relative to fp32) */
 static double GetQuantizationScaleFactor(const char *quantType)
@@ -180,42 +1177,49 @@ static int EstimateGpuLayers(const char *folderPath, const char *modelName)
     if (!folderPath || !modelName || !*folderPath || !*modelName)
         return -1;
 
-    int modelSizeMB = GetModelFileSizeMB(folderPath, modelName);
-    if (modelSizeMB <= 0)
-        return -1;  /* Could not determine size */
+    /* Build full path */
+    char fullPath[MAX_PATH * 2];
+    snprintf(fullPath, sizeof(fullPath), "%s\\%s", folderPath, modelName);
+    
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER fileSize;
+        fileSize.LowPart = fad.nFileSizeLow;
+        fileSize.HighPart = fad.nFileSizeHigh;
+        int modelSizeMB = (int)(fileSize.QuadPart / (1024 * 1024));
+        
+        if (modelSizeMB <= 0)
+            return -1;
 
-    /* Estimate actual size after context overhead (20% reserve for KV cache, etc) */
-    int reservedMB = (int)(modelSizeMB * 0.20);  /* 20% overhead for context */
+        /* Estimate actual size after context overhead (20% reserve for KV cache, etc) */
+        int reservedMB = (int)(modelSizeMB * 0.20);
+        
+        const char *quantType = DetectQuantizationType(modelName);
+        double scaleFactor = GetQuantizationScaleFactor(quantType);
+        
+        /* Get available VRAM */
+        int vramMB = GetAvailableVRAM();
+        
+        /* Available for layers = total VRAM - model size - reserves */
+        int availForLayers = vramMB - modelSizeMB - reservedMB;
+        
+        if (availForLayers <= 0)
+            return -1;
+        
+        /* Rough heuristic */
+        int estimatedLayers = (availForLayers * modelSizeMB) / (1024 * 256);
+        
+        if (estimatedLayers <= 0)
+            estimatedLayers = 1;
+        
+        /* Cap at 128 layers (very conservative upper bound) */
+        if (estimatedLayers > 128)
+            estimatedLayers = 128;
+        
+        return estimatedLayers;
+    }
     
-    const char *quantType = DetectQuantizationType(modelName);
-    double scaleFactor = GetQuantizationScaleFactor(quantType);
-    
-    /* Calculate effective memory needed per layer */
-    /* Rough estimate: most modern LLMs use ~300-500MB per layer in fp32 form */
-    /* With quantization scaling applied */
-    int vramMB = GetAvailableVRAM();
-    
-    /* Conservative estimate: assume each layer is ~400MB equivalent (after quantization) */
-    int bytePerLayer = (int)(400.0 / scaleFactor);  /* Adjust for quantization */
-    
-    /* Available for layers = total VRAM - model size - reserves */
-    int availForLayers = vramMB - modelSizeMB - reservedMB;
-    
-    if (availForLayers <= 0)
-        return -1;  /* Not enough VRAM, use fallback */
-    
-    /* Estimate is very rough; use conservative calculation */
-    /* Most models have 32-40 layers; we estimate based on VRAM availability */
-    int estimatedLayers = (availForLayers * modelSizeMB) / (1024 * 256);  /* Heuristic */
-    
-    if (estimatedLayers <= 0)
-        estimatedLayers = 1;
-    
-    /* Cap at 128 layers (very conservative upper bound) */
-    if (estimatedLayers > 128)
-        estimatedLayers = 128;
-    
-    return estimatedLayers;
+    return -1;  /* File not found */
 }
 
 /*
@@ -306,7 +1310,7 @@ static void ShowOnlyOnPage(HWND hwnd)
     ShowWindow(hBtnGenerate,   SW_HIDE);
     ShowWindow(hBtnCopy,       SW_HIDE);
     ShowWindow(hBtnPrev,       SW_HIDE);
-    SetWindowTextA(hBtnNext, "Generate Command");
+    SetWindowTextA(hBtnNext, "Save Setup");
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
@@ -315,8 +1319,12 @@ static void ShowOnlyOnPage(HWND hwnd)
    ────────────────────────────────────────────── */
 static void ScanModels(void)
 {
+    int selectedIndex = 0;
+    int i;
+
     nModels = 0;
-    SendMessageA(hModelCombo, CB_RESETCONTENT, 0, 0);
+    if (hModelCombo)
+        SendMessageA(hModelCombo, CB_RESETCONTENT, 0, 0);
     
     /* Reset GPU auto-detection state when rescanning models */
     bGpuFieldEdited = FALSE;
@@ -335,7 +1343,8 @@ static void ScanModels(void)
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
             if (nModels < MAX_MODELS) {
                 lstrcpynA(sModels[nModels], fd.cFileName, MAX_PATH);
-                SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[nModels]);
+                if (hModelCombo)
+                    SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[nModels]);
                 nModels++;
             }
         }
@@ -343,9 +1352,18 @@ static void ScanModels(void)
 
     FindClose(hFind);
 
-    if (nModels > 0) {
-        SendMessageA(hModelCombo, CB_SETCURSEL, 0, 0);
-        /* Auto-detect GPU layers for the first model */
+    if (!EnsureSelectedModelExists())
+        return;
+
+    for (i = 0; i < nModels; ++i) {
+        if (lstrcmpiA(sModels[i], sSelectedModel) == 0) {
+            selectedIndex = i;
+            break;
+        }
+    }
+
+    if (hModelCombo && nModels > 0) {
+        SendMessageA(hModelCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
         AutoDetectAndSetGpuLayers();
     }
 }
@@ -353,19 +1371,22 @@ static void ScanModels(void)
 static void SelectServerFile(HWND hwnd)
 {
     OPENFILENAMEA ofn;
+    char selectedFile[MAX_PATH] = "";
+
     ZeroMemory(&ofn, sizeof(ofn));
-    ZeroMemory(sServer, sizeof(sServer));
 
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = sServer;
+    ofn.lpstrFile = selectedFile;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = "Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
     ofn.lpstrTitle = "Select Server Executable";
 
-    if (GetOpenFileNameA(&ofn))
+    if (GetOpenFileNameA(&ofn)) {
+        lstrcpynA(sServer, selectedFile, sizeof(sServer));
         SetWindowTextA(hServerEdit, sServer);
+    }
 }
 
 static void SelectFolder(HWND hwnd)
@@ -414,76 +1435,47 @@ static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int 
 static void GenerateCommand(HWND hwnd)
 {
     int idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
+    int cmdTypeIdx = (int)SendMessageA(hCommandTypeCombo, CB_GETCURSEL, 0, 0);
+    int isCliMode = (cmdTypeIdx == 1);
+
+    if (!sServer[0] && hServerEdit)
+        GetWindowTextA(hServerEdit, sServer, sizeof(sServer));
+    if (!sFolder[0] && hFolderEdit)
+        GetWindowTextA(hFolderEdit, sFolder, sizeof(sFolder));
+
     if (idx == CB_ERR) {
-        MessageBoxA(hwnd, "No model selected. Browse a model folder first.", "Error", MB_ICONERROR);
+        MessageBoxA(hwnd, "No model selected. Browse a model folder first.", "Setup incomplete", MB_ICONERROR);
         return;
     }
 
-    /* Get command type: Server or CLI */
-    int cmdTypeIdx = (int)SendMessageA(hCommandTypeCombo, CB_GETCURSEL, 0, 0);
-    int isCliMode = (cmdTypeIdx == 1);  /* Index 1 = CLI (Server is 0) */
-
-    int serverTypeIdx = (int)SendMessageA(hServerTypeCombo, CB_GETCURSEL, 0, 0);
-    char serverType[64] = {0};
-    SendMessageA(hServerTypeCombo, CB_GETLBTEXT, (WPARAM)serverTypeIdx, (LPARAM)serverType);
-
-    char model[MAX_PATH] = {0};
-    char ctx[32] = {0};
-    char gpu[32] = {0};
-    char port[32] = {0};
-    char threads[32] = {0};
-
-    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)model);
-    GetWindowTextA(hCtxEdit, ctx, sizeof(ctx));
-    GetWindowTextA(hGpuEdit, gpu, sizeof(gpu));
-    GetWindowTextA(hPortEdit, port, sizeof(port));
-    GetWindowTextA(hThreadsEdit, threads, sizeof(threads));
-
     if (!sServer[0]) {
-        MessageBoxA(hwnd, "Select the server executable first.", "Error", MB_ICONERROR);
+        MessageBoxA(hwnd, "Select the server executable first.", "Setup incomplete", MB_ICONERROR);
         return;
     }
 
     if (!sFolder[0]) {
-        MessageBoxA(hwnd, "Select the model folder first.", "Error", MB_ICONERROR);
+        MessageBoxA(hwnd, "Select the model folder first.", "Setup incomplete", MB_ICONERROR);
         return;
     }
 
-    if (isCliMode) {
-        /* Generate llama-cli command */
-        char cliPath[MAX_PATH] = {0};
-        GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
-
-        snprintf(
-            sCommand, sizeof(sCommand),
-            "& \"%s\" -m \"%s\\%s\" -c %s -ngl %s -t %s -color auto",
-            cliPath,
-            sFolder,
-            model,
-            ctx[0] ? ctx : "2048",
-            gpu[0] ? gpu : "-1",
-            threads[0] ? threads : "4"
-        );
-    } else {
-        /* Generate llama-server command (original behavior) */
-        const char *host = (serverTypeIdx == 1) ? "0.0.0.0" : "127.0.0.1";
-
-        snprintf(
-            sCommand, sizeof(sCommand),
-            "& \"%s\" -m \"%s\\%s\" -c %s -ngl %s --port %s -t %s --host %s",
-            sServer,
-            sFolder,
-            model,
-            ctx[0] ? ctx : "2048",
-            gpu[0] ? gpu : "-1",
-            port[0] ? port : "8000",
-            threads[0] ? threads : "4",
-            host
-        );
+    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
+    if (!SaveConfigToDisk()) {
+        MessageBoxA(hwnd, "Could not save the Valora configuration.", "Save failed", MB_ICONERROR);
+        return;
     }
 
+    snprintf(
+        sCommand, sizeof(sCommand),
+        "valora models\r\nvalora run\r\nvalora serve\r\n\r\nCurrent quick command: %s",
+        isCliMode ? "valora run" : "valora serve"
+    );
     CopyToClipboardA(hwnd, sCommand);
-    MessageBoxA(hwnd, "Command copied to clipboard successfully!", "Success", MB_OK | MB_ICONINFORMATION);
+    MessageBoxA(
+        hwnd,
+        "Setup saved.\n\nYou can now use:\nvalora models\nvalora run\nvalora serve\n\nThe command list has been copied to your clipboard.",
+        "Valora ready",
+        MB_OK | MB_ICONINFORMATION
+    );
 }
 
 /* ──────────────────────────────────────────────
@@ -501,9 +1493,15 @@ static void DrawLabel(HDC hdc, const char *text, int x, int y, int w, int h, HFO
 
 static void DrawHeader(HDC hdc, RECT rc)
 {
+    RECT accent = {0, 0, rc.right, 4};
+    HBRUSH accentBrush = CreateSolidBrush(C_ACCENT);
+
+    FillRect(hdc, &accent, accentBrush);
+    DeleteObject(accentBrush);
+
     SetBkMode(hdc, TRANSPARENT);
-    DrawLabel(hdc, "Llama Server Setup", 0, 16, rc.right, 38, hFontTitle, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    DrawLabel(hdc, "Configure paths and copy the launch command to your clipboard.", 0, 50, rc.right, 20, hFontSmall, C_MUTED, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawLabel(hdc, "Valora Setup", 0, 22, rc.right, 40, hFontTitle, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawLabel(hdc, "Set your paths once, then launch models from the terminal without reopening setup.", 0, 58, rc.right, 20, hFontSmall, C_MUTED, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 static void DrawCardFrame(HDC hdc, RECT rc)
@@ -516,9 +1514,17 @@ static void DrawCardFrame(HDC hdc, RECT rc)
     int cardX = (rc.right - cardW) / 2;
     int cardY = HEADER_H + 12;
 
+    RECT glow;
+    HBRUSH glowBrush = CreateSolidBrush(C_ACCENT_SOFT);
     HBRUSH b = CreateSolidBrush(C_PANEL);
     HPEN p = CreatePen(PS_SOLID, 1, C_BORDER);
     
+    glow.left = cardX - 2;
+    glow.top = cardY - 2;
+    glow.right = cardX + cardW + 2;
+    glow.bottom = cardY + cardH + 2;
+    FillRect(hdc, &glow, glowBrush);
+
     HBRUSH oldB = (HBRUSH)SelectObject(hdc, b);
     HPEN oldP = (HPEN)SelectObject(hdc, p);
 
@@ -529,6 +1535,7 @@ static void DrawCardFrame(HDC hdc, RECT rc)
 
     DeleteObject(p);
     DeleteObject(b);
+    DeleteObject(glowBrush);
 }
 
 /* ──────────────────────────────────────────────
@@ -551,11 +1558,11 @@ static void LayoutControls(HWND hwnd)
 
     int innerX = cardX + 28;
     int innerW = cardW - 56;
-    int rowH = 24;      
+    int rowH = 28;
     int labelH = 16;    
-    int gapY = 8;
-    int colW = (innerW - 8) / 2;  // Two columns with small gap
-    int y = cardY + 18; 
+    int gapY = 11;
+    int colW = (innerW - 12) / 2;
+    int y = cardY + 22;
 
     // Server Type (new option)
     MoveWindow(hLblServerType, innerX, y, innerW, labelH, TRUE);
@@ -572,15 +1579,15 @@ static void LayoutControls(HWND hwnd)
     // Server Executable
     MoveWindow(hLblServer, innerX, y, innerW, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hServerEdit, innerX, y, innerW - 85, rowH, TRUE);
-    MoveWindow(hBtnServer,  innerX + innerW - 78, y - 1, 78, rowH + 2, TRUE);
+    MoveWindow(hServerEdit, innerX, y, innerW - 98, rowH, TRUE);
+    MoveWindow(hBtnServer,  innerX + innerW - 88, y - 1, 88, rowH + 2, TRUE);
     y += rowH + gapY;
 
     // Model Folder
     MoveWindow(hLblFolder, innerX, y, innerW, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hFolderEdit, innerX, y, innerW - 85, rowH, TRUE);
-    MoveWindow(hBtnFolder,  innerX + innerW - 78, y - 1, 78, rowH + 2, TRUE);
+    MoveWindow(hFolderEdit, innerX, y, innerW - 98, rowH, TRUE);
+    MoveWindow(hBtnFolder,  innerX + innerW - 88, y - 1, 88, rowH + 2, TRUE);
     y += rowH + gapY;
 
     // Model Combo (Height is dropdown height)
@@ -596,7 +1603,7 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(hCtxEdit, innerX, y, colW, rowH, TRUE);
     
     // Right column: GPU Layers (at same y level)
-    int rightColX = innerX + colW + 8;
+    int rightColX = innerX + colW + 12;
     MoveWindow(hLblGpu, rightColX, y - labelH - 2, colW, labelH, TRUE);
     MoveWindow(hGpuEdit, rightColX, y, colW, rowH, TRUE);
     y += rowH + gapY;
@@ -612,7 +1619,7 @@ static void LayoutControls(HWND hwnd)
     y += rowH + 20;
 
     // Generate button - positioned with more spacing
-    MoveWindow(hBtnNext, innerX, y, innerW, 32, TRUE);
+    MoveWindow(hBtnNext, innerX, y, innerW, 38, TRUE);
 }
 
 /* ──────────────────────────────────────────────
@@ -717,7 +1724,7 @@ static void CreateControls(HWND hwnd)
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PREV, hi, NULL);
 
-    hBtnNext = CreateWindowA("BUTTON", "Generate Command",
+    hBtnNext = CreateWindowA("BUTTON", "Save Setup",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hi, NULL);
 
@@ -812,13 +1819,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             brPanel2 = CreateSolidBrush(C_PANEL2);
             brInput  = CreateSolidBrush(C_INPUT);
 
-            hFontTitle = CreateFontA(24, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontBody  = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontSmall = CreateFontA(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontBold  = CreateFontA(15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontLabel = CreateFontA(14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+            hFontTitle = CreateFontA(30, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
+            hFontBody  = CreateFontA(17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+            hFontSmall = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+            hFontBold  = CreateFontA(17, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
+            hFontLabel = CreateFontA(15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
 
             CreateControls(hwnd);
+            if (LoadConfigFromDisk()) {
+                ApplyLoadedConfigToControls();
+                ScanModels();
+                ApplyLoadedConfigToControls();
+            }
         }
         return 0;
 
@@ -848,6 +1860,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             
             /* Handle combo box model selection change */
             if (hCtl == hModelCombo && notifyCode == CBN_SELCHANGE) {
+                int sel = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
+                if (sel != CB_ERR)
+                    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)sSelectedModel);
                 AutoDetectAndSetGpuLayers();
             }
             
@@ -927,11 +1942,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 /* ──────────────────────────────────────────────
    Entry point
    ────────────────────────────────────────────── */
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
+static int RunGui(HINSTANCE hInst, int nShow)
 {
-    (void)hPrev;
-    (void)lpCmd;
-
     WNDCLASSEXA wc;
     ZeroMemory(&wc, sizeof(wc));
 
@@ -957,7 +1969,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     int sy = GetSystemMetrics(SM_CYSCREEN);
 
     HWND hwnd = CreateWindowExA(
-        0, "LlamaSetupRedesign", "Llama Server Setup",
+        0, "LlamaSetupRedesign", "Valora Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (sx - winW) / 2, (sy - winH) / 2, winW, winH,
         NULL, NULL, hInst, NULL
@@ -975,4 +1987,164 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     }
 
     return (int)msg.wParam;
+}
+
+static int EnsureCliConfigReady(BOOL requireCliExecutable)
+{
+    char cliPath[MAX_PATH];
+
+    if (!LoadConfigFromDisk()) {
+        fprintf(stderr, "Valora is not configured yet. Run `valora setup` first.\n");
+        return 1;
+    }
+
+    if (!FileExistsA_(sServer)) {
+        fprintf(stderr, "Configured server executable was not found: %s\n", sServer);
+        return 1;
+    }
+
+    if (!DirectoryExistsA_(sFolder)) {
+        fprintf(stderr, "Configured models folder was not found: %s\n", sFolder);
+        return 1;
+    }
+
+    ScanModels();
+    if (!EnsureSelectedModelExists()) {
+        fprintf(stderr, "No models were found in %s\n", sFolder);
+        return 1;
+    }
+
+    if (requireCliExecutable) {
+        GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
+        if (!FileExistsA_(cliPath)) {
+            fprintf(stderr, "Expected CLI executable was not found: %s\n", cliPath);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int EnsureModelsFolderReady(void)
+{
+    if (!LoadConfigFromDisk()) {
+        fprintf(stderr, "Valora is not configured yet. Run `valora setup` first.\n");
+        return 0;
+    }
+
+    if (!sFolder[0]) {
+        fprintf(stderr, "No models folder is saved yet. Run `valora setup` first.\n");
+        return 0;
+    }
+
+    if (!DirectoryExistsA_(sFolder)) {
+        fprintf(stderr, "Configured models folder was not found: %s\n", sFolder);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int RunCli(int argc, char **argv)
+{
+    if (argc <= 1) {
+        HideStandaloneConsoleWindow();
+        return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+    }
+
+    if (lstrcmpiA(argv[1], "setup") == 0) {
+        HideStandaloneConsoleWindow();
+        return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+    }
+
+    AttachConsoleStreams();
+
+    if (lstrcmpiA(argv[1], "models") == 0 || lstrcmpiA(argv[1], "list") == 0) {
+        if (EnsureCliConfigReady(FALSE) != 0)
+            return 1;
+        return PrintModels();
+    }
+
+    if (lstrcmpiA(argv[1], "get") == 0) {
+        if (argc <= 2 || !argv[2][0]) {
+            fprintf(stderr, "Usage: valora get <owner/repo|hf_url>\n");
+            return 1;
+        }
+        return DownloadFromHuggingFace(argv[2]);
+    }
+
+    if (lstrcmpiA(argv[1], "run") == 0) {
+        if (EnsureCliConfigReady(TRUE) != 0)
+            return 1;
+
+        /* Check if model name provided as argument */
+        if (argc > 2 && argv[2][0]) {
+            /* Use provided model name */
+            lstrcpynA(sSelectedModel, argv[2], sizeof(sSelectedModel));
+        } else {
+            /* Show interactive model selector */
+            char selectedModel[MAX_PATH];
+            if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) < 0) {
+                printf("Model selection cancelled.\n");
+                return 0;
+            }
+            lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
+        }
+
+        BuildRunCommand(sCommand, sizeof(sCommand), NULL);
+        return RunChildProcess(sCommand);
+    }
+
+    if (lstrcmpiA(argv[1], "serve") == 0 || lstrcmpiA(argv[1], "server") == 0) {
+        if (EnsureCliConfigReady(FALSE) != 0)
+            return 1;
+
+        /* Check if model name provided as argument */
+        if (argc > 2 && argv[2][0]) {
+            /* Use provided model name */
+            lstrcpynA(sSelectedModel, argv[2], sizeof(sSelectedModel));
+        } else {
+            /* Show interactive model selector */
+            char selectedModel[MAX_PATH];
+            if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) < 0) {
+                printf("Model selection cancelled.\n");
+                return 0;
+            }
+            lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
+        }
+
+        BuildServeCommand(sCommand, sizeof(sCommand));
+        return RunChildProcess(sCommand);
+    }
+
+    if (lstrcmpiA(argv[1], "get") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: valora get <huggingface_url>\n");
+            fprintf(stderr, "Example: valora get LiquidAI/LFM2.5-1.2B-Instruct-GGUF\n");
+            return 1;
+        }
+        return DownloadFromHuggingFace(argv[2]);
+    }
+
+    return PrintUsage();
+}
+
+int main(int argc, char **argv)
+{
+    return RunCli(argc, argv);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
+{
+    int argc;
+    char **argv;
+
+    (void)hInst;
+    (void)hPrev;
+    (void)lpCmd;
+    (void)nShow;
+
+    argv = __argv;
+    argc = __argc;
+    return RunCli(argc, argv);
 }

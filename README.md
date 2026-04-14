@@ -1,1 +1,16 @@
-<img width="1012" height="815" alt="image" src="https://github.com/user-attachments/assets/e47fa9c4-5e6f-4532-a824-e082fe9ceb86" />
+## Valora
+
+One-time Windows setup UI for `llama-server.exe` plus a saved CLI workflow.
+
+After saving setup once, you can use:
+
+```powershell
+valora setup
+valora list
+valora models
+valora run
+valora serve
+valora get LiquidAI/LFM2.5-1.2B-Instruct-GGUF
+```
+
+The configuration is stored in `%APPDATA%\Valora\config.ini`.
