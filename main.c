@@ -3330,15 +3330,115 @@ static void EnsureServerRunning(void) {
 
 static HANDLE sChatServerProcess = NULL;
 static DWORD sChatServerProcessId = 0;
+static BOOL sServerStartedByUs = FALSE;
 
 static void StopChatServer(void) {
     if (sChatServerProcess) {
-        printf("\n\x1b[90mStopping server...\x1b[0m\n");
         TerminateProcess(sChatServerProcess, 0);
         CloseHandle(sChatServerProcess);
         sChatServerProcess = NULL;
-        sChatServerProcessId = 0;
     }
+    sChatServerProcessId = 0;
+    system("taskkill /F /IM llama-server.exe 2>nul");
+}
+
+static char* HttpGet(const char *query);
+
+static void DoWebSearch(void) {
+    char searchQuery[512] = {0};
+    char apiKey[256] = {0};
+    int choice;
+    
+    printf("\n\x1b[36m=== Web Search ===\x1b[0m\n");
+    printf("1. DuckDuckGo (free)\n");
+    printf("2. SerpAPI (requires key)\n");
+    printf("0. Cancel\n");
+    printf("Choice: ");
+    choice = getchar();
+    while (getchar() != '\n');
+    
+    if (choice == '0') return;
+    if (choice == '2') {
+        printf("SerpAPI key (Enter for saved): ");
+        if (fgets(apiKey, sizeof(apiKey), stdin)) {
+            apiKey[strcspn(apiKey, "\n")] = 0;
+            if (apiKey[0]) WritePrivateProfileStringA("search", "serp_api_key", apiKey, sConfigPath);
+            else GetPrivateProfileStringA("search", "serp_api_key", "", apiKey, sizeof(apiKey), sConfigPath);
+        }
+        if (!apiKey[0]) { printf("\x1b[31mNo API key\x1b[0m\n"); return; }
+    }
+    
+    printf("Search query: ");
+    if (fgets(searchQuery, sizeof(searchQuery), stdin)) {
+        searchQuery[strcspn(searchQuery, "\n")] = 0;
+    }
+    if (!searchQuery[0]) return;
+    
+    printf("\x1b[90mSearching...\x1b[0m\n");
+    
+    if (choice == '1') {
+        char *result = HttpGet(searchQuery);
+        if (result) { printf("\x1b[36m=== Results ===\x1b[0m\n%s\n", result); free(result); }
+        else printf("\x1b[31mSearch failed\x1b[0m\n");
+    } else if (choice == '2') {
+        char *result = HttpGet(searchQuery);
+        if (result) { printf("\x1b[36m=== Results ===\x1b[0m\n%s\n", result); free(result); }
+        else printf("\x1b[31mSearch failed\x1b[0m\n");
+    }
+}
+
+static char* HttpGet(const char *query) {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    char *result = NULL;
+    char url[2048] = {0};
+    char host[256] = {0}, path[1024] = {0};
+    const char *p;
+    BOOL bResults;
+    DWORD bytesRead;
+    
+    if (!query || !*query) return NULL;
+    
+    snprintf(url, sizeof(url), "https://duckduckgo.com/?q=%s&format=json", query);
+    p = url + 8;
+    while (*p && *p != '/') p++;
+    strncpy(host, url + 8, p - url - 8);
+    strcpy(path, *p ? p : "/");
+    
+    hSession = InternetOpen("Valora/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hSession) return NULL;
+    
+    hConnect = InternetConnect(hSession, host, 443, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) { InternetCloseHandle(hSession); return NULL; }
+    
+    hRequest = HttpOpenRequest(hConnect, "GET", path, NULL, NULL, NULL, INTERNET_FLAG_SECURE, 0);
+    if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hSession); return NULL; }
+    
+    bResults = HttpSendRequest(hRequest, NULL, 0, NULL, 0);
+    if (bResults) {
+        char buffer[8192];
+        while (InternetReadFile(hRequest, buffer, sizeof(buffer)-1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = 0;
+            size_t len = result ? strlen(result) : 0;
+            char *newresult = realloc(result, len + bytesRead + 1);
+            if (newresult) {
+                result = newresult;
+                memcpy(result + len, buffer, bytesRead + 1);
+            }
+        }
+    }
+    
+    if (hRequest) InternetCloseHandle(hRequest);
+    if (hConnect) InternetCloseHandle(hConnect);
+    if (hSession) InternetCloseHandle(hSession);
+    
+    return result;
+}
+
+static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
+    if (sServerStartedByUs && sChatServerProcess) {
+        StopChatServer();
+    }
+    return FALSE;
 }
 
 static BOOL IsServerRunning(void) {
@@ -3521,7 +3621,8 @@ static int RunChatMode(void) {
         if (StartServerForChat() != 0) {
             return 1;
         }
-        serverStartedByUs = TRUE;
+        sServerStartedByUs = TRUE;
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
         system("cls");
         printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
         printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
@@ -3542,6 +3643,21 @@ static int RunChatMode(void) {
         }
         
         input[strcspn(input, "\n")] = '\0';
+        
+        if (input[0] == '/' && input[1] == '\0') {
+            printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
+            printf("  /exit        Exit and stop server\n");
+            printf("  /clear       Clear chat history\n");
+            printf("  /cls         Clear terminal\n");
+            printf("  /model       Change model\n");
+            printf("  /restart     Restart llama server\n");
+            printf("  /websearch   Search web\n");
+            printf("  /search      Same as /websearch\n");
+            printf("  /help        Show help\n\n");
+            printf("\x1b[32mYou \x1b[0m> ");
+            if (!fgets(input, sizeof(input), stdin)) { exitCode = 0; break; }
+            input[strcspn(input, "\n")] = '\0';
+        }
         
         if (strcmp(input, "/exit") == 0 || strcmp(input, "exit") == 0) {
             exitCode = 0;
@@ -3570,6 +3686,25 @@ static int RunChatMode(void) {
             if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) >= 0) {
                 printf("\x1b[33mModel change requires restart. Please exit and run 'valora chat' again.\x1b[0m\n");
             }
+            continue;
+        }
+        
+        if (strcmp(input, "/restart") == 0) {
+            printf("\x1b[90mRestarting server...\x1b[0m\n");
+            if (sServerStartedByUs && sChatServerProcess) {
+                StopChatServer();
+            }
+            Sleep(1000);
+            if (StartServerForChat() != 0) {
+                printf("\x1b[31mFailed to restart server\x1b[0m\n");
+            } else {
+                printf("\x1b[32mServer restarted\x1b[0m\n");
+            }
+            continue;
+        }
+        
+        if (strcmp(input, "/websearch") == 0 || strcmp(input, "/search") == 0) {
+            DoWebSearch();
             continue;
         }
         
