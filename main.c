@@ -348,10 +348,7 @@ static int EstimateContextMemoryMB(int ctxLen)
 
 static SafetyDecision CheckLoadSafety(const char *modelName, const char *projectorName, int ctxLen, int gpuLayers)
 {
-    ULONGLONG availRAM = GetAvailableRamMB();
     ULONGLONG totalRAM = GetSystemRamMB();
-    ULONGLONG commitUsed = GetCommitChargeMB();
-    ULONGLONG commitLimit = GetTotalCommitLimitMB();
     ULONGLONG availVRAM = GetAvailableVRAMMB();
 
     int modelSizeMB = GetModelSizeMB(modelName);
@@ -359,69 +356,15 @@ static SafetyDecision CheckLoadSafety(const char *modelName, const char *project
     int ctxMemoryMB = EstimateContextMemoryMB(ctxLen);
 
     int totalModelRAM = modelSizeMB + projectorSizeMB + ctxMemoryMB;
-    int estimatedGPU = 0;
-    if (gpuLayers > 0 && modelSizeMB > 0) {
-        double quantFactor = 0.45;
-        const char *quant = DetectQuantizationType(modelName);
-        if (strstr(quant, "Q8")) quantFactor = 0.95;
-        else if (strstr(quant, "Q6")) quantFactor = 0.70;
-        else if (strstr(quant, "Q5")) quantFactor = 0.55;
-        else if (strstr(quant, "Q3")) quantFactor = 0.30;
 
-        estimatedGPU = (int)(modelSizeMB * quantFactor * (gpuLayers / 35.0));
-        if (estimatedGPU > (int)availVRAM)
-            return SAFETY_REFUSE;
-    }
-
-    if (commitLimit > 0) {
-        int commitPercent = (int)((commitUsed * 100) / commitLimit);
-        if (commitPercent >= DANGER_COMMIT_PERCENT) {
-            lstrcpynA(sLastSafetyReason, "COMMIT_LIMIT", sizeof(sLastSafetyReason));
-            return SAFETY_REFUSE;
-        }
-    }
-
-    if (availRAM < (ULONGLONG)SAFE_RAM_BUFFER_MB) {
-        lstrcpynA(sLastSafetyReason, "LOW_RAM", sizeof(sLastSafetyReason));
-        return SAFETY_REFUSE;
-    }
-
-    if ((availRAM - totalModelRAM) < (ULONGLONG)SAFE_RAM_BUFFER_MB) {
-        lstrcpynA(sLastSafetyReason, "MODEL_TOO_LARGE", sizeof(sLastSafetyReason));
-        return SAFETY_REFUSE;
-    }
-
-    if (totalModelRAM > (int)(totalRAM * 0.8)) {
-        lstrcpynA(sLastSafetyReason, "MODEL_TOO_LARGE", sizeof(sLastSafetyReason));
-        return SAFETY_REFUSE;
-    }
-
-    if (availVRAM > 0 && estimatedGPU > 0 && estimatedGPU > (int)availVRAM) {
-        lstrcpynA(sLastSafetyReason, "LOW_VRAM", sizeof(sLastSafetyReason));
-        return SAFETY_REFUSE;
-    }
-
-    if (projectorSizeMB > 0 && projectorSizeMB > 500) {
+    if (projectorSizeMB > 0 && projectorSizeMB > 1000) {
         lstrcpynA(sLastSafetyReason, "PROJECTOR_TOO_HEAVY", sizeof(sLastSafetyReason));
         return SAFETY_REFUSE;
     }
 
-    if (ctxLen > 32768 && availRAM < 8192) {
-        lstrcpynA(sLastSafetyReason, "HIGH_CONTEXT_LOW_RAM", sizeof(sLastSafetyReason));
+    if (totalModelRAM > (int)(totalRAM * 0.95)) {
+        lstrcpynA(sLastSafetyReason, "MODEL_TOO_LARGE", sizeof(sLastSafetyReason));
         return SAFETY_REFUSE;
-    }
-
-    if (commitLimit > 0) {
-        int commitPercent = (int)((commitUsed * 100) / commitLimit);
-        if (commitPercent >= WARNING_COMMIT_PERCENT) {
-            lstrcpynA(sLastSafetyReason, "COMMIT_WARNING", sizeof(sLastSafetyReason));
-            return SAFETY_ALLOW_WITH_WARNINGS;
-        }
-    }
-
-    if (availRAM < (ULONGLONG)WARNING_RAM_MB) {
-        lstrcpynA(sLastSafetyReason, "LOW_RAM_WARNING", sizeof(sLastSafetyReason));
-        return SAFETY_ALLOW_WITH_WARNINGS;
     }
 
     return SAFETY_ALLOW;
@@ -3151,6 +3094,21 @@ static size_t HttpWriteCallback(void *contents, size_t size, size_t nmemb, char 
     return realsize;
 }
 
+static DWORD WINAPI ThinkingAnimationThread(LPVOID param) {
+    int *running = (int*)param;
+    const char *frames = "|/-\\";
+    int frame = 0;
+    while (*running) {
+        printf("\r\x1b[36m[%c]\x1b[0m \x1b[33mProcessing...\x1b[0m ", frames[frame % 4]);
+        fflush(stdout);
+        Sleep(100);
+        frame++;
+    }
+    printf("\r                                 \r");
+    fflush(stdout);
+    return 0;
+}
+
 static char* HttpPost(const char *url, const char *json_data) {
     HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
     char *result = NULL;
@@ -3253,16 +3211,21 @@ static char* ParseChatResponse(const char *json_response) {
     if (!json_response)
         return NULL;
     
+    if (strstr(json_response, "\"error\""))
+        return NULL;
+    
     content_start = strstr(json_response, "\"content\"");
+    if (!content_start) {
+        content_start = strstr(json_response, "\"text\"");
+    }
     if (!content_start)
         return NULL;
     
-    content_start = strchr(content_start, '"');
-    if (!content_start) return NULL;
+    while (*content_start && *content_start != ':') content_start++;
+    if (!*content_start) return NULL;
     content_start++;
-    content_start = strchr(content_start, '"');
-    if (!content_start) return NULL;
-    content_start++;
+    while (*content_start && (*content_start == ' ' || *content_start == '"')) content_start++;
+    if (!*content_start) return NULL;
     
     content_end = content_start;
     while (*content_end && *content_end != '"') {
@@ -3272,8 +3235,8 @@ static char* ParseChatResponse(const char *json_response) {
     }
     
     len = (int)(content_end - content_start);
-    if (len >= (int)sizeof(result))
-        len = sizeof(result) - 1;
+    if (len <= 0 || len >= (int)sizeof(result))
+        return NULL;
     
     strncpy(result, content_start, len);
     result[len] = '\0';
@@ -3283,21 +3246,41 @@ static char* ParseChatResponse(const char *json_response) {
         while (*p) {
             if (*p == '\\' && *(p + 1) == 'n') { *q++ = '\n'; p += 2; }
             else if (*p == '\\' && *(p + 1) == 't') { *q++ = '\t'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == 'r') { *q++ = '\r'; p += 2; }
             else *q++ = *p++;
         }
         *q = '\0';
     }
     
+    {
+        char *p = result, *q = result;
+        while (*p) {
+            if (strncmp(p, "<|im_end|>", 10) == 0) { p += 10; continue; }
+            if (strncmp(p, "<|im_start|>", 11) == 0) { p += 11; continue; }
+            if (strncmp(p, "<|endoftext|>", 12) == 0) { p += 12; continue; }
+            *q++ = *p++;
+        }
+        *q = '\0';
+    }
+    
+    while (*result && (*result == '\n' || *result == '\r' || *result == ' ')) memmove(result, result+1, strlen(result));
+    
     return result;
 }
 
 static void PrintWrapped(const char *text, int width) {
+    int len = (int)strlen(text);
+    int delay = (len < 50) ? 30 : (len < 200) ? 15 : 3;
     int col = 0;
     while (*text) {
         if (*text == '\n') { putchar('\n'); col = 0; text++; continue; }
         if (col >= width) { putchar('\n'); col = 0; }
-        putchar(*text++); col++;
+        putchar(*text);
+        if (delay > 3) { fflush(stdout); Sleep(delay); }
+        col++;
+        text++;
     }
+    fflush(stdout);
     if (col > 0) putchar('\n');
 }
 
@@ -3465,23 +3448,6 @@ static BOOL IsServerRunning(void) {
     return running;
 }
 
-static void WaitForServerReady(void) {
-    int i;
-    printf("\x1b[90mWaiting for server to be ready");
-    fflush(stdout);
-    
-    for (i = 0; i < 60; i++) {
-        Sleep(1000);
-        if (IsServerRunning()) {
-            printf("\x1b[90m OK\x1b[0m\n\n");
-            return;
-        }
-        printf("\x1b[90m.\x1b[0m");
-        fflush(stdout);
-    }
-    printf("\x1b[33m Server may still be starting...\x1b[0m\n\n");
-}
-
 static int StartServerForChat(void) {
     char cliPath[MAX_PATH];
     char modelPath[MAX_PATH * 2];
@@ -3518,11 +3484,15 @@ static int StartServerForChat(void) {
     
     {
         char projector[MAX_PATH] = "";
-        FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
-        if (projector[0])
-            lstrcpynA(projectorPath, projector, sizeof(projectorPath));
-        else
+        if (strcmp(GetModelTypeLabel(sSelectedModel), "Vision") == 0) {
+            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            if (projector[0])
+                lstrcpynA(projectorPath, projector, sizeof(projectorPath));
+            else
+                projectorPath[0] = '\0';
+        } else {
             projectorPath[0] = '\0';
+        }
     }
     
     safety = CheckLoadSafety(sSelectedModel, projectorPath[0] ? projectorPath : NULL, 2048, -1);
@@ -3585,6 +3555,9 @@ static int StartServerForChat(void) {
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     
+    printf("\x1b[90mStarting server: %s\x1b[0m\n", command);
+    fflush(stdout);
+    
     if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         fprintf(stderr, "\n\x1b[31mFailed to start server. Error: %lu\x1b[0m\n", GetLastError());
         return -1;
@@ -3594,9 +3567,7 @@ static int StartServerForChat(void) {
     sChatServerProcessId = pi.dwProcessId;
     CloseHandle(pi.hThread);
     
-    printf("\x1b[90mStarting server...\x1b[0m ");
-    fflush(stdout);
-    WaitForServerReady();
+    Sleep(3000);
     
     return 0;
 }
@@ -3633,7 +3604,7 @@ static int RunChatMode(void) {
     
     snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     
-    printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen\n\n");
+    printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen | '\x1b[33m/\x1b[90m' for commands\n\n");
     
     while (1) {
         printf("\x1b[32mYou \x1b[0m> ");
@@ -3642,7 +3613,7 @@ static int RunChatMode(void) {
             break;
         }
         
-        input[strcspn(input, "\n")] = '\0';
+input[strcspn(input, "\n")] = '\0';
         
         if (input[0] == '/' && input[1] == '\0') {
             printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
@@ -3651,7 +3622,22 @@ static int RunChatMode(void) {
             printf("  /cls         Clear terminal\n");
             printf("  /model       Change model\n");
             printf("  /restart     Restart llama server\n");
-            printf("  /websearch   Search web\n");
+            printf("  /websearch   Search web (DuckDuckGo/SerpAPI)\n");
+            printf("  /search      Same as /websearch\n");
+            printf("  /help        Show help\n\n");
+            printf("\x1b[32mYou \x1b[0m> ");
+            if (!fgets(input, sizeof(input), stdin)) { exitCode = 0; break; }
+            input[strcspn(input, "\n")] = '\0';
+        }
+        
+        if (input[0] == '/' && input[1] != '\0') {
+            printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
+            printf("  /exit        Exit and stop server\n");
+            printf("  /clear       Clear chat history\n");
+            printf("  /cls         Clear terminal\n");
+            printf("  /model       Change model\n");
+            printf("  /restart     Restart llama server\n");
+            printf("  /websearch   Search web (DuckDuckGo/SerpAPI)\n");
             printf("  /search      Same as /websearch\n");
             printf("  /help        Show help\n\n");
             printf("\x1b[32mYou \x1b[0m> ");
@@ -3723,7 +3709,13 @@ static int RunChatMode(void) {
         
         ChatAddMessage("user", input);
         
+        BOOL thinking = TRUE;
+        HANDLE hThread = CreateThread(NULL, 0, ThinkingAnimationThread, &thinking, 0, NULL);
+        
         response = HttpPost(url, BuildChatPayload(input));
+        
+        thinking = FALSE;
+        if (hThread) { WaitForSingleObject(hThread, INFINITE); CloseHandle(hThread); }
         
         if (!response) {
             printf("\x1b[31mFailed to get response. Is the server running?\x1b[0m\n");
@@ -3731,9 +3723,11 @@ static int RunChatMode(void) {
             continue;
         }
         
+        printf("\x1b[90m[DEBUG] Response: %s\x1b[0m\n", response);
+        
         assistant_msg = ParseChatResponse(response);
         if (!assistant_msg || !assistant_msg[0]) {
-            printf("\x1b[31mFailed to parse response\x1b[0m\n");
+            printf("\x1b[31mFailed to parse response: %s\x1b[0m\n", response);
             free(response);
             ChatAddMessage("assistant", "");
             continue;
