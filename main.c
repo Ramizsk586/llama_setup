@@ -5,9 +5,12 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +23,7 @@
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 /* ──────────────────────────────────────────────
    Modern Dark Theme Colors (OpenWebUI Style)
@@ -69,14 +73,30 @@ static char sServer[MAX_PATH] = "";
 static char sFolder[MAX_PATH] = "";
 static char sSelectedModel[MAX_PATH] = "";
 static char sModels[MAX_MODELS][MAX_PATH];
+static char sModelTypes[MAX_MODELS][16];
+static char sModelProjectors[MAX_MODELS][MAX_PATH];
 static int  nModels = 0;
 static char sCommand[MAX_CMD] = "";
 static char sConfigPath[MAX_PATH] = "";
 static int  nServerType = 0;
+static char sCustomCtx[32] = "";
 
 /* GPU auto-detection state */
-static BOOL bGpuFieldEdited = FALSE;     // Track if user manually edited GPU field
-static int  nLastDetectedGpu = -1;       // Store last auto-detected value
+static BOOL bGpuFieldEdited = FALSE;
+static int  nLastDetectedGpu = -1;
+
+/* Safety Controller State */
+static char sLastSafetyReason[64] = "";
+static HANDLE sActiveProcessHandle = NULL;
+static DWORD sActiveProcessId = 0;
+static BOOL sModelLoaded = FALSE;
+
+/* Safety Thresholds */
+#define SAFE_RAM_BUFFER_MB 2048
+#define SAFE_VRAM_BUFFER_MB 512
+#define WARNING_RAM_MB 4096
+#define WARNING_COMMIT_PERCENT 85
+#define DANGER_COMMIT_PERCENT 92
 
 /* ──────────────────────────────────────────────
    Handles
@@ -100,12 +120,321 @@ static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int 
 static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen);
 static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *gpu, int gpuLen, char *threads, int threadsLen);
 static BOOL HasModelConfig(const char *modelName);
+static const char *GetModelTypeLabel(const char *modelName);
+static BOOL FindMatchingProjector(const char *modelName, char *projectorName, int projectorNameLen);
 static BOOL NormalizeHuggingFaceRepo(const char *input, char *repo, int repoLen);
 static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen);
 static int EnsureModelsFolderReady(void);
 
 /* HuggingFace model download */
 static int DownloadFromHuggingFace(const char *hfUrl);
+
+/* ──────────────────────────────────────────────
+   Safety Controller
+   ────────────────────────────────────────────── */
+static const char* DetectQuantizationType(const char *modelName);
+
+typedef enum {
+    SAFETY_ALLOW,
+    SAFETY_ALLOW_WITH_WARNINGS,
+    SAFETY_REFUSE,
+    SAFETY_ABORT,
+    SAFETY_KILL
+} SafetyDecision;
+
+static void SafetyInit(void);
+static void SafetyShutdown(void);
+static BOOL KillProcessTree(DWORD pid);
+static BOOL TerminateActiveProcess(void);
+static ULONGLONG GetSystemRamMB(void);
+static ULONGLONG GetAvailableRamMB(void);
+static ULONGLONG GetCommitChargeMB(void);
+static ULONGLONG GetTotalCommitLimitMB(void);
+static ULONGLONG GetAvailableVRAMMB(void);
+static int GetModelSizeMB(const char *modelName);
+static int GetProjectorSizeMB(const char *projectorName);
+static int EstimateContextMemoryMB(int ctxLen);
+static SafetyDecision CheckLoadSafety(const char *modelName, const char *projectorName, int ctxLen, int gpuLayers);
+static void PrintSafetyRefusal(const char *reason, const char *model, const char *suggestion);
+
+/* ──────────────────────────────────────────────
+   Safety Controller Implementation
+   ────────────────────────────────────────────── */
+static void SafetyInit(void)
+{
+    sActiveProcessHandle = NULL;
+    sActiveProcessId = 0;
+    sModelLoaded = FALSE;
+    sLastSafetyReason[0] = '\0';
+}
+
+static void SafetyShutdown(void)
+{
+    TerminateActiveProcess();
+    sModelLoaded = FALSE;
+}
+
+static BOOL KillProcessTree(DWORD pid)
+{
+    HANDLE hSnapshot;
+    PROCESSENTRY32 pe;
+    BOOL found;
+
+    if (pid == 0)
+        return TRUE;
+
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    pe.dwSize = sizeof(pe);
+    found = Process32First(hSnapshot, &pe);
+
+    while (found) {
+        if (pe.th32ParentProcessID == pid) {
+            KillProcessTree(pe.th32ProcessID);
+        }
+        found = Process32Next(hSnapshot, &pe);
+    }
+
+    CloseHandle(hSnapshot);
+
+    if (pid == GetCurrentProcessId())
+        return TRUE;
+
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        pe.dwSize = sizeof(pe);
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 1);
+                        CloseHandle(hProcess);
+                    }
+                    break;
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    return TRUE;
+}
+
+static BOOL TerminateActiveProcess(void)
+{
+    if (sActiveProcessId != 0) {
+        KillProcessTree(sActiveProcessId);
+        if (sActiveProcessHandle) {
+            CloseHandle(sActiveProcessHandle);
+            sActiveProcessHandle = NULL;
+        }
+        sActiveProcessId = 0;
+    }
+    return TRUE;
+}
+
+static ULONGLONG GetSystemRamMB(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex))
+        return statex.ullTotalPhys / (1024 * 1024);
+    return 0;
+}
+
+static ULONGLONG GetAvailableRamMB(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex))
+        return statex.ullAvailPhys / (1024 * 1024);
+    return 0;
+}
+
+static ULONGLONG GetCommitChargeMB(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex))
+        return statex.ullTotalPageFile / (1024 * 1024) - statex.ullAvailPageFile / (1024 * 1024);
+    return 0;
+}
+
+static ULONGLONG GetTotalCommitLimitMB(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex))
+        return statex.ullTotalPageFile / (1024 * 1024);
+    return 0;
+}
+
+static ULONGLONG GetAvailableVRAMMB(void)
+{
+    ULONGLONG totalVRAM = 0;
+    DISPLAY_DEVICEA dd;
+    dd.cb = sizeof(dd);
+
+    for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++) {
+        if (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) {
+            DEVMODEA dm;
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm))
+                totalVRAM = dm.dmPelsWidth * dm.dmPelsHeight * 4 / (1024 * 1024);
+            break;
+        }
+    }
+
+    if (totalVRAM == 0) {
+        ULONGLONG avail = GetAvailableRamMB();
+        if (avail > 4096) return 8192;
+        if (avail > 2048) return 4096;
+        if (avail > 1024) return 2048;
+        return 1024;
+    }
+
+    return totalVRAM / 2;
+}
+
+static int GetModelSizeMB(const char *modelName)
+{
+    if (!modelName || !*modelName || !sFolder[0])
+        return 0;
+
+    char fullPath[MAX_PATH * 2];
+    snprintf(fullPath, sizeof(fullPath), "%s\\%s", sFolder, modelName);
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER size;
+        size.LowPart = fad.nFileSizeLow;
+        size.HighPart = fad.nFileSizeHigh;
+        return (int)(size.QuadPart / (1024 * 1024));
+    }
+    return 0;
+}
+
+static int GetProjectorSizeMB(const char *projectorName)
+{
+    return GetModelSizeMB(projectorName);
+}
+
+static int EstimateContextMemoryMB(int ctxLen)
+{
+    int modelSizeMB = 0;
+    if (sSelectedModel[0])
+        modelSizeMB = GetModelSizeMB(sSelectedModel);
+
+    double quantFactor = 0.45;
+    const char *quant = DetectQuantizationType(sSelectedModel);
+    if (strstr(quant, "Q8")) quantFactor = 0.95;
+    else if (strstr(quant, "Q6")) quantFactor = 0.70;
+    else if (strstr(quant, "Q5")) quantFactor = 0.55;
+    else if (strstr(quant, "Q3")) quantFactor = 0.30;
+    else if (strstr(quant, "F16")) quantFactor = 0.50;
+
+    int estimatedWeightSize = (int)(modelSizeMB * quantFactor);
+    int bytesPerToken = (int)(estimatedWeightSize * 0.001);
+
+    return (ctxLen * bytesPerToken) / 2;
+}
+
+static SafetyDecision CheckLoadSafety(const char *modelName, const char *projectorName, int ctxLen, int gpuLayers)
+{
+    ULONGLONG availRAM = GetAvailableRamMB();
+    ULONGLONG totalRAM = GetSystemRamMB();
+    ULONGLONG commitUsed = GetCommitChargeMB();
+    ULONGLONG commitLimit = GetTotalCommitLimitMB();
+    ULONGLONG availVRAM = GetAvailableVRAMMB();
+
+    int modelSizeMB = GetModelSizeMB(modelName);
+    int projectorSizeMB = projectorName && projectorName[0] ? GetProjectorSizeMB(projectorName) : 0;
+    int ctxMemoryMB = EstimateContextMemoryMB(ctxLen);
+
+    int totalModelRAM = modelSizeMB + projectorSizeMB + ctxMemoryMB;
+    int estimatedGPU = 0;
+    if (gpuLayers > 0 && modelSizeMB > 0) {
+        double quantFactor = 0.45;
+        const char *quant = DetectQuantizationType(modelName);
+        if (strstr(quant, "Q8")) quantFactor = 0.95;
+        else if (strstr(quant, "Q6")) quantFactor = 0.70;
+        else if (strstr(quant, "Q5")) quantFactor = 0.55;
+        else if (strstr(quant, "Q3")) quantFactor = 0.30;
+
+        estimatedGPU = (int)(modelSizeMB * quantFactor * (gpuLayers / 35.0));
+        if (estimatedGPU > (int)availVRAM)
+            return SAFETY_REFUSE;
+    }
+
+    if (commitLimit > 0) {
+        int commitPercent = (int)((commitUsed * 100) / commitLimit);
+        if (commitPercent >= DANGER_COMMIT_PERCENT) {
+            lstrcpynA(sLastSafetyReason, "COMMIT_LIMIT", sizeof(sLastSafetyReason));
+            return SAFETY_REFUSE;
+        }
+    }
+
+    if (availRAM < (ULONGLONG)SAFE_RAM_BUFFER_MB) {
+        lstrcpynA(sLastSafetyReason, "LOW_RAM", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if ((availRAM - totalModelRAM) < (ULONGLONG)SAFE_RAM_BUFFER_MB) {
+        lstrcpynA(sLastSafetyReason, "MODEL_TOO_LARGE", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if (totalModelRAM > (int)(totalRAM * 0.8)) {
+        lstrcpynA(sLastSafetyReason, "MODEL_TOO_LARGE", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if (availVRAM > 0 && estimatedGPU > 0 && estimatedGPU > (int)availVRAM) {
+        lstrcpynA(sLastSafetyReason, "LOW_VRAM", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if (projectorSizeMB > 0 && projectorSizeMB > 500) {
+        lstrcpynA(sLastSafetyReason, "PROJECTOR_TOO_HEAVY", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if (ctxLen > 32768 && availRAM < 8192) {
+        lstrcpynA(sLastSafetyReason, "HIGH_CONTEXT_LOW_RAM", sizeof(sLastSafetyReason));
+        return SAFETY_REFUSE;
+    }
+
+    if (commitLimit > 0) {
+        int commitPercent = (int)((commitUsed * 100) / commitLimit);
+        if (commitPercent >= WARNING_COMMIT_PERCENT) {
+            lstrcpynA(sLastSafetyReason, "COMMIT_WARNING", sizeof(sLastSafetyReason));
+            return SAFETY_ALLOW_WITH_WARNINGS;
+        }
+    }
+
+    if (availRAM < (ULONGLONG)WARNING_RAM_MB) {
+        lstrcpynA(sLastSafetyReason, "LOW_RAM_WARNING", sizeof(sLastSafetyReason));
+        return SAFETY_ALLOW_WITH_WARNINGS;
+    }
+
+    return SAFETY_ALLOW;
+}
+
+static void PrintSafetyRefusal(const char *reason, const char *model, const char *suggestion)
+{
+    printf("\n");
+    printf("\x1b[31m========================================\x1b[0m\n");
+    printf("\x1b[31m  SAFETY CONTROLLER: LOAD REFUSED\x1b[0m\n");
+    printf("\x1b[31m========================================\x1b[0m\n\n");
+    printf("\x1b[33mReason: %s\x1b[0m\n\n", reason);
+    printf("Model: %s\n\n", model ? model : "N/A");
+    printf("%s\n\n", suggestion);
+    printf("\x1b[90mThe device was protected from potential instability.\x1b[0m\n");
+    printf("\n");
+}
 
 /* ──────────────────────────────────────────────
    Utility
@@ -309,6 +638,253 @@ static void BuildModelPath(char *dst, int dstLen, const char *modelName)
 {
     if (!dst || dstLen <= 0) return;
     snprintf(dst, dstLen, "%s\\%s", sFolder, modelName);
+}
+
+static BOOL StringContainsI(const char *text, const char *needle)
+{
+    size_t needleLen;
+    const char *p;
+
+    if (!text || !needle || !*needle)
+        return FALSE;
+
+    needleLen = strlen(needle);
+    for (p = text; *p; ++p) {
+        if (_strnicmp(p, needle, needleLen) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL NameContainsAnyI(const char *text, const char *const *needles, int count)
+{
+    int i;
+
+    if (!text || !*text || !needles || count <= 0)
+        return FALSE;
+
+    for (i = 0; i < count; ++i) {
+        if (needles[i] && StringContainsI(text, needles[i]))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL IsProjectorFileName(const char *name)
+{
+    static const char *const strongKeywords[] = {
+        "mmproj", "mm-proj", "projector", "vision_proj", "vision-proj", "image_proj"
+    };
+
+    return NameContainsAnyI(name, strongKeywords, (int)(sizeof(strongKeywords) / sizeof(strongKeywords[0])));
+}
+
+static BOOL IsProjectorCandidateFileName(const char *name)
+{
+    static const char *const candidateKeywords[] = {
+        "mmproj", "mm-proj", "projector", "vision_proj", "vision-proj",
+        "vision", "encoder", "clip", "vit"
+    };
+
+    return NameContainsAnyI(name, candidateKeywords, (int)(sizeof(candidateKeywords) / sizeof(candidateKeywords[0])));
+}
+
+static BOOL IsVisionSignalName(const char *modelName)
+{
+    static const char *const visionKeywords[] = {
+        "llava", "vision", "multimodal", "qwen2-vl", "internvl",
+        "minicpm-v", "minicpmv", "pixtral", "smolvlm",
+        "-vl-", "_vl_", "-vl.", "_vl.", "-vl-", "vlm"
+    };
+
+    return NameContainsAnyI(modelName, visionKeywords, (int)(sizeof(visionKeywords) / sizeof(visionKeywords[0])));
+}
+
+static BOOL ExtractQuantizationTag(const char *name, char *quant, int quantLen)
+{
+    static const char *const tags[] = {
+        "IQ1_M", "IQ1_S", "IQ2_M", "IQ2_S", "IQ3_M", "IQ3_S",
+        "IQ4_NL", "IQ4_XS", "IQ4_M", "IQ4_S",
+        "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
+        "Q4_K_S", "Q4_K_M", "Q4_0", "Q4_1",
+        "Q5_K_S", "Q5_K_M", "Q5_0", "Q5_1",
+        "Q6_K", "Q6_0", "Q8_0", "BF16", "F16", "F32"
+    };
+    int i;
+
+    if (!quant || quantLen <= 0)
+        return FALSE;
+
+    quant[0] = '\0';
+    if (!name || !*name)
+        return FALSE;
+
+    for (i = 0; i < (int)(sizeof(tags) / sizeof(tags[0])); ++i) {
+        if (StringContainsI(name, tags[i])) {
+            lstrcpynA(quant, tags[i], quantLen);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static int GetKnownFamilyScore(const char *modelName, const char *candidateName)
+{
+    static const char *const families[] = {
+        "llava", "qwen2-vl", "qwen", "internvl", "minicpm",
+        "pixtral", "smolvlm", "gemma-3", "gemma", "phi", "vl"
+    };
+    int i;
+
+    for (i = 0; i < (int)(sizeof(families) / sizeof(families[0])); ++i) {
+        if (StringContainsI(modelName, families[i]) && StringContainsI(candidateName, families[i]))
+            return 10;
+    }
+
+    return 0;
+}
+
+static ULONGLONG GetFileSize64(const WIN32_FIND_DATAA *fd)
+{
+    ULARGE_INTEGER value;
+
+    if (!fd)
+        return 0;
+
+    value.LowPart = fd->nFileSizeLow;
+    value.HighPart = fd->nFileSizeHigh;
+    return value.QuadPart;
+}
+
+static const char *GetModelTypeLabel(const char *modelName)
+{
+    if (!modelName || !*modelName)
+        return "Text";
+
+    if (IsVisionSignalName(modelName)) {
+        return "Vision";
+    }
+
+    if (StringContainsI(modelName, "audio") ||
+        StringContainsI(modelName, "speech") ||
+        StringContainsI(modelName, "whisper") ||
+        StringContainsI(modelName, "asr") ||
+        StringContainsI(modelName, "wav")) {
+        return "Audio";
+    }
+
+    if (StringContainsI(modelName, "embed") ||
+        StringContainsI(modelName, "embedding") ||
+        StringContainsI(modelName, "bge") ||
+        StringContainsI(modelName, "e5") ||
+        StringContainsI(modelName, "gte") ||
+        StringContainsI(modelName, "nomic-embed")) {
+        return "Embedding";
+    }
+
+    if (StringContainsI(modelName, "rerank") ||
+        StringContainsI(modelName, "reranker") ||
+        StringContainsI(modelName, "ranker")) {
+        return "Reranker";
+    }
+
+    return "Text";
+}
+
+static int ScoreProjectorCandidate(const char *modelName, const char *candidateName)
+{
+    char modelQuant[32];
+    char candidateQuant[32];
+    int score = 0;
+
+    if (!candidateName || !*candidateName || !IsProjectorCandidateFileName(candidateName))
+        return -1;
+
+    score += GetKnownFamilyScore(modelName, candidateName);
+    if (StringContainsI(candidateName, "mmproj")) score += 5;
+    if (StringContainsI(candidateName, "projector")) score += 4;
+    if (StringContainsI(candidateName, "clip") || StringContainsI(candidateName, "encoder")) score += 3;
+    if (StringContainsI(candidateName, "vision")) score += 2;
+    if (ExtractQuantizationTag(modelName, modelQuant, sizeof(modelQuant)) &&
+        ExtractQuantizationTag(candidateName, candidateQuant, sizeof(candidateQuant)) &&
+        lstrcmpiA(modelQuant, candidateQuant) == 0) score += 2;
+
+    return score;
+}
+
+static BOOL FindMatchingProjector(const char *modelName, char *projectorName, int projectorNameLen)
+{
+    char pattern[MAX_PATH * 2];
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind;
+    int bestScore = -1;
+    ULONGLONG bestSize = 0;
+    ULONGLONG fallbackSize = 0;
+    char fallbackName[MAX_PATH] = "";
+
+    if (!projectorName || projectorNameLen <= 0) return FALSE;
+    projectorName[0] = '\0';
+
+    if (!sFolder[0] || !modelName || !*modelName)
+        return FALSE;
+
+    snprintf(pattern, sizeof(pattern), "%s\\*.gguf", sFolder);
+    hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    do {
+        int score;
+        ULONGLONG fileSize;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (_stricmp(fd.cFileName, modelName) == 0)
+            continue;
+
+        fileSize = GetFileSize64(&fd);
+        score = ScoreProjectorCandidate(modelName, fd.cFileName);
+        if (score > bestScore || (score == bestScore && fileSize > bestSize)) {
+            bestScore = score;
+            bestSize = fileSize;
+            lstrcpynA(projectorName, fd.cFileName, projectorNameLen);
+        }
+
+        if (fileSize > fallbackSize) {
+            fallbackSize = fileSize;
+            lstrcpynA(fallbackName, fd.cFileName, sizeof(fallbackName));
+        }
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+
+    if (bestScore >= 0 && projectorName[0] != '\0')
+        return TRUE;
+
+    if (fallbackName[0]) {
+        lstrcpynA(projectorName, fallbackName, projectorNameLen);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static int FindModelIndexByName(const char *modelName)
+{
+    int i;
+
+    if (!modelName || !*modelName)
+        return -1;
+
+    for (i = 0; i < nModels; ++i) {
+        if (lstrcmpiA(sModels[i], modelName) == 0)
+            return i;
+    }
+
+    return -1;
 }
 
 static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen)
@@ -527,12 +1103,12 @@ static void MoveCursorDown(int lines)
 
 static void PrintTableHeader(void)
 {
-    printf("\n+----+-----------------------------------------------+------------+----------+----------+\n");
-    printf("| %2s | %-45s | %10s | %8s | %8s |\n", "#", "Model", "Size", "Quant", "Status");
-    printf("+----+-----------------------------------------------+------------+----------+----------+\n");
+    printf("\n+----+-----------------------------------------------+------------+----------+------------+----------+\n");
+    printf("| %2s | %-45s | %10s | %8s | %10s | %8s |\n", "#", "Model", "Size", "Quant", "Type", "Status");
+    printf("+----+-----------------------------------------------+------------+----------+------------+----------+\n");
 }
 
-static void PrintTableRowAt(int rowIndex, int selectedIndex, const char *modelName, int sizeMB, const char *quant, BOOL usable)
+static void PrintTableRowAt(int rowIndex, int selectedIndex, const char *modelName, int sizeMB, const char *quant, const char *typeLabel, BOOL usable)
 {
     char sizeStr[32];
     const char *status = usable ? "Ready" : "Low VRAM";
@@ -546,7 +1122,7 @@ static void PrintTableRowAt(int rowIndex, int selectedIndex, const char *modelNa
     } else {
         printf("%-45.45s", modelName);
     }
-    printf(" | %10s | %8.8s | ", sizeStr, quant);
+    printf(" | %10s | %8.8s | %10.10s | ", sizeStr, quant, typeLabel);
     if (usable) {
         printf("\x1b[32m%8s\x1b[0m", status);
     } else {
@@ -557,7 +1133,7 @@ static void PrintTableRowAt(int rowIndex, int selectedIndex, const char *modelNa
 
 static void PrintTableFooter(void)
 {
-    printf("+----+-----------------------------------------------+------------+----------+----------+\n");
+    printf("+----+-----------------------------------------------+------------+----------+------------+----------+\n");
 }
 
 static void RefreshSelectorRow(int rowIndex, int selectedIndex, const int *modelSizes, const BOOL *usableFlags, int totalRows)
@@ -568,7 +1144,7 @@ static void RefreshSelectorRow(int rowIndex, int selectedIndex, const int *model
     linesUp = totalRows - rowIndex + 1;
     MoveCursorUp(linesUp);
     quant = DetectQuantizationType(sModels[rowIndex]);
-    PrintTableRowAt(rowIndex, selectedIndex, sModels[rowIndex], modelSizes[rowIndex], quant, usableFlags[rowIndex]);
+    PrintTableRowAt(rowIndex, selectedIndex, sModels[rowIndex], modelSizes[rowIndex], quant, sModelTypes[rowIndex], usableFlags[rowIndex]);
     MoveCursorDown(linesUp - 1);
     fflush(stdout);
 }
@@ -634,7 +1210,7 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     PrintTableHeader();
     for (i = 0; i < nModels; ++i) {
         const char *quant = DetectQuantizationType(sModels[i]);
-        PrintTableRowAt(i, selectedIndex, sModels[i], modelSizes[i], quant, usableFlags[i]);
+        PrintTableRowAt(i, selectedIndex, sModels[i], modelSizes[i], quant, sModelTypes[i], usableFlags[i]);
     }
     PrintTableFooter();
     
@@ -668,14 +1244,43 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     }
 }
 
-static void BuildServeCommand(char *dst, int dstLen)
+static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int customGpu, BOOL includeLocalIp)
 {
     char modelPath[MAX_PATH * 2];
     char ctx[32], gpu[32], port[32], threads[32];
-    const char *host = (nServerType == 1) ? "0.0.0.0" : "127.0.0.1";
+    char host[128];
 
     BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
     GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), port, sizeof(port), threads, sizeof(threads));
+
+    if (customCtx && customCtx[0])
+        lstrcpynA(ctx, customCtx, sizeof(ctx));
+    if (customGpu >= 0)
+        snprintf(gpu, sizeof(gpu), "%d", customGpu);
+
+    if (includeLocalIp) {
+        WSADATA wsd;
+        char localIp[32] = "";
+        if (WSAStartup(MAKEWORD(2, 2), &wsd) == 0) {
+            char hostname[256];
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                struct hostent *he = gethostbyname(hostname);
+                if (he && he->h_addr_list[0]) {
+                    struct in_addr addr;
+                    memcpy(&addr, he->h_addr_list[0], sizeof(addr));
+                    lstrcpynA(localIp, inet_ntoa(addr), sizeof(localIp));
+                }
+            }
+            WSACleanup();
+        }
+        if (localIp[0]) {
+            snprintf(host, sizeof(host), "127.0.0.1,%s", localIp);
+        } else {
+            lstrcpynA(host, "127.0.0.1", sizeof(host));
+        }
+    } else {
+        lstrcpynA(host, (nServerType == 1) ? "0.0.0.0" : "127.0.0.1", sizeof(host));
+    }
 
     snprintf(
         dst, dstLen,
@@ -688,17 +1293,37 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
 {
     char cliPath[MAX_PATH];
     char modelPath[MAX_PATH * 2];
+    char projectorPath[MAX_PATH * 2];
     char ctx[32], gpu[32], threads[32];
+    int modelIndex;
+    const char *targetModel;
 
     GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
-    BuildModelPath(modelPath, sizeof(modelPath), modelName ? modelName : sSelectedModel);
-    GetModelConfig(modelName, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+    targetModel = modelName ? modelName : sSelectedModel;
+    BuildModelPath(modelPath, sizeof(modelPath), targetModel);
+    GetModelConfig(targetModel, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+    
+    if (sCustomCtx[0])
+        lstrcpynA(ctx, sCustomCtx, sizeof(ctx));
+    
+    modelIndex = FindModelIndexByName(targetModel);
 
-    snprintf(
-        dst, dstLen,
-        "\"%s\" -m \"%s\" -c %s -ngl %s -t %s",
-        cliPath, modelPath, ctx, gpu, threads
-    );
+    if (modelIndex >= 0 &&
+        _stricmp(sModelTypes[modelIndex], "Vision") == 0 &&
+        sModelProjectors[modelIndex][0]) {
+        BuildModelPath(projectorPath, sizeof(projectorPath), sModelProjectors[modelIndex]);
+        snprintf(
+            dst, dstLen,
+            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s",
+            cliPath, modelPath, projectorPath, ctx, gpu, threads
+        );
+    } else {
+        snprintf(
+            dst, dstLen,
+            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s",
+            cliPath, modelPath, ctx, gpu, threads
+        );
+    }
 }
 
 static int RunChildProcess(const char *commandLine)
@@ -813,6 +1438,81 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("  return 'Unknown'\n", fp);
     fputs("}\n", fp);
     fputs("\n", fp);
+    fputs("function Test-Contains([string]$Text, [string]$Needle) {\n", fp);
+    fputs("  if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Needle)) { return $false }\n", fp);
+    fputs("  return $Text.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Is-ProjectorFile([string]$Name) {\n", fp);
+    fputs("  return (Test-Contains $Name 'mmproj') -or (Test-Contains $Name 'mm-proj') -or (Test-Contains $Name 'projector') -or (Test-Contains $Name 'vision_proj') -or (Test-Contains $Name 'vision-proj') -or (Test-Contains $Name 'image_proj')\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Is-ProjectorCandidate([string]$Name) {\n", fp);
+    fputs("  return (Is-ProjectorFile $Name) -or (Test-Contains $Name 'vision') -or (Test-Contains $Name 'encoder') -or (Test-Contains $Name 'clip') -or (Test-Contains $Name 'vit')\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Test-VisionName([string]$Name) {\n", fp);
+    fputs("  return (Test-Contains $Name 'vision') -or (Test-Contains $Name 'llava') -or (Test-Contains $Name 'vlm') -or (Test-Contains $Name '-vl-') -or (Test-Contains $Name '_vl_') -or (Test-Contains $Name '-vl.') -or (Test-Contains $Name '_vl.') -or (Test-Contains $Name 'minicpm-v') -or (Test-Contains $Name 'minicpmv') -or (Test-Contains $Name 'smolvlm') -or (Test-Contains $Name 'qwen2-vl') -or (Test-Contains $Name 'internvl') -or (Test-Contains $Name 'pixtral') -or (Test-Contains $Name 'gemma-3') -or (Test-Contains $Name 'multimodal')\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-ModelType([string]$Name) {\n", fp);
+    fputs("  if (Test-VisionName $Name) { return 'Vision' }\n", fp);
+    fputs("  if ((Test-Contains $Name 'audio') -or (Test-Contains $Name 'speech') -or (Test-Contains $Name 'whisper') -or (Test-Contains $Name 'asr') -or (Test-Contains $Name 'wav')) { return 'Audio' }\n", fp);
+    fputs("  if ((Test-Contains $Name 'embed') -or (Test-Contains $Name 'embedding') -or (Test-Contains $Name 'bge') -or (Test-Contains $Name 'e5') -or (Test-Contains $Name 'gte') -or (Test-Contains $Name 'nomic-embed')) { return 'Embedding' }\n", fp);
+    fputs("  if ((Test-Contains $Name 'rerank') -or (Test-Contains $Name 'reranker') -or (Test-Contains $Name 'ranker')) { return 'Reranker' }\n", fp);
+    fputs("  return 'Text'\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-RepoSignalFlags($RepoInfo, [string]$Repo) {\n", fp);
+    fputs("  $parts = @()\n", fp);
+    fputs("  if ($RepoInfo.tags) { $parts += ($RepoInfo.tags -join ' ') }\n", fp);
+    fputs("  if ($RepoInfo.pipeline_tag) { $parts += [string]$RepoInfo.pipeline_tag }\n", fp);
+    fputs("  if ($RepoInfo.cardData) { try { $parts += ($RepoInfo.cardData | ConvertTo-Json -Depth 10 -Compress) } catch {} }\n", fp);
+    fputs("  if ($RepoInfo.config) { try { $parts += ($RepoInfo.config | ConvertTo-Json -Depth 10 -Compress) } catch {} }\n", fp);
+    fputs("  try { $parts += (Invoke-WebRequest -Uri ('https://huggingface.co/' + $Repo + '/resolve/main/config.json') -UseBasicParsing -TimeoutSec 20).Content } catch {}\n", fp);
+    fputs("  try { $parts += (Invoke-WebRequest -Uri ('https://huggingface.co/' + $Repo + '/resolve/main/README.md') -UseBasicParsing -TimeoutSec 20).Content } catch {}\n", fp);
+    fputs("  $text = ($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join \"`n\"\n", fp);
+    fputs("  return [PSCustomObject]@{ Vision = (Test-Contains $text 'vision'); Image = (Test-Contains $text 'image'); Multimodal = (Test-Contains $text 'multimodal'); Clip = (Test-Contains $text 'clip') }\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-DetectedModelType([string]$Name, $RepoSignals, [bool]$HasStructureSignal) {\n", fp);
+    fputs("  $baseType = Get-ModelType $Name\n", fp);
+    fputs("  if ($baseType -ne 'Text') { return $baseType }\n", fp);
+    fputs("  if ($RepoSignals.Vision -or $RepoSignals.Image -or $RepoSignals.Multimodal -or $RepoSignals.Clip -or $HasStructureSignal) { return 'Vision' }\n", fp);
+    fputs("  return 'Text'\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Get-ProjectorScore([string]$ModelName, [string]$CandidateName) {\n", fp);
+    fputs("  if (-not (Is-ProjectorCandidate $CandidateName)) { return -1 }\n", fp);
+    fputs("  $score = 0\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'llava') -and (Test-Contains $CandidateName 'llava')) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'minicpm') -and (Test-Contains $CandidateName 'minicpm')) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'smolvlm') -and (Test-Contains $CandidateName 'smolvlm')) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'qwen') -and (Test-Contains $CandidateName 'qwen')) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'internvl') -and (Test-Contains $CandidateName 'internvl')) { $score += 10 }\n", fp);
+    fputs("  if (((Test-Contains $ModelName '-vl-') -or (Test-Contains $ModelName '_vl_')) -and ((Test-Contains $CandidateName '-vl-') -or (Test-Contains $CandidateName '_vl_'))) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'pixtral') -and (Test-Contains $CandidateName 'pixtral')) { $score += 10 }\n", fp);
+    fputs("  if ((Test-Contains $ModelName 'gemma') -and (Test-Contains $CandidateName 'gemma')) { $score += 10 }\n", fp);
+    fputs("  if (Test-Contains $CandidateName 'mmproj') { $score += 5 }\n", fp);
+    fputs("  if (Test-Contains $CandidateName 'projector') { $score += 4 }\n", fp);
+    fputs("  if ((Test-Contains $CandidateName 'clip') -or (Test-Contains $CandidateName 'encoder')) { $score += 3 }\n", fp);
+    fputs("  if (((Get-Quant $ModelName) -ne 'Unknown') -and ((Get-Quant $ModelName) -eq (Get-Quant $CandidateName))) { $score += 2 }\n", fp);
+    fputs("  return $score\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("function Find-MatchingProjector($Selected, $Projectors, $AllGgufFiles) {\n", fp);
+    fputs("  $best = $null\n", fp);
+    fputs("  $bestScore = -1\n", fp);
+    fputs("  foreach ($candidate in $Projectors) {\n", fp);
+    fputs("    $candidateName = if ($candidate.PSObject.Properties['rfilename']) { $candidate.rfilename } else { $candidate.Name }\n", fp);
+    fputs("    $score = Get-ProjectorScore $Selected.Name $candidateName\n", fp);
+    fputs("    if ($score -gt $bestScore) { $bestScore = $score; $best = $candidate }\n", fp);
+    fputs("  }\n", fp);
+    fputs("  if ($best) { return $best }\n", fp);
+    fputs("  $fallback = $AllGgufFiles | Where-Object { $_.Name -ine $Selected.Name } | Sort-Object Size -Descending | Select-Object -First 1\n", fp);
+    fputs("  return $fallback\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
     fputs("function Trim-Cell([string]$Text, [int]$Width) {\n", fp);
     fputs("  if (-not $Text) { return ''.PadRight($Width) }\n", fp);
     fputs("  if ($Text.Length -le $Width) { return $Text.PadRight($Width) }\n", fp);
@@ -820,15 +1520,16 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("  return ($Text.Substring(0, $Width - 3) + '...')\n", fp);
     fputs("}\n", fp);
     fputs("\n", fp);
-    fputs("function Show-Table($Items) {\n", fp);
-    fputs("  $line = '+' + ('-' * 4) + '+' + ('-' * 44) + '+' + ('-' * 12) + '+' + ('-' * 12) + '+' + ('-' * 15) + '+'\n", fp);
+    fputs("function Show-Table($Items, [string]$RecommendedName) {\n", fp);
+    fputs("  $line = '+' + ('-' * 4) + '+' + ('-' * 40) + '+' + ('-' * 12) + '+' + ('-' * 12) + '+' + ('-' * 12) + '+' + ('-' * 12) + '+' + ('-' * 15) + '+'\n", fp);
     fputs("  Write-Host $line\n", fp);
-    fputs("  Write-Host ('| ' + (Trim-Cell 'No' 2) + ' | ' + (Trim-Cell 'Model' 42) + ' | ' + (Trim-Cell 'Size' 10) + ' | ' + (Trim-Cell 'Quant' 10) + ' | ' + (Trim-Cell 'GPU Offload' 13) + ' |')\n", fp);
+    fputs("  Write-Host ('| ' + (Trim-Cell 'No' 2) + ' | ' + (Trim-Cell 'Model' 38) + ' | ' + (Trim-Cell 'Size' 10) + ' | ' + (Trim-Cell 'Quant' 10) + ' | ' + (Trim-Cell 'Type' 10) + ' | ' + (Trim-Cell 'GPU Fit' 10) + ' | ' + (Trim-Cell 'Recommended' 13) + ' |')\n", fp);
     fputs("  Write-Host $line\n", fp);
     fputs("  for ($i = 0; $i -lt $Items.Count; $i++) {\n", fp);
     fputs("    $item = $Items[$i]\n", fp);
-    fputs("    $row = '| ' + (Trim-Cell ([string]($i + 1)) 2) + ' | ' + (Trim-Cell $item.Name 42) + ' | ' + (Trim-Cell (Format-Bytes $item.Size) 10) + ' | ' + (Trim-Cell $item.Quant 10) + ' | ' + (Trim-Cell $item.Gpu 13) + ' |'\n", fp);
-    fputs("    Write-Host $row\n", fp);
+    fputs("    $recommended = if ($item.Name -eq $RecommendedName) { 'YES' } else { '' }\n", fp);
+    fputs("    $row = '| ' + (Trim-Cell ([string]($i + 1)) 2) + ' | ' + (Trim-Cell $item.Name 38) + ' | ' + (Trim-Cell (Format-Bytes $item.Size) 10) + ' | ' + (Trim-Cell $item.Quant 10) + ' | ' + (Trim-Cell $item.Type 10) + ' | ' + (Trim-Cell $item.Gpu 10) + ' | ' + (Trim-Cell $recommended 13) + ' |'\n", fp);
+    fputs("    if ($item.Name -eq $RecommendedName) { Write-Host $row -ForegroundColor Green } else { Write-Host $row }\n", fp);
     fputs("  }\n", fp);
     fputs("  Write-Host $line\n", fp);
     fputs("}\n", fp);
@@ -840,14 +1541,16 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("  if ($Total -gt 0) {\n", fp);
     fputs("    $percent = [Math]::Min(100, [Math]::Max(0, [int](($Done * 100) / $Total)))\n", fp);
     fputs("    $filled = [Math]::Min($width, [int](($Done * $width) / $Total))\n", fp);
+    fputs("    $eta = [TimeSpan]::FromSeconds([int](($Total - $Done) / [Math]::Max($speed, 1)))\n", fp);
     fputs("  } else {\n", fp);
     fputs("    $percent = 0\n", fp);
     fputs("    $filled = 0\n", fp);
+    fputs("    $eta = [TimeSpan]::FromSeconds(0)\n", fp);
     fputs("  }\n", fp);
     fputs("  $bar = ('=' * $filled) + (' ' * ($width - $filled))\n", fp);
     fputs("  $left = (Trim-Cell $Label 18)\n", fp);
-    fputs("  $elapsedText = [TimeSpan]::FromSeconds([int]$elapsed).ToString('hh\\:mm\\:ss')\n", fp);
-    fputs("  $line = ('{0} {1,3}% [{2}] {3,8} {4,8}/s {5}' -f $left, $percent, $bar, (Format-Bytes $Total), (Format-Bytes ([Int64]$speed)), $elapsedText)\n", fp);
+    fputs("  $etaText = $eta.ToString('hh\\:mm\\:ss')\n", fp);
+    fputs("  $line = ('{0} {1,3}% [{2}] {3,8} {4,8}/s ETA {5}' -f $left, $percent, $bar, (Format-Bytes $Total), (Format-Bytes ([Int64]$speed)), $etaText)\n", fp);
     fputs("  [Console]::Write(\"`r\" + $line.PadRight(120))\n", fp);
     fputs("}\n", fp);
     fputs("\n", fp);
@@ -952,8 +1655,13 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("Write-Host 'Fetching repository metadata...' -ForegroundColor DarkGray\n", fp);
     fputs("$repoUrl = 'https://huggingface.co/api/models/' + $Repo\n", fp);
     fputs("$repoInfo = Invoke-RestMethod -Uri $repoUrl\n", fp);
-    fputs("$ggufFiles = @($repoInfo.siblings | Where-Object { $_.rfilename -match '\\.gguf$' })\n", fp);
-    fputs("if ($ggufFiles.Count -eq 0) { Write-Host 'No GGUF files found in this repository.' -ForegroundColor Yellow; exit 1 }\n", fp);
+    fputs("$repoSignals = Get-RepoSignalFlags $repoInfo $Repo\n", fp);
+    fputs("$allGgufFiles = @($repoInfo.siblings | Where-Object { $_.rfilename -match '\\.gguf$' })\n", fp);
+    fputs("if ($allGgufFiles.Count -eq 0) { Write-Host 'No GGUF files found in this repository.' -ForegroundColor Yellow; exit 1 }\n", fp);
+    fputs("$projectorFiles = @($allGgufFiles | Where-Object { Is-ProjectorCandidate $_.rfilename })\n", fp);
+    fputs("$ggufFiles = @($allGgufFiles | Where-Object { -not (Is-ProjectorFile $_.rfilename) })\n", fp);
+    fputs("if ($ggufFiles.Count -eq 0) { $ggufFiles = $allGgufFiles }\n", fp);
+    fputs("$hasStructureSignal = ($ggufFiles.Count -gt 0 -and $projectorFiles.Count -gt 0)\n", fp);
     fputs("$files = @()\n", fp);
     fputs("foreach ($entry in $ggufFiles) {\n", fp);
     fputs("  $name = $entry.rfilename\n", fp);
@@ -965,15 +1673,16 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("    $head = Invoke-WebRequest -Uri $downloadUrl -Method Head -UseBasicParsing\n", fp);
     fputs("    if ($head.Headers['Content-Length']) { $size = [Int64]$head.Headers['Content-Length'] }\n", fp);
     fputs("  } catch {}\n", fp);
-    fputs("  $files += [PSCustomObject]@{ Name = $name; Url = $downloadUrl; Size = $size; Quant = (Get-Quant $name); Gpu = (Get-GpuOffload $size) }\n", fp);
+    fputs("  $files += [PSCustomObject]@{ Name = $name; Url = $downloadUrl; Size = $size; Quant = (Get-Quant $name); Type = (Get-DetectedModelType $name $repoSignals $hasStructureSignal); Gpu = (Get-GpuOffload $size) }\n", fp);
     fputs("}\n", fp);
     fputs("$files = @($files | Sort-Object Name)\n", fp);
     fputs("$defaultModel = Get-DefaultModel $files\n", fp);
     fputs("$selected = $defaultModel\n", fp);
+    fputs("$selectedProjector = $null\n", fp);
     fputs("\n", fp);
     fputs("if ($files.Count -gt 1) {\n", fp);
     fputs("  Write-Host ('Found ' + $files.Count + ' GGUF models in this repo.') -ForegroundColor Green\n", fp);
-    fputs("  Write-Host ('Default: ' + $defaultModel.Name + ' | ' + (Format-Bytes $defaultModel.Size) + ' | ' + $defaultModel.Quant + ' | GPU offload: ' + $defaultModel.Gpu)\n", fp);
+    fputs("  Write-Host ('Recommended: ' + $defaultModel.Name + ' | ' + (Format-Bytes $defaultModel.Size) + ' | ' + $defaultModel.Quant + ' | ' + $defaultModel.Type + ' | GPU fit: ' + $defaultModel.Gpu)\n", fp);
     fputs("  Write-Host ''\n", fp);
     fputs("  Write-Host '1. Continue with default model'\n", fp);
     fputs("  Write-Host '2. Change model'\n", fp);
@@ -982,12 +1691,21 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("  if ($choice -eq '3') { Write-Host 'Cancelled.'; exit 0 }\n", fp);
     fputs("  if ($choice -eq '2') {\n", fp);
     fputs("    Write-Host ''\n", fp);
-    fputs("    Show-Table $files\n", fp);
+    fputs("    Show-Table $files $defaultModel.Name\n", fp);
     fputs("    do { $pick = Read-Host 'Choose model number' } until ($pick -match '^\\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $files.Count)\n", fp);
     fputs("    $selected = $files[[int]$pick - 1]\n", fp);
     fputs("  }\n", fp);
     fputs("} else {\n", fp);
-    fputs("  Write-Host ('One GGUF model found: ' + $selected.Name + ' | ' + (Format-Bytes $selected.Size) + ' | ' + $selected.Quant + ' | GPU offload: ' + $selected.Gpu) -ForegroundColor Green\n", fp);
+    fputs("  Write-Host ('One GGUF model found: ' + $selected.Name + ' | ' + (Format-Bytes $selected.Size) + ' | ' + $selected.Quant + ' | ' + $selected.Type + ' | GPU fit: ' + $selected.Gpu) -ForegroundColor Green\n", fp);
+    fputs("}\n", fp);
+    fputs("\n", fp);
+    fputs("Write-Host ('Detection summary: metadata=' + ($repoSignals.Vision -or $repoSignals.Image -or $repoSignals.Multimodal -or $repoSignals.Clip) + ', structure=' + $hasStructureSignal + ', selected-type=' + $selected.Type) -ForegroundColor DarkCyan\n", fp);
+    fputs("if ($selected.Type -eq 'Vision' -and $projectorFiles.Count -gt 0) {\n", fp);
+    fputs("  $selectedProjector = Find-MatchingProjector $selected $projectorFiles $files\n", fp);
+    fputs("  if ($selectedProjector) {\n", fp);
+    fputs("    $matchedProjectorName = if ($selectedProjector.PSObject.Properties['rfilename']) { $selectedProjector.rfilename } else { $selectedProjector.Name }\n", fp);
+    fputs("    Write-Host ('Matched projector: ' + $matchedProjectorName) -ForegroundColor DarkCyan\n", fp);
+    fputs("  }\n", fp);
     fputs("}\n", fp);
     fputs("\n", fp);
     fputs("$targetPath = Join-Path $ModelsFolder ([System.IO.Path]::GetFileName($selected.Name))\n", fp);
@@ -995,13 +1713,53 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("  do { $overwrite = Read-Host 'File already exists. Overwrite? (y/n)' } until ($overwrite -match '^[YyNn]$')\n", fp);
     fputs("  if ($overwrite -match '^[Nn]$') { Write-Host 'Cancelled.'; exit 0 }\n", fp);
     fputs("}\n", fp);
+    fputs("$projectorTargetPath = $null\n", fp);
+    fputs("$overwriteProjector = 'Y'\n", fp);
+    fputs("if ($selected.Type -eq 'Vision' -and -not $selectedProjector) {\n", fp);
+    fputs("  Write-Host 'WARNING: Vision model detected but no projector match was found.' -ForegroundColor Yellow\n", fp);
+    fputs("  Write-Host '1. Continue without projector'\n", fp);
+    fputs("  Write-Host '2. Try fallback selection'\n", fp);
+    fputs("  Write-Host '3. Abort'\n", fp);
+    fputs("  do { $missingProjectorChoice = Read-Host 'Choose 1, 2 or 3' } until ($missingProjectorChoice -match '^[123]$')\n", fp);
+    fputs("  if ($missingProjectorChoice -eq '3') { Write-Host 'Aborted.' -ForegroundColor Yellow; exit 1 }\n", fp);
+    fputs("  if ($missingProjectorChoice -eq '2') {\n", fp);
+    fputs("    $selectedProjector = ($files | Where-Object { $_.Name -ine $selected.Name } | Sort-Object Size -Descending | Select-Object -First 1)\n", fp);
+    fputs("    if ($selectedProjector) { Write-Host ('Fallback projector: ' + $selectedProjector.Name) -ForegroundColor Yellow }\n", fp);
+    fputs("  }\n", fp);
+    fputs("}\n", fp);
+    fputs("if ($selectedProjector) {\n", fp);
+    fputs("  $projectorName = if ($selectedProjector.PSObject.Properties['rfilename']) { $selectedProjector.rfilename } else { $selectedProjector.Name }\n", fp);
+    fputs("  $projectorTargetPath = Join-Path $ModelsFolder ([System.IO.Path]::GetFileName($projectorName))\n", fp);
+    fputs("  if (Test-Path -LiteralPath $projectorTargetPath) {\n", fp);
+    fputs("    do { $overwriteProjector = Read-Host 'Projector file already exists. Overwrite? (y/n)' } until ($overwriteProjector -match '^[YyNn]$')\n", fp);
+    fputs("    if ($overwriteProjector -match '^[Nn]$') { Write-Host 'Keeping existing projector file.' -ForegroundColor Yellow }\n", fp);
+    fputs("  }\n", fp);
+    fputs("}\n", fp);
     fputs("Write-Host ''\n", fp);
     fputs("Write-Host ('Downloading ' + $selected.Name) -ForegroundColor Cyan\n", fp);
     fputs("Write-Host ('Saving to ' + $targetPath)\n", fp);
     fputs("Write-Host 'Download progress:' -ForegroundColor DarkGray\n", fp);
     fputs("Download-WithProgress $selected.Url $targetPath\n", fp);
+    fputs("if ($selectedProjector -and $projectorTargetPath -and ($overwriteProjector -notmatch '^[Nn]$' -or -not (Test-Path -LiteralPath $projectorTargetPath))) {\n", fp);
+    fputs("  $projectorName = if ($selectedProjector.PSObject.Properties['rfilename']) { $selectedProjector.rfilename } else { $selectedProjector.Name }\n", fp);
+    fputs("  $escapedProjectorName = [System.Uri]::EscapeDataString($projectorName) -replace '%2F', '/'\n", fp);
+    fputs("  $projectorUrl = 'https://huggingface.co/' + $Repo + '/resolve/main/' + $escapedProjectorName + '?download=true'\n", fp);
+    fputs("  Write-Host ''\n", fp);
+    fputs("  Write-Host ('Downloading companion projector ' + $projectorName) -ForegroundColor Cyan\n", fp);
+    fputs("  Write-Host ('Saving to ' + $projectorTargetPath)\n", fp);
+    fputs("  Write-Host 'Download progress:' -ForegroundColor DarkGray\n", fp);
+    fputs("  Download-WithProgress $projectorUrl $projectorTargetPath\n", fp);
+    fputs("}\n", fp);
     fputs("Write-Host ''\n", fp);
     fputs("Write-Host ('Installed model to ' + $targetPath) -ForegroundColor Green\n", fp);
+    fputs("if ($selectedProjector -and $projectorTargetPath) { Write-Host ('Installed projector to ' + $projectorTargetPath) -ForegroundColor Green }\n", fp);
+    fputs("$suggestedThreads = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else { 4 }\n", fp);
+    fputs("$suggestedCtx = 4096\n", fp);
+    fputs("$suggestedGpuLayers = if ($selected.Gpu -eq 'No') { 0 } elseif ($selected.Gpu -eq 'Yes') { 999 } else { 40 }\n", fp);
+    fputs("$readyCommand = 'llama-cli -m \"' + $targetPath + '\"'\n", fp);
+    fputs("if ($selectedProjector -and $projectorTargetPath) { $readyCommand += ' --mmproj \"' + $projectorTargetPath + '\"' }\n", fp);
+    fputs("$readyCommand += ' -c ' + $suggestedCtx + ' -ngl ' + $suggestedGpuLayers + ' -t ' + $suggestedThreads\n", fp);
+    fputs("Write-Host ('Ready command: ' + $readyCommand) -ForegroundColor Green\n", fp);
 
     fclose(fp);
     return TRUE;
@@ -1165,7 +1923,11 @@ static int PrintModels(void)
     EnsureSelectedModelExists();
     printf("Configured models in %s\n", sFolder);
     for (i = 0; i < nModels; ++i) {
-        printf("%s %s\n", lstrcmpiA(sModels[i], sSelectedModel) == 0 ? "*" : "-", sModels[i]);
+        printf("%s %-45s  [%s]", lstrcmpiA(sModels[i], sSelectedModel) == 0 ? "*" : "-", sModels[i], sModelTypes[i]);
+        if (_stricmp(sModelTypes[i], "Vision") == 0 && sModelProjectors[i][0]) {
+            printf("  projector=%s", sModelProjectors[i]);
+        }
+        printf("\n");
     }
     fflush(stdout);
     return 0;
@@ -1380,8 +2142,14 @@ static void ScanModels(void)
 
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            if (nModels < MAX_MODELS) {
+            if (nModels < MAX_MODELS && !IsProjectorFileName(fd.cFileName)) {
                 lstrcpynA(sModels[nModels], fd.cFileName, MAX_PATH);
+                lstrcpynA(sModelTypes[nModels], GetModelTypeLabel(fd.cFileName), (int)sizeof(sModelTypes[nModels]));
+                if (_stricmp(sModelTypes[nModels], "Vision") == 0) {
+                    FindMatchingProjector(fd.cFileName, sModelProjectors[nModels], MAX_PATH);
+                } else {
+                    sModelProjectors[nModels][0] = '\0';
+                }
                 if (hModelCombo)
                     SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[nModels]);
                 nModels++;
@@ -2113,15 +2881,32 @@ static int RunCli(int argc, char **argv)
     }
 
     if (lstrcmpiA(argv[1], "run") == 0) {
+        int i;
+        int customGpu = -1;
+        char ctxBuf[32] = "2048";
+        char gpuBuf[32] = "-1";
+        SafetyDecision safety;
+
+        SafetyInit();
+
         if (EnsureCliConfigReady(TRUE) != 0)
             return 1;
 
-        /* Check if model name provided as argument */
-        if (argc > 2 && argv[2][0]) {
-            /* Use provided model name */
-            lstrcpynA(sSelectedModel, argv[2], sizeof(sSelectedModel));
-        } else {
-            /* Show interactive model selector */
+        sCustomCtx[0] = '\0';
+
+        for (i = 2; i < argc; i++) {
+            if (lstrcmpiA(argv[i], "--context") == 0 && i + 1 < argc) {
+                lstrcpynA(sCustomCtx, argv[i + 1], sizeof(sCustomCtx));
+                i++;
+            } else if (lstrcmpiA(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
+                customGpu = atoi(argv[i + 1]);
+                i++;
+            } else if (argv[i][0] != '-') {
+                lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
+            }
+        }
+
+        if (!sSelectedModel[0]) {
             char selectedModel[MAX_PATH];
             if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) < 0) {
                 printf("Model selection cancelled.\n");
@@ -2130,20 +2915,82 @@ static int RunCli(int argc, char **argv)
             lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
         }
 
+        if (sCustomCtx[0])
+            lstrcpynA(ctxBuf, sCustomCtx, sizeof(ctxBuf));
+        else
+            GetModelConfig(sSelectedModel, ctxBuf, sizeof(ctxBuf), gpuBuf, sizeof(gpuBuf), NULL, 0);
+
+        if (customGpu >= 0)
+            snprintf(gpuBuf, sizeof(gpuBuf), "%d", customGpu);
+
+        {
+            char projector[MAX_PATH] = "";
+            int ctxLen = atoi(ctxBuf);
+            int gpuLayers = atoi(gpuBuf);
+            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            safety = CheckLoadSafety(sSelectedModel, projector, ctxLen, gpuLayers);
+
+            if (safety == SAFETY_REFUSE) {
+                PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+                    "Suggestion: Try a smaller model, lower quantization, reduced context, or fewer GPU layers.");
+                return 1;
+            }
+
+            if (safety == SAFETY_KILL) {
+                TerminateActiveProcess();
+                PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+                    "Process terminated. Suggestion: Close other applications and retry.");
+                return 1;
+            }
+
+            if (safety == SAFETY_ALLOW_WITH_WARNINGS) {
+                printf("\n\x1b[33m[SAFETY WARNING] %s - proceeding with caution\x1b[0m\n\n", sLastSafetyReason);
+            }
+        }
+
         BuildRunCommand(sCommand, sizeof(sCommand), NULL);
+        if (sCustomCtx[0])
+            printf("Using custom context length: %s\n", sCustomCtx);
+
+        {
+            ULONGLONG availRAM = GetAvailableRamMB();
+            ULONGLONG totalRAM = GetSystemRamMB();
+            int modelMB = GetModelSizeMB(sSelectedModel);
+            printf("\x1b[90m[Safety Check] RAM: %llu/%llu MB | Model: %d MB\x1b[0m\n\n", 
+                   availRAM, totalRAM, modelMB);
+        }
+
+        sModelLoaded = TRUE;
         return RunChildProcess(sCommand);
     }
 
     if (lstrcmpiA(argv[1], "serve") == 0 || lstrcmpiA(argv[1], "server") == 0) {
+        int i;
+        int customGpu = -1;
+        char customCtx[32] = "";
+        BOOL includeLocalIp = FALSE;
+        SafetyDecision safety;
+
+        SafetyInit();
+
         if (EnsureCliConfigReady(FALSE) != 0)
             return 1;
 
-        /* Check if model name provided as argument */
-        if (argc > 2 && argv[2][0]) {
-            /* Use provided model name */
-            lstrcpynA(sSelectedModel, argv[2], sizeof(sSelectedModel));
-        } else {
-            /* Show interactive model selector */
+        for (i = 2; i < argc; i++) {
+            if (lstrcmpiA(argv[i], "--context") == 0 && i + 1 < argc) {
+                lstrcpynA(customCtx, argv[i + 1], sizeof(customCtx));
+                i++;
+            } else if (lstrcmpiA(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
+                customGpu = atoi(argv[i + 1]);
+                i++;
+            } else if (lstrcmpiA(argv[i], "--ip") == 0) {
+                includeLocalIp = TRUE;
+            } else if (argv[i][0] != '-') {
+                lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
+            }
+        }
+
+        if (!sSelectedModel[0]) {
             char selectedModel[MAX_PATH];
             if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) < 0) {
                 printf("Model selection cancelled.\n");
@@ -2152,7 +2999,45 @@ static int RunCli(int argc, char **argv)
             lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
         }
 
-        BuildServeCommand(sCommand, sizeof(sCommand));
+        {
+            char projector[MAX_PATH] = "";
+            int ctxLen = customCtx[0] ? atoi(customCtx) : 2048;
+            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            safety = CheckLoadSafety(sSelectedModel, projector, ctxLen, customGpu >= 0 ? customGpu : -1);
+
+            if (safety == SAFETY_REFUSE) {
+                PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+                    "Suggestion: Try a smaller model, lower quantization, reduced context, or fewer GPU layers.");
+                return 1;
+            }
+
+            if (safety == SAFETY_KILL) {
+                TerminateActiveProcess();
+                PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+                    "Process terminated. Suggestion: Close other applications and retry.");
+                return 1;
+            }
+
+            if (safety == SAFETY_ALLOW_WITH_WARNINGS) {
+                printf("\n\x1b[33m[SAFETY WARNING] %s - proceeding with caution\x1b[0m\n\n", sLastSafetyReason);
+            }
+        }
+
+        BuildServeCommand(sCommand, sizeof(sCommand), customCtx[0] ? customCtx : NULL, customGpu, includeLocalIp);
+        if (customCtx[0])
+            printf("Using custom context length: %s\n", customCtx);
+        if (includeLocalIp)
+            printf("Server will listen on localhost and local IP\n");
+
+        {
+            ULONGLONG availRAM = GetAvailableRamMB();
+            ULONGLONG totalRAM = GetSystemRamMB();
+            int modelMB = GetModelSizeMB(sSelectedModel);
+            printf("\x1b[90m[Safety Check] RAM: %llu/%llu MB | Model: %d MB\x1b[0m\n\n", 
+                   availRAM, totalRAM, modelMB);
+        }
+
+        sModelLoaded = TRUE;
         return RunChildProcess(sCommand);
     }
 
@@ -2170,6 +3055,8 @@ static int RunCli(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     return RunCli(argc, argv);
 }
 
