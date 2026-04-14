@@ -5,6 +5,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wininet.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <commdlg.h>
@@ -128,6 +129,9 @@ static int EnsureModelsFolderReady(void);
 
 /* HuggingFace model download */
 static int DownloadFromHuggingFace(const char *hfUrl);
+
+/* Chat Mode */
+static int RunChatMode(void);
 
 /* ──────────────────────────────────────────────
    Safety Controller
@@ -462,13 +466,20 @@ static void AttachConsoleStreams(void)
 
 static void OpenOwnedConsole(const char *title)
 {
-    FreeConsole();
-    if (!AllocConsole())
-        return;
-
-    if (title && *title)
-        SetConsoleTitleA(title);
-
+    DWORD consoleMode;
+    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+    BOOL hasConsole = (hInput != INVALID_HANDLE_VALUE) && 
+                      (GetConsoleMode(hInput, &consoleMode) != 0);
+    
+    if (!hasConsole) {
+        if (!AllocConsole()) {
+            return;
+        }
+        if (title && *title) {
+            SetConsoleTitleA(title);
+        }
+    }
+    
     AttachConsoleStreams();
 }
 
@@ -1942,6 +1953,7 @@ static int PrintUsage(void)
     printf("  valora run     Run the saved model in llama-cli\n");
     printf("  valora serve [model]  Start a model in llama-server (optional model name)\n");
     printf("  valora get <owner/repo|hf_url>  Download a GGUF model from Hugging Face\n");
+    printf("  valora chat    Start interactive chat mode (requires server running)\n");
     fflush(stdout);
     return 1;
 }
@@ -2885,6 +2897,7 @@ static int RunCli(int argc, char **argv)
         int customGpu = -1;
         char ctxBuf[32] = "2048";
         char gpuBuf[32] = "-1";
+        BOOL modelProvidedAsArg = FALSE;
         SafetyDecision safety;
 
         SafetyInit();
@@ -2903,7 +2916,12 @@ static int RunCli(int argc, char **argv)
                 i++;
             } else if (argv[i][0] != '-') {
                 lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
+                modelProvidedAsArg = TRUE;
             }
+        }
+
+        if (!modelProvidedAsArg) {
+            sSelectedModel[0] = '\0';
         }
 
         if (!sSelectedModel[0]) {
@@ -2969,6 +2987,7 @@ static int RunCli(int argc, char **argv)
         int customGpu = -1;
         char customCtx[32] = "";
         BOOL includeLocalIp = FALSE;
+        BOOL modelProvidedAsArg = FALSE;
         SafetyDecision safety;
 
         SafetyInit();
@@ -2987,11 +3006,17 @@ static int RunCli(int argc, char **argv)
                 includeLocalIp = TRUE;
             } else if (argv[i][0] != '-') {
                 lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
+                modelProvidedAsArg = TRUE;
             }
+        }
+
+        if (!modelProvidedAsArg) {
+            sSelectedModel[0] = '\0';
         }
 
         if (!sSelectedModel[0]) {
             char selectedModel[MAX_PATH];
+            printf("\x1b[36m=== Select Model ===\x1b[0m\n\n");
             if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) < 0) {
                 printf("Model selection cancelled.\n");
                 return 0;
@@ -3050,13 +3075,561 @@ static int RunCli(int argc, char **argv)
         return DownloadFromHuggingFace(argv[2]);
     }
 
+    if (lstrcmpiA(argv[1], "chat") == 0 || lstrcmpiA(argv[1], "cli") == 0) {
+        return RunChatMode();
+    }
+
     return PrintUsage();
+}
+
+/* ──────────────────────────────────────────────
+   Chat Mode Implementation
+   ────────────────────────────────────────────── */
+
+#define MAX_HISTORY 50
+#define MAX_MESSAGE_LEN 4096
+
+typedef struct {
+    char role[32];
+    char content[MAX_MESSAGE_LEN];
+} ChatMessage;
+
+typedef struct {
+    ChatMessage messages[MAX_HISTORY];
+    int count;
+    int max_tokens;
+} ChatHistory;
+
+static ChatHistory sChatHistory;
+static char sServerUrl[512] = "http://127.0.0.1:8000";
+static char sApiKey[256] = "";
+static BOOL sWebSearchEnabled = FALSE;
+
+static void ChatInit(void) {
+    memset(&sChatHistory, 0, sizeof(sChatHistory));
+    sChatHistory.max_tokens = 4096;
+}
+
+static void ChatAddMessage(const char *role, const char *content) {
+    if (sChatHistory.count >= MAX_HISTORY) {
+        int i;
+        for (i = 0; i < sChatHistory.count - 1; i++) {
+            sChatHistory.messages[i] = sChatHistory.messages[i + 1];
+        }
+        sChatHistory.count--;
+    }
+    
+    ChatMessage *msg = &sChatHistory.messages[sChatHistory.count];
+    strncpy(msg->role, role, sizeof(msg->role) - 1);
+    strncpy(msg->content, content, sizeof(msg->content) - 1);
+    sChatHistory.count++;
+}
+
+static void ChatClear(void) {
+    sChatHistory.count = 0;
+    memset(sChatHistory.messages, 0, sizeof(sChatHistory.messages));
+}
+
+static const char* GetSystemPrompt(void) {
+    return "You are Valora, a helpful AI assistant running locally. "
+           "Keep responses short and helpful. "
+           "You can use web search when needed for current information.";
+}
+
+static size_t HttpWriteCallback(void *contents, size_t size, size_t nmemb, char **output) {
+    size_t realsize = size * nmemb;
+    size_t len = *output ? strlen(*output) : 0;
+    char *ptr = realloc(*output, len + realsize + 1);
+    
+    if (!ptr)
+        return 0;
+    
+    *output = ptr;
+    memcpy(*output + len, contents, realsize);
+    (*output)[len + realsize] = '\0';
+    
+    return realsize;
+}
+
+static char* HttpPost(const char *url, const char *json_data) {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    char *result = NULL;
+    DWORD dwSize, dwDownloaded;
+    BOOL bResults;
+    char host[512] = "", path[1024] = "";
+    INTERNET_PORT port = 80;
+    const char *p, *host_start, *path_start;
+    
+    if (!url || !json_data)
+        return NULL;
+    
+    p = url;
+    if (strncmp(p, "http://", 7) == 0) p += 7, port = 80;
+    else if (strncmp(p, "https://", 8) == 0) p += 8, port = 443;
+    
+    host_start = p;
+    while (*p && *p != '/' && *p != ':') p++;
+    
+    strncpy(host, host_start, p - host_start);
+    host[p - host_start] = '\0';
+    
+    if (*p == ':') {
+        p++;
+        port = (INTERNET_PORT)atoi(p);
+        while (*p && *p >= '0' && *p <= '9') p++;
+    }
+    
+    path_start = (*p == '/') ? p : "/";
+    strncpy(path, path_start, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    
+    hSession = InternetOpen("Valora/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hSession)
+        return NULL;
+    
+    hConnect = InternetConnect(hSession, host, port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) { InternetCloseHandle(hSession); return NULL; }
+    
+    hRequest = HttpOpenRequest(hConnect, "POST", path, NULL, NULL, NULL, 0, 0);
+    
+    if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hSession); return NULL; }
+    
+    {
+        bResults = HttpSendRequest(hRequest, "Content-Type: application/json", 
+            (DWORD)strlen("Content-Type: application/json"), (LPVOID)json_data, (DWORD)strlen(json_data));
+    }
+    
+    if (bResults) {
+        char *response = NULL;
+        char buffer[8192];
+        DWORD bytesRead;
+        
+        while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            HttpWriteCallback(buffer, 1, bytesRead, &response);
+        }
+        result = response;
+    }
+    
+    if (hRequest) InternetCloseHandle(hRequest);
+    if (hConnect) InternetCloseHandle(hConnect);
+    if (hSession) InternetCloseHandle(hSession);
+    
+    return result;
+}
+
+static char* BuildChatPayload(const char *user_message) {
+    static char payload[16384];
+    int offset;
+    int i;
+    
+    offset = snprintf(payload, sizeof(payload),
+        "{\"model\":\"auto\",\"messages\":["
+        "{\"role\":\"system\",\"content\":\"%s\"},",
+        GetSystemPrompt());
+    
+    for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
+        if (i > 0)
+            offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
+        offset += snprintf(payload + offset, sizeof(payload) - offset,
+            "{\"role\":\"%s\",\"content\":\"%s\"}",
+            sChatHistory.messages[i].role,
+            sChatHistory.messages[i].content);
+    }
+    
+    if (user_message) {
+        offset += snprintf(payload + offset, sizeof(payload) - offset,
+            "],\"max_tokens\":%d}", sChatHistory.max_tokens);
+    }
+    
+    return payload;
+}
+
+static char* ParseChatResponse(const char *json_response) {
+    static char result[8192];
+    const char *content_start, *content_end;
+    int len;
+    
+    if (!json_response)
+        return NULL;
+    
+    content_start = strstr(json_response, "\"content\"");
+    if (!content_start)
+        return NULL;
+    
+    content_start = strchr(content_start, '"');
+    if (!content_start) return NULL;
+    content_start++;
+    content_start = strchr(content_start, '"');
+    if (!content_start) return NULL;
+    content_start++;
+    
+    content_end = content_start;
+    while (*content_end && *content_end != '"') {
+        if (*content_end == '\\')
+            content_end++;
+        content_end++;
+    }
+    
+    len = (int)(content_end - content_start);
+    if (len >= (int)sizeof(result))
+        len = sizeof(result) - 1;
+    
+    strncpy(result, content_start, len);
+    result[len] = '\0';
+    
+    {
+        char *p = result, *q = result;
+        while (*p) {
+            if (*p == '\\' && *(p + 1) == 'n') { *q++ = '\n'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == 't') { *q++ = '\t'; p += 2; }
+            else *q++ = *p++;
+        }
+        *q = '\0';
+    }
+    
+    return result;
+}
+
+static void PrintWrapped(const char *text, int width) {
+    int col = 0;
+    while (*text) {
+        if (*text == '\n') { putchar('\n'); col = 0; text++; continue; }
+        if (col >= width) { putchar('\n'); col = 0; }
+        putchar(*text++); col++;
+    }
+    if (col > 0) putchar('\n');
+}
+
+static void EnsureServerRunning(void) {
+    SOCKET s;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    
+    if (WSAStartup(MAKEWORD(2, 2), &wsd) != 0)
+        return;
+    
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { WSACleanup(); return; }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8000);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        closesocket(s);
+        WSACleanup();
+        return;
+    }
+    closesocket(s);
+    WSACleanup();
+    
+    printf("\n\x1b[33mNo server running. Please start one first:\x1b[0m\n");
+    printf("  \x1b[36mvalora serve\x1b[0m\n\n");
+}
+
+static HANDLE sChatServerProcess = NULL;
+static DWORD sChatServerProcessId = 0;
+
+static void StopChatServer(void) {
+    if (sChatServerProcess) {
+        printf("\n\x1b[90mStopping server...\x1b[0m\n");
+        TerminateProcess(sChatServerProcess, 0);
+        CloseHandle(sChatServerProcess);
+        sChatServerProcess = NULL;
+        sChatServerProcessId = 0;
+    }
+}
+
+static BOOL IsServerRunning(void) {
+    SOCKET s;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    BOOL running = FALSE;
+    
+    if (WSAStartup(MAKEWORD(2, 2), &wsd) != 0)
+        return FALSE;
+    
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { WSACleanup(); return FALSE; }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8000);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+        running = TRUE;
+    
+    closesocket(s);
+    WSACleanup();
+    return running;
+}
+
+static void WaitForServerReady(void) {
+    int i;
+    printf("\x1b[90mWaiting for server to be ready");
+    fflush(stdout);
+    
+    for (i = 0; i < 60; i++) {
+        Sleep(1000);
+        if (IsServerRunning()) {
+            printf("\x1b[90m OK\x1b[0m\n\n");
+            return;
+        }
+        printf("\x1b[90m.\x1b[0m");
+        fflush(stdout);
+    }
+    printf("\x1b[33m Server may still be starting...\x1b[0m\n\n");
+}
+
+static int StartServerForChat(void) {
+    char cliPath[MAX_PATH];
+    char modelPath[MAX_PATH * 2];
+    char projectorPath[MAX_PATH * 2];
+    char ctx[32], gpu[32], threads[32];
+    char command[MAX_CMD];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char selectedModel[MAX_PATH];
+    int selResult;
+    SafetyDecision safety;
+    ULONGLONG availRAM, totalRAM;
+    int modelMB;
+    
+    if (IsServerRunning()) {
+        printf("\x1b[90mServer already running.\x1b[0m\n");
+        return 0;
+    }
+    
+    if (EnsureCliConfigReady(FALSE) != 0)
+        return -1;
+    
+    SafetyInit();
+    
+    printf("\x1b[36m=== Select Model for Chat ===\x1b[0m\n\n");
+    selResult = RunInteractiveModelSelector(selectedModel, sizeof(selectedModel));
+    
+    if (selResult < 0) {
+        printf("Model selection cancelled.\n");
+        return -1;
+    }
+    
+    lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
+    
+    {
+        char projector[MAX_PATH] = "";
+        FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+        if (projector[0])
+            lstrcpynA(projectorPath, projector, sizeof(projectorPath));
+        else
+            projectorPath[0] = '\0';
+    }
+    
+    safety = CheckLoadSafety(sSelectedModel, projectorPath[0] ? projectorPath : NULL, 2048, -1);
+    
+    if (safety == SAFETY_REFUSE) {
+        PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+            "Suggestion: Try a smaller model or close other applications.");
+        return -1;
+    }
+    
+    if (safety == SAFETY_KILL) {
+        TerminateActiveProcess();
+        PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+            "Process terminated. Try again after closing other apps.");
+        return -1;
+    }
+    
+    if (safety == SAFETY_ALLOW_WITH_WARNINGS) {
+        printf("\n\x1b[33m[SAFETY WARNING] %s - proceeding with caution\x1b[0m\n\n", sLastSafetyReason);
+    }
+    
+    lstrcpynA(cliPath, sServer, sizeof(cliPath));
+    {
+        char *lastSlash = strrchr(cliPath, '\\');
+        if (lastSlash) lstrcpynA(lastSlash + 1, "llama-server.exe", sizeof(cliPath) - (int)(lastSlash - cliPath) - 1);
+        else lstrcpynA(cliPath, "llama-server.exe", sizeof(cliPath));
+    }
+    BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads));
+    
+    availRAM = GetAvailableRamMB();
+    totalRAM = GetSystemRamMB();
+    modelMB = GetModelSizeMB(sSelectedModel);
+    
+    system("cls");
+    
+    printf("\x1b[36m========================================\x1b[0m\n");
+    printf("\x1b[36m       VALORA SERVER STARTING\x1b[0m\n");
+    printf("\x1b[36m========================================\x1b[0m\n\n");
+    printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
+    printf("\x1b[32mContext:\x1b[0m %s\n", ctx);
+    printf("\x1b[32mGPU Layers:\x1b[0m %s\n", gpu);
+    printf("\x1b[32mThreads:\x1b[0m %s\n\n", threads);
+    printf("\x1b[90mRAM: %llu/%llu MB | Model: %d MB\x1b[0m\n", availRAM, totalRAM, modelMB);
+    printf("\x1b[90mServer: http://127.0.0.1:8000\x1b[0m\n\n");
+    
+    if (projectorPath[0]) {
+        snprintf(command, sizeof(command),
+            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1",
+            cliPath, modelPath, projectorPath, ctx, gpu, threads);
+    } else {
+        snprintf(command, sizeof(command),
+            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1",
+            cliPath, modelPath, ctx, gpu, threads);
+    }
+    
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    
+    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "\n\x1b[31mFailed to start server. Error: %lu\x1b[0m\n", GetLastError());
+        return -1;
+    }
+    
+    sChatServerProcess = pi.hProcess;
+    sChatServerProcessId = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    
+    printf("\x1b[90mStarting server...\x1b[0m ");
+    fflush(stdout);
+    WaitForServerReady();
+    
+    return 0;
+}
+
+static int RunChatMode(void) {
+    char input[MAX_MESSAGE_LEN];
+    char *response;
+    char *assistant_msg;
+    char url[512];
+    BOOL serverStartedByUs = FALSE;
+    int exitCode = 0;
+    
+    ChatInit();
+    
+    if (IsServerRunning()) {
+        system("cls");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
+        printf("\x1b[90mUsing existing server.\x1b[0m\n\n");
+    } else {
+        if (StartServerForChat() != 0) {
+            return 1;
+        }
+        serverStartedByUs = TRUE;
+        system("cls");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
+        printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
+        printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
+    }
+    
+    snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
+    
+    printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen\n\n");
+    
+    while (1) {
+        printf("\x1b[32mYou \x1b[0m> ");
+        if (!fgets(input, sizeof(input), stdin)) {
+            exitCode = 0;
+            break;
+        }
+        
+        input[strcspn(input, "\n")] = '\0';
+        
+        if (strcmp(input, "/exit") == 0 || strcmp(input, "exit") == 0) {
+            exitCode = 0;
+            break;
+        }
+        
+        if (strcmp(input, "/cls") == 0) {
+            system("cls");
+            printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
+            printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+            printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
+            printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
+            printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
+            printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen\n\n");
+            continue;
+        }
+        
+        if (strcmp(input, "/clear") == 0 || strcmp(input, "clear") == 0) {
+            ChatClear();
+            printf("\x1b[90mChat history cleared.\x1b[0m\n");
+            continue;
+        }
+        
+        if (strcmp(input, "/model") == 0) {
+            char selectedModel[MAX_PATH];
+            if (RunInteractiveModelSelector(selectedModel, sizeof(selectedModel)) >= 0) {
+                printf("\x1b[33mModel change requires restart. Please exit and run 'valora chat' again.\x1b[0m\n");
+            }
+            continue;
+        }
+        
+        if (strcmp(input, "/help") == 0 || strcmp(input, "/?") == 0) {
+            printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
+            printf("  /exit     - Exit chat and stop server\n");
+            printf("  /clear    - Clear chat history\n");
+            printf("  /cls      - Clear terminal screen\n");
+            printf("  /model    - Change model (requires restart)\n");
+            printf("  /help     - Show this help\n\n");
+            continue;
+        }
+        
+        if (strlen(input) == 0)
+            continue;
+        
+        ChatAddMessage("user", input);
+        
+        response = HttpPost(url, BuildChatPayload(input));
+        
+        if (!response) {
+            printf("\x1b[31mFailed to get response. Is the server running?\x1b[0m\n");
+            ChatAddMessage("assistant", "");
+            continue;
+        }
+        
+        assistant_msg = ParseChatResponse(response);
+        if (!assistant_msg || !assistant_msg[0]) {
+            printf("\x1b[31mFailed to parse response\x1b[0m\n");
+            free(response);
+            ChatAddMessage("assistant", "");
+            continue;
+        }
+        
+        ChatAddMessage("assistant", assistant_msg);
+        
+        printf("\n\x1b[35mAI >\x1b[0m ");
+        PrintWrapped(assistant_msg, 80);
+        printf("\n");
+        
+        free(response);
+    }
+    
+    if (serverStartedByUs) {
+        StopChatServer();
+    }
+    
+    printf("\n\x1b[90mGoodbye!\x1b[0m\n");
+    return exitCode;
 }
 
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    
+    if (argc > 1) {
+        AttachConsoleStreams();
+    }
+    
     return RunCli(argc, argv);
 }
 
