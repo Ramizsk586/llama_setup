@@ -361,7 +361,7 @@ static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *g
 /* Interactive model selector using console API */
 
 /* Animation states for realtime feedback */
-static const char* animationFrames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+static const char* animationFrames[] = {"-", "\\", "|", "/"};
 static int animFrame = 0;
 
 /* Get available VRAM in MB */
@@ -463,50 +463,120 @@ static void PrintAnimation(const char *message)
     animFrame = (animFrame + 1) % 10;
 }
 
-/* Print table header */
-static void PrintTableHeader(void)
+static int GetSelectorPriority(const char *modelName, BOOL usable, int sizeMB)
 {
-    printf("\n┌─────────────────────────────────────────────────────────────────────────────┐\n");
-    printf("│ %-45s │ %10s │ %10s │ %8s │\n", "Model Name", "Size", "Quant", "Usable");
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
+    const char *quant;
+
+    if (!usable)
+        return 1000 + (sizeMB > 0 ? sizeMB : 999999);
+
+    quant = DetectQuantizationType(modelName);
+    if (strcmp(quant, "Q4-K_M") == 0) return 0;
+    if (strcmp(quant, "Q4_0") == 0) return 1;
+    if (strcmp(quant, "Q4_1") == 0) return 2;
+    if (strcmp(quant, "Q5-K_M") == 0) return 3;
+    if (strcmp(quant, "Q5-K_S") == 0) return 4;
+    if (strcmp(quant, "Q5_0") == 0) return 5;
+    if (strcmp(quant, "Q5_1") == 0) return 6;
+    if (strcmp(quant, "Q6_K") == 0) return 7;
+    if (strcmp(quant, "Q8_0") == 0) return 8;
+    if (strcmp(quant, "F16") == 0) return 9;
+    if (strcmp(quant, "BF16") == 0) return 10;
+    if (strcmp(quant, "F32") == 0) return 11;
+    return 12;
 }
 
-/* Print table row with color coding */
-static void PrintTableRow(int index, int selectedIndex, const char *modelName, int sizeMB, const char *quant, BOOL usable)
+static int PickBestSelectorIndex(const int *modelSizes, const BOOL *usableFlags)
 {
-    BOOL isSelected = (index == selectedIndex);
-    
-    if (isSelected) {
-        /* Selected row - bright cyan background */
-        if (usable) {
-            printf("│ \x1b[46;30m%45s\x1b[0m │ \x1b[46;30m%10s\x1b[0m │ \x1b[46;30m%10s\x1b[0m │ \x1b[46;30m  ✓ OK  \x1b[0m │\n", modelName, "", quant);
-        } else {
-            printf("│ \x1b[41;30m%45s\x1b[0m │ \x1b[41;30m%10s\x1b[0m │ \x1b[41;30m%10s\x1b[0m │ \x1b[41;30m LOWMEM \x1b[0m │\n", modelName, "", quant);
-        }
-    } else {
-        /* Non-selected row */
-        char sizeStr[32];
-        FormatFileSize(sizeMB, sizeStr, sizeof(sizeStr));
-        
-        if (usable) {
-            /* Green for usable */
-            printf("│ %-45s │ %10s │ %10s │ \x1b[32m  ✓ OK  \x1b[0m │\n", modelName, sizeStr, quant);
-        } else {
-            /* Red for not usable */
-            printf("│ %-45s │ %10s │ %10s │ \x1b[31mLOWMEM\x1b[0m │\n", modelName, sizeStr, quant);
+    int i;
+    int bestIndex = 0;
+    int bestPriority = 9999999;
+    int bestSize = 9999999;
+
+    for (i = 0; i < nModels; ++i) {
+        int priority;
+        int sizeValue;
+
+        if (sSelectedModel[0] && lstrcmpiA(sModels[i], sSelectedModel) == 0)
+            return i;
+
+        priority = GetSelectorPriority(sModels[i], usableFlags[i], modelSizes[i]);
+        sizeValue = (modelSizes[i] > 0) ? modelSizes[i] : 9999999;
+
+        if (priority < bestPriority || (priority == bestPriority && sizeValue < bestSize)) {
+            bestPriority = priority;
+            bestSize = sizeValue;
+            bestIndex = i;
         }
     }
+
+    return bestIndex;
 }
 
-/* Print table footer */
+static void MoveCursorUp(int lines)
+{
+    if (lines > 0)
+        printf("\x1b[%dA", lines);
+}
+
+static void MoveCursorDown(int lines)
+{
+    if (lines > 0)
+        printf("\x1b[%dB", lines);
+}
+
+static void PrintTableHeader(void)
+{
+    printf("\n+----+-----------------------------------------------+------------+----------+----------+\n");
+    printf("| %2s | %-45s | %10s | %8s | %8s |\n", "#", "Model", "Size", "Quant", "Status");
+    printf("+----+-----------------------------------------------+------------+----------+----------+\n");
+}
+
+static void PrintTableRowAt(int rowIndex, int selectedIndex, const char *modelName, int sizeMB, const char *quant, BOOL usable)
+{
+    char sizeStr[32];
+    const char *status = usable ? "Ready" : "Low VRAM";
+    BOOL isSelected = (rowIndex == selectedIndex);
+
+    FormatFileSize(sizeMB, sizeStr, sizeof(sizeStr));
+    printf("\x1b[2K\r");
+    printf("| %2d | ", rowIndex + 1);
+    if (isSelected) {
+        printf("\x1b[46;30m%-45.45s\x1b[0m", modelName);
+    } else {
+        printf("%-45.45s", modelName);
+    }
+    printf(" | %10s | %8.8s | ", sizeStr, quant);
+    if (usable) {
+        printf("\x1b[32m%8s\x1b[0m", status);
+    } else {
+        printf("\x1b[33m%8s\x1b[0m", status);
+    }
+    printf(" |\n");
+}
+
 static void PrintTableFooter(void)
 {
-    printf("└─────────────────────────────────────────────────────────────────────────────┘\n");
+    printf("+----+-----------------------------------------------+------------+----------+----------+\n");
+}
+
+static void RefreshSelectorRow(int rowIndex, int selectedIndex, const int *modelSizes, const BOOL *usableFlags, int totalRows)
+{
+    int linesUp;
+    const char *quant;
+
+    linesUp = totalRows - rowIndex + 1;
+    MoveCursorUp(linesUp);
+    quant = DetectQuantizationType(sModels[rowIndex]);
+    PrintTableRowAt(rowIndex, selectedIndex, sModels[rowIndex], modelSizes[rowIndex], quant, usableFlags[rowIndex]);
+    MoveCursorDown(linesUp - 1);
+    fflush(stdout);
 }
 
 static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen)
 {
     int selectedIndex = 0;
+    int previousIndex = 0;
     int i;
     int ch;
     DWORD mode;
@@ -515,6 +585,7 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     
     /* Array to store model sizes */
     static int modelSizes[MAX_MODELS];
+    static BOOL usableFlags[MAX_MODELS];
     
     if (!selectedModel || selectedModelLen <= 0)
         return -1;
@@ -530,6 +601,7 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     /* Calculate sizes for all models */
     for (i = 0; i < nModels; i++) {
         modelSizes[i] = GetModelFileSizeMB(sModels[i]);
+        usableFlags[i] = IsModelUsable(sModels[i], availableVRAM);
     }
     
     /* Clear animation line */
@@ -555,20 +627,14 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     printf("\x1b[90mUse UP/DOWN arrow keys to navigate, ENTER to select, ESC to cancel\x1b[0m\n");
     printf("\x1b[90mAvailable VRAM: %d MB\x1b[0m\n\n", availableVRAM);
 
-    /* Find default selection (currently selected model or first) */
-    for (i = 0; i < nModels; ++i) {
-        if (lstrcmpiA(sModels[i], sSelectedModel) == 0) {
-            selectedIndex = i;
-            break;
-        }
-    }
+    selectedIndex = PickBestSelectorIndex(modelSizes, usableFlags);
+    previousIndex = selectedIndex;
 
     /* Draw initial table */
     PrintTableHeader();
     for (i = 0; i < nModels; ++i) {
         const char *quant = DetectQuantizationType(sModels[i]);
-        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
-        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
+        PrintTableRowAt(i, selectedIndex, sModels[i], modelSizes[i], quant, usableFlags[i]);
     }
     PrintTableFooter();
     
@@ -578,42 +644,15 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
         if (ch == 224) { /* Arrow key prefix */
             ch = _getch();
             if (ch == 72) { /* Up arrow */
-                if (selectedIndex > 0) {
-                    selectedIndex--;
-                    /* Redraw table */
-                    printf("\r");
-                    for (i = 0; i < nModels + 3; i++) {
-                        printf("\x1b[2K\r\n");  /* Clear lines */
-                    }
-                    /* Move cursor back up */
-                    printf("\x1b[%dA", nModels + 4);
-                    
-                    PrintTableHeader();
-                    for (i = 0; i < nModels; ++i) {
-                        const char *quant = DetectQuantizationType(sModels[i]);
-                        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
-                        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
-                    }
-                    PrintTableFooter();
-                }
+                previousIndex = selectedIndex;
+                selectedIndex = (selectedIndex > 0) ? (selectedIndex - 1) : (nModels - 1);
+                RefreshSelectorRow(previousIndex, selectedIndex, modelSizes, usableFlags, nModels);
+                RefreshSelectorRow(selectedIndex, selectedIndex, modelSizes, usableFlags, nModels);
             } else if (ch == 80) { /* Down arrow */
-                if (selectedIndex < nModels - 1) {
-                    selectedIndex++;
-                    /* Redraw table */
-                    printf("\r");
-                    for (i = 0; i < nModels + 3; i++) {
-                        printf("\x1b[2K\r\n");
-                    }
-                    printf("\x1b[%dA", nModels + 4);
-                    
-                    PrintTableHeader();
-                    for (i = 0; i < nModels; ++i) {
-                        const char *quant = DetectQuantizationType(sModels[i]);
-                        BOOL usable = IsModelUsable(sModels[i], availableVRAM);
-                        PrintTableRow(i, selectedIndex, sModels[i], modelSizes[i], quant, usable);
-                    }
-                    PrintTableFooter();
-                }
+                previousIndex = selectedIndex;
+                selectedIndex = (selectedIndex < nModels - 1) ? (selectedIndex + 1) : 0;
+                RefreshSelectorRow(previousIndex, selectedIndex, modelSizes, usableFlags, nModels);
+                RefreshSelectorRow(selectedIndex, selectedIndex, modelSizes, usableFlags, nModels);
             }
         } else if (ch == 13) { /* Enter */
             lstrcpynA(selectedModel, sModels[selectedIndex], selectedModelLen);
