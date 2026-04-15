@@ -81,6 +81,9 @@ static char sConfigPath[MAX_PATH] = "";
 static int  nServerType = 0;
 static char sCustomCtx[32] = "";
 
+/* llama.cpp setup state */
+static char sLlamaCppPath[MAX_PATH] = "";
+
 /* GPU auto-detection state */
 static BOOL bGpuFieldEdited = FALSE;
 static int  nLastDetectedGpu = -1;
@@ -135,6 +138,34 @@ static BOOL sDebugMode = FALSE;
 static BOOL sOllamaMode = FALSE;
 static char sOllamaUrl[256] = "http://127.0.0.1:11434";
 static char sSelectedOllamaModel[256] = "";
+
+/* ──────────────────────────────────────────────
+   llama.cpp Setup
+   ────────────────────────────────────────────── */
+typedef enum {
+    OS_UNKNOWN = 0,
+    OS_WINDOWS,
+    OS_LINUX,
+    OS_MAC
+} OSType;
+
+typedef struct {
+    char name[256];
+    char downloadUrl[512];
+    int size;
+    BOOL isVulkan;
+    BOOL isCpu;
+    OSType os;
+} LlamaCppBuild;
+
+static OSType DetectOS(void);
+static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count);
+static void FreeLlamaCppBuilds(LlamaCppBuild *builds, int count);
+static int SelectBuildMenu(LlamaCppBuild *builds, int count);
+static int DownloadBuild(const char *url, const char *destPath);
+static int ExtractZip(const char *zipPath, const char *destDir);
+static BOOL VerifyLlamaCppInstall(const char *installPath);
+static int SetupLlamaCpp(void);
 
 /* ──────────────────────────────────────────────
    Safety Controller
@@ -583,6 +614,7 @@ static BOOL SaveConfigToDisk(void)
     WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
     WritePrivateProfileStringA("paths", "models_folder", sFolder, sConfigPath);
     WritePrivateProfileStringA("paths", "default_model", sSelectedModel, sConfigPath);
+    WritePrivateProfileStringA("paths", "llama_cpp_path", sLlamaCppPath, sConfigPath);
     WritePrivateProfileStringA("settings", "ctx", ctx, sConfigPath);
     WritePrivateProfileStringA("settings", "gpu", gpu, sConfigPath);
     WritePrivateProfileStringA("settings", "port", port, sConfigPath);
@@ -600,6 +632,7 @@ static BOOL LoadConfigFromDisk(void)
     GetPrivateProfileStringA("paths", "server", "", sServer, sizeof(sServer), sConfigPath);
     GetPrivateProfileStringA("paths", "models_folder", "", sFolder, sizeof(sFolder), sConfigPath);
     GetPrivateProfileStringA("paths", "default_model", "", sSelectedModel, sizeof(sSelectedModel), sConfigPath);
+    GetPrivateProfileStringA("paths", "llama_cpp_path", "", sLlamaCppPath, sizeof(sLlamaCppPath), sConfigPath);
     nServerType = GetPrivateProfileIntA("settings", "server_type", 0, sConfigPath);
 
     return sServer[0] != '\0' && sFolder[0] != '\0';
@@ -1948,12 +1981,540 @@ static int PrintModels(void)
     return 0;
 }
 
+/* ──────────────────────────────────────────────
+   llama.cpp Setup Implementation
+   ────────────────────────────────────────────── */
+
+static OSType DetectOS(void)
+{
+#ifdef _WIN32
+    return OS_WINDOWS;
+#elif __linux__
+    return OS_LINUX;
+#elif __APPLE__
+    return OS_MAC;
+#else
+    return OS_UNKNOWN;
+#endif
+}
+
+static const char* GetOSName(OSType os)
+{
+    switch (os) {
+        case OS_WINDOWS: return "Windows";
+        case OS_LINUX:   return "Linux";
+        case OS_MAC:    return "macOS";
+        default:       return "Unknown";
+    }
+}
+
+static const char* GetOSFilterPattern(OSType os)
+{
+    switch (os) {
+        case OS_WINDOWS: return "win";
+        case OS_LINUX:   return "linux";
+        case OS_MAC:    return "macos";
+        default:       return "";
+    }
+}
+
+static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
+{
+    char command[MAX_CMD];
+    char tempFile[MAX_PATH];
+    char *jsonBuffer = NULL;
+    DWORD jsonSize = 0;
+    HANDLE hFile;
+    DWORD bytesRead;
+    int i, buildIdx = 0;
+    char *tagStart, *tagEnd, *nameStart, *nameEnd;
+    char *browserUrlStart, *browserUrlEnd;
+    char *sizeStart, *sizeEnd;
+    char *p;
+    LlamaCppBuild *tempBuilds = NULL;
+    int capacity = 16;
+    OSType detectedOS;
+    const char *osFilter;
+    
+    *builds = NULL;
+    *count = 0;
+    
+    detectedOS = DetectOS();
+    osFilter = GetOSFilterPattern(detectedOS);
+    
+    if (!osFilter[0]) {
+        fprintf(stderr, "Unsupported operating system.\n");
+        return -1;
+    }
+    
+    tempBuilds = (LlamaCppBuild*)malloc(sizeof(LlamaCppBuild) * capacity);
+    if (!tempBuilds) {
+        fprintf(stderr, "Out of memory.\n");
+        return -1;
+    }
+    
+    /* Create temp file for JSON response */
+    GetTempFileNameA(".", "valora_releases_", 0, tempFile);
+    lstrcatA(tempFile, ".json");
+    
+    /* Fetch JSON from GitHub API */
+    snprintf(command, sizeof(command),
+        "powershell.exe -NoProfile -Command \"$r = Invoke-RestMethod -Uri 'https://api.github.com/repos/ggerganov/llama.cpp/releases/latest' -Headers @{'Accept'='application/vnd.github+json'}; $r | ConvertTo-Json -Depth 10 | Out-File -FilePath '%s' -Encoding utf8\"",
+        tempFile);
+    
+    if (RunChildProcess(command) != 0) {
+        fprintf(stderr, "Failed to fetch releases from GitHub.\n");
+        free(tempBuilds);
+        DeleteFileA(tempFile);
+        return -1;
+    }
+    
+    /* Read JSON file */
+    hFile = CreateFileA(tempFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Failed to read release data.\n");
+        free(tempBuilds);
+        DeleteFileA(tempFile);
+        return -1;
+    }
+    
+    jsonSize = GetFileSize(hFile, NULL);
+    if (jsonSize == 0 || jsonSize > 1024*1024) {
+        CloseHandle(hFile);
+        free(tempBuilds);
+        DeleteFileA(tempFile);
+        fprintf(stderr, "Invalid release data.\n");
+        return -1;
+    }
+    
+    jsonBuffer = (char*)malloc(jsonSize + 1);
+    if (!jsonBuffer) {
+        CloseHandle(hFile);
+        free(tempBuilds);
+        DeleteFileA(tempFile);
+        fprintf(stderr, "Out of memory.\n");
+        return -1;
+    }
+    
+    ReadFile(hFile, jsonBuffer, jsonSize, &bytesRead, NULL);
+    jsonBuffer[bytesRead] = '\0';
+    CloseHandle(hFile);
+    DeleteFileA(tempFile);
+    
+    /* Parse JSON - find assets array and extract relevant builds */
+    p = jsonBuffer;
+    
+    while (*p) {
+        /* Look for \"name\" field in an asset - handle both formats */
+        nameStart = strstr(p, "\"name\":");
+        if (!nameStart) break;
+        nameStart = strchr(nameStart, '\"');
+        if (!nameStart) break;
+        nameStart++; /* skip opening quote */
+        nameEnd = strstr(nameStart, "\"");
+        if (!nameEnd) break;
+        
+        /* Look for \"browser_download_url\" */
+        browserUrlStart = strstr(nameEnd, "\"browser_download_url\":");
+        if (!browserUrlStart) break;
+        browserUrlStart = strchr(browserUrlStart, '\"');
+        if (!browserUrlStart) break;
+        browserUrlStart++; /* skip opening quote */
+        browserUrlEnd = strstr(browserUrlStart, "\"");
+        if (!browserUrlEnd) break;
+        
+        /* Look for \"size\" */
+        sizeStart = strstr(browserUrlEnd, "\"size\":");
+        if (!sizeStart) break;
+        sizeStart += 7;
+        sizeEnd = strstr(sizeStart, ",");
+        if (!sizeEnd) sizeEnd = strstr(sizeStart, "}");
+        if (!sizeEnd) break;
+        
+        /* Extract and validate build name */
+        {
+            int nameLen = (int)(nameEnd - nameStart);
+            char buildName[256];
+            if (nameLen >= sizeof(buildName)) nameLen = sizeof(buildName) - 1;
+            memcpy(buildName, nameStart, nameLen);
+            buildName[nameLen] = '\0';
+            
+            /* DEBUG: Show what build name was extracted */
+            printf("DEBUG: Extracted build name: '%s'\n", buildName);
+            
+            /* Check if this build matches our OS */
+            if (strstr(buildName, osFilter) != NULL) {
+                printf("DEBUG: Build '%s' matches OS filter '%s'\n", buildName, osFilter);
+                /* Check if it's a binary archive (not source) */
+                BOOL isValid = (
+                    strstr(buildName, "bin-") != NULL ||
+                    strstr(buildName, "-bin") != NULL
+                ) && (
+                    strstr(buildName, ".zip") != NULL ||
+                    strstr(buildName, ".tar") != NULL ||
+                    strstr(buildName, ".tgz") != NULL
+                );
+                
+                if (isValid && buildIdx < 64) {
+                    /* Extract URL */
+                    int urlLen = (int)(browserUrlEnd - browserUrlStart);
+                    if (urlLen >= sizeof(tempBuilds[buildIdx].downloadUrl)) {
+                        urlLen = sizeof(tempBuilds[buildIdx].downloadUrl) - 1;
+                    }
+                    memcpy(tempBuilds[buildIdx].downloadUrl, browserUrlStart, urlLen);
+                    tempBuilds[buildIdx].downloadUrl[urlLen] = '\0';
+                    
+                    /* Extract name */
+                    lstrcpynA(tempBuilds[buildIdx].name, buildName, sizeof(tempBuilds[buildIdx].name));
+                    
+                    /* Extract size */
+                    {
+                        int sizeLen = (int)(sizeEnd - sizeStart);
+                        char sizeStr[32];
+                        if (sizeLen >= sizeof(sizeStr)) sizeLen = sizeof(sizeStr) - 1;
+                        memcpy(sizeStr, sizeStart, sizeLen);
+                        sizeStr[sizeLen] = '\0';
+                        tempBuilds[buildIdx].size = atoi(sizeStr) / (1024*1024);
+                    }
+                    
+                    /* Determine if CPU or Vulkan */
+                    tempBuilds[buildIdx].isVulkan = (
+                        strstr(buildName, "vulkan") != NULL ||
+                        strstr(buildName, "cuda") != NULL
+                    );
+                    tempBuilds[buildIdx].isCpu = !tempBuilds[buildIdx].isVulkan;
+                    tempBuilds[buildIdx].os = detectedOS;
+                    
+                    buildIdx++;
+                }
+            }
+        }
+        
+        p = browserUrlEnd + 1;
+    }
+    
+    free(jsonBuffer);
+    
+    if (buildIdx == 0) {
+        free(tempBuilds);
+        fprintf(stderr, "No builds found for %s.\n", GetOSName(detectedOS));
+        return -1;
+    }
+    
+    *builds = tempBuilds;
+    *count = buildIdx;
+    
+    return 0;
+}
+
+static void FreeLlamaCppBuilds(LlamaCppBuild *builds, int count)
+{
+    if (builds) free(builds);
+}
+
+static void PrintBuildMenu(int selectedIndex, const LlamaCppBuild *builds, int count)
+{
+    int i;
+    for (i = 0; i < count; i++) {
+        const char *type = builds[i].isVulkan ? "GPU" : "CPU";
+        const char *marker = (i == selectedIndex) ? ">" : " ";
+        
+        printf("%s [%-4s] %-50s  (%d MB)\n",
+            marker, type, builds[i].name, builds[i].size);
+    }
+}
+
+static int SelectBuildMenu(LlamaCppBuild *builds, int count)
+{
+    int selectedIndex = 0;
+    int previousIndex = 0;
+    int ch;
+    DWORD mode;
+    HANDLE hConsole;
+    
+    if (count <= 0) return -1;
+    
+    /* Get console handle */
+    hConsole = GetStdHandle(STD_INPUT_HANDLE);
+    if (hConsole == INVALID_HANDLE_VALUE) return -1;
+    
+    /* Save and modify console mode */
+    GetConsoleMode(hConsole, &mode);
+    SetConsoleMode(hConsole, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+    
+    printf("\n=== Select llama.cpp Build ===\n\n");
+    printf("\x1b[90mUse UP/DOWN arrow keys to navigate, ENTER to select, ESC to cancel\x1b[0m\n\n");
+    
+    PrintBuildMenu(selectedIndex, builds, count);
+    
+    /* Input loop */
+    while (1) {
+        ch = _getch();
+        if (ch == 224) {  /* Arrow key prefix */
+            ch = _getch();
+            if (ch == 72) {  /* Up arrow */
+                previousIndex = selectedIndex;
+                selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : count - 1;
+                printf("\r                \r");
+                PrintBuildMenu(selectedIndex, builds, count);
+            } else if (ch == 80) {  /* Down arrow */
+                previousIndex = selectedIndex;
+                selectedIndex = (selectedIndex < count - 1) ? selectedIndex + 1 : 0;
+                printf("\r                \r");
+                PrintBuildMenu(selectedIndex, builds, count);
+            }
+        } else if (ch == 13) {  /* Enter */
+            SetConsoleMode(hConsole, mode);
+            return selectedIndex;
+        } else if (ch == 27) {  /* Escape */
+            SetConsoleMode(hConsole, mode);
+            return -1;
+        }
+    }
+}
+
+static int DownloadBuild(const char *url, const char *destPath)
+{
+    char command[MAX_CMD];
+    
+    printf("Downloading: %s\n", destPath);
+    
+    snprintf(command, sizeof(command),
+        "powershell.exe -NoProfile -Command \"Invoke-WebRequest -Uri '%s' -OutFile '%s'\"",
+        url, destPath);
+    
+    return RunChildProcess(command);
+}
+
+static int ExtractZip(const char *zipPath, const char *destDir)
+{
+    char command[MAX_CMD];
+    
+    printf("Extracting to: %s\n", destDir);
+    
+    /* Ensure destination directory exists */
+    CreateDirectoryA(destDir, NULL);
+    
+    if (strstr(zipPath, ".zip") != NULL) {
+        snprintf(command, sizeof(command),
+            "powershell.exe -NoProfile -Command \"Expand-Archive -Path '%s' -DestinationPath '%s' -Force\"",
+            zipPath, destDir);
+    } else {
+        /* Handle tar.gz or tar.zst */
+        char destZip[MAX_PATH];
+        lstrcpynA(destZip, zipPath, sizeof(destZip));
+        snprintf(command, sizeof(command),
+            "powershell.exe -NoProfile -Command \"tar -xf '%s' -C '%s'\"",
+            zipPath, destDir);
+    }
+    
+    return RunChildProcess(command);
+}
+
+static BOOL VerifyLlamaCppInstall(const char *installPath)
+{
+    char exePath[MAX_PATH];
+    BOOL hasServer = FALSE;
+    BOOL hasCli = FALSE;
+    
+    /* Check for llama-server */
+    snprintf(exePath, sizeof(exePath), "%s\\llama-server.exe", installPath);
+    hasServer = FileExistsA_(exePath);
+    
+    /* Also check without .exe extension for Unix-like systems */
+    if (!hasServer) {
+        snprintf(exePath, sizeof(exePath), "%s/llama-server", installPath);
+        hasServer = FileExistsA_(exePath);
+    }
+    
+    /* Check for llama-cli */
+    snprintf(exePath, sizeof(exePath), "%s\\llama-cli.exe", installPath);
+    hasCli = FileExistsA_(exePath);
+    
+    if (!hasCli) {
+        snprintf(exePath, sizeof(exePath), "%s/llama-cli", installPath);
+        hasCli = FileExistsA_(exePath);
+    }
+    
+    if (!hasServer) {
+        fprintf(stderr, "llama-server not found at: %s\n", installPath);
+    }
+    if (!hasCli) {
+        fprintf(stderr, "llama-cli not found at: %s\n", installPath);
+    }
+    
+    return hasServer && hasCli;
+}
+
+static int SetupLlamaCpp(void)
+{
+    LlamaCppBuild *builds = NULL;
+    int buildCount = 0;
+    int selectedIdx = -1;
+    char installDir[MAX_PATH];
+    char zipPath[MAX_PATH];
+    char modelDir[MAX_PATH];
+    OSType os;
+    int result = 0;
+    
+    printf("\n================================================================\n");
+    printf("  llama.cpp Setup\n");
+    printf("================================================================\n\n");
+    
+    /* Detect OS */
+    os = DetectOS();
+    printf("Detected OS: %s\n\n", GetOSName(os));
+    
+    /* Fetch releases */
+    printf("Fetching latest releases from GitHub...\n");
+    
+    /* Debug: Show what OS filter we're using */
+    {
+        OSType detectedOS;
+        const char *osFilter;
+        detectedOS = DetectOS();
+        osFilter = GetOSFilterPattern(detectedOS);
+        printf("DEBUG: Detected OS: %s, Filter pattern: '%s'\n", GetOSName(detectedOS), osFilter);
+        printf("DEBUG: Looking for build names containing '%s'...\n", osFilter);
+        printf("DEBUG: Example Windows build: llama-b3088-bin-win-x64.zip\n");
+    }
+    
+    if (FetchLlamaCppReleases(&builds, &buildCount) != 0) {
+        fprintf(stderr, "Failed to fetch releases.\n");
+        return 1;
+    }
+    
+    if (buildCount == 0) {
+        fprintf(stderr, "No builds available for your OS.\n");
+        return 1;
+    }
+    
+    printf("Found %d build(s)\n\n", buildCount);
+    
+    /* Show interactive menu */
+    selectedIdx = SelectBuildMenu(builds, buildCount);
+    if (selectedIdx < 0) {
+        printf("\nSelection cancelled.\n");
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 0;
+    }
+    
+    printf("\nSelected: %s\n", builds[selectedIdx].name);
+    
+    /* Prepare install path */
+    if (!LoadConfigFromDisk()) {
+        /* Create default paths */
+        if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath))) {
+            fprintf(stderr, "Failed to build config path.\n");
+            FreeLlamaCppBuilds(builds, buildCount);
+            return 1;
+        }
+    }
+    
+    /* Build install directory path - use local directory */
+    GetCurrentDirectoryA(sizeof(installDir), installDir);
+    lstrcatA(installDir, "\\llama-cpp\\");
+    
+    /* Build model directory path */
+    lstrcpynA(modelDir, sFolder, sizeof(modelDir));
+    if (!modelDir[0]) {
+        GetCurrentDirectoryA(sizeof(modelDir), modelDir);
+        lstrcatA(modelDir, "\\models");
+    }
+    
+    /* Ensure install directory exists */
+    CreateDirectoryA(installDir, NULL);
+    
+    /* Download the build */
+    GetTempFileNameA(".", "valora_llama_", 0, zipPath);
+    lstrcatA(zipPath, ".zip");
+    
+    printf("\n================================================================\n");
+    printf("  Downloading...\n");
+    printf("================================================================\n\n");
+    
+    result = DownloadBuild(builds[selectedIdx].downloadUrl, zipPath);
+    if (result != 0) {
+        fprintf(stderr, "Download failed with exit code %d\n", result);
+        DeleteFileA(zipPath);
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Extract the build */
+    printf("\n================================================================\n");
+    printf("  Extracting...\n");
+    printf("================================================================\n\n");
+    
+    result = ExtractZip(zipPath, installDir);
+    DeleteFileA(zipPath);
+    
+    if (result != 0) {
+        fprintf(stderr, "Extraction failed with exit code %d\n", result);
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Verify installation */
+    printf("\n================================================================\n");
+    printf("  Verifying...\n");
+    printf("================================================================\n\n");
+    
+    if (!VerifyLlamaCppInstall(installDir)) {
+        fprintf(stderr, "Installation verification failed.\n");
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Save path to config */
+    lstrcpynA(sLlamaCppPath, installDir, sizeof(sLlamaCppPath));
+    
+    /* Check if we need to update config */
+    if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath))) {
+        fprintf(stderr, "Warning: Could not build config path. Path saved in memory only.\n");
+    } else {
+        WritePrivateProfileStringA("paths", "llama_cpp_path", sLlamaCppPath, sConfigPath);
+    }
+    
+    /* Update server path if not already set */
+    if (!sServer[0]) {
+        /* Try to find the executable */
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind;
+        char searchPath[MAX_PATH];
+        
+        snprintf(searchPath, sizeof(searchPath), "%s\\*llama-server.exe", installDir);
+        hFind = FindFirstFileA(searchPath, &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            FindClose(hFind);
+            snprintf(sServer, sizeof(sServer), "%s\\%s", installDir, findData.cFileName);
+            
+            /* Save to config */
+            if (sConfigPath[0]) {
+                WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
+            }
+        }
+    }
+    
+    FreeLlamaCppBuilds(builds, buildCount);
+    
+    printf("\n================================================================\n");
+    printf("  \x1b[32mSetup completed successfully!\x1b[0m\n");
+    printf("================================================================\n\n");
+    
+    printf("llama.cpp installed to: %s\n", sLlamaCppPath);
+    printf("You can now use 'valora run' or 'valora serve' with the configured server.\n\n");
+    
+    return 0;
+}
+
 static int PrintUsage(void)
 {
     printf("\x1b[36mValora CLI - Local AI Model Manager\x1b[0m\n\n");
     
     printf("\x1b[33mGeneral:\x1b[0m\n");
     printf("  valora setup           Open the GUI setup window\n");
+    printf("  valora setup --llama.cpp  Setup llama.cpp from GitHub releases\n");
     printf("  valora help           Show this help message\n");
     printf("  valora version        Show version information\n");
     
@@ -2949,6 +3510,10 @@ static int RunCli(int argc, char **argv)
     }
 
     if (lstrcmpiA(argv[1], "setup") == 0) {
+        if (argc > 2 && lstrcmpiA(argv[2], "--llama.cpp") == 0) {
+            AttachConsoleStreams();
+            return SetupLlamaCpp();
+        }
         HideStandaloneConsoleWindow();
         return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
     }
