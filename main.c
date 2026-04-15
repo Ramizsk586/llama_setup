@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <conio.h>
-#include <wininet.h>
 
 #define IDI_ICON1 101
 #define VALORA_APP_DIR "Valora"
@@ -132,6 +131,10 @@ static int DownloadFromHuggingFace(const char *hfUrl);
 
 /* Chat Mode */
 static int RunChatMode(void);
+static BOOL sDebugMode = FALSE;
+static BOOL sOllamaMode = FALSE;
+static char sOllamaUrl[256] = "http://127.0.0.1:11434";
+static char sSelectedOllamaModel[256] = "";
 
 /* ──────────────────────────────────────────────
    Safety Controller
@@ -276,31 +279,80 @@ static ULONGLONG GetTotalCommitLimitMB(void)
     return 0;
 }
 
+static const IID IID_IDXGIFactory = {0x7b7166ec,0x21c7,0x4ae1,{0x9c,0xa1,0x23,0x78,0x69,0x3a,0x1e,0x5f}};
+
+typedef struct IDXGIFactory IDXGIFactory;
+typedef struct IDXGIAdapter IDXGIAdapter;
+
+typedef struct DXGI_ADAPTER_DESC {
+    UINT VendorId;
+    UINT DeviceId;
+    UINT SubSysId;
+    UINT Revision;
+    UINT AdapterLuid;
+    SIZE_T DedicatedVideoMemory;
+    SIZE_T DedicatedSystemMemory;
+    SIZE_T SharedSystemMemory;
+    DWORD Flags;
+} DXGI_ADAPTER_DESC;
+
+typedef struct IDXGIAdapterVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IDXGIAdapter*, REFIID, void**);
+    ULONG (STDMETHODCALLTYPE *AddRef)(IDXGIAdapter*);
+    ULONG (STDMETHODCALLTYPE *Release)(IDXGIAdapter*);
+    HRESULT (STDMETHODCALLTYPE *GetParent)(IDXGIAdapter*, REFIID, void**);
+    HRESULT (STDMETHODCALLTYPE *GetDesc)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
+} IDXGIAdapterVtbl;
+
+struct IDXGIAdapter {
+    IDXGIAdapterVtbl *lpVtbl;
+};
+
+typedef struct IDXGIFactoryVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IDXGIFactory*, REFIID, void**);
+    ULONG (STDMETHODCALLTYPE *AddRef)(IDXGIFactory*);
+    ULONG (STDMETHODCALLTYPE *Release)(IDXGIFactory*);
+    HRESULT (STDMETHODCALLTYPE *EnumAdapters)(IDXGIFactory*, UINT, IDXGIAdapter**);
+} IDXGIFactoryVtbl;
+
+struct IDXGIFactory {
+    IDXGIFactoryVtbl *lpVtbl;
+};
+
 static ULONGLONG GetAvailableVRAMMB(void)
 {
-    ULONGLONG totalVRAM = 0;
-    DISPLAY_DEVICEA dd;
-    dd.cb = sizeof(dd);
-
-    for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++) {
-        if (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) {
-            DEVMODEA dm;
-            dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm))
-                totalVRAM = dm.dmPelsWidth * dm.dmPelsHeight * 4 / (1024 * 1024);
-            break;
+    ULONGLONG vramMB = 0;
+    
+    HMODULE dxgi = LoadLibraryA("dxgi.dll");
+    if (dxgi) {
+        typedef HRESULT(WINAPI *PFN_CREATE_DXGIFACTORY)(REFIID, void**);
+        PFN_CREATE_DXGIFACTORY pfnCreateDXGIFactory = (PFN_CREATE_DXGIFACTORY)GetProcAddress(dxgi, "CreateDXGIFactory");
+        if (pfnCreateDXGIFactory) {
+            IDXGIFactory *pFactory = NULL;
+            if (SUCCEEDED(pfnCreateDXGIFactory(&IID_IDXGIFactory, (void**)&pFactory))) {
+                IDXGIAdapter *pAdapter = NULL;
+                if (SUCCEEDED(pFactory->lpVtbl->EnumAdapters(pFactory, 0, &pAdapter))) {
+                    DXGI_ADAPTER_DESC desc;
+                    if (SUCCEEDED(pAdapter->lpVtbl->GetDesc(pAdapter, &desc))) {
+                        vramMB = desc.DedicatedVideoMemory / (1024 * 1024);
+                    }
+                    pAdapter->lpVtbl->Release(pAdapter);
+                }
+                pFactory->lpVtbl->Release(pFactory);
+            }
         }
+        FreeLibrary(dxgi);
     }
 
-    if (totalVRAM == 0) {
+    if (vramMB == 0) {
         ULONGLONG avail = GetAvailableRamMB();
-        if (avail > 4096) return 8192;
-        if (avail > 2048) return 4096;
-        if (avail > 1024) return 2048;
+        if (avail > 8192) return 8192;
+        if (avail > 4096) return 4096;
+        if (avail > 2048) return 2048;
         return 1024;
     }
 
-    return totalVRAM / 2;
+    return vramMB;
 }
 
 static int GetModelSizeMB(const char *modelName)
@@ -391,6 +443,13 @@ static void SetCtlFont(HWND hWnd, HFONT hFont)
     if (hWnd) SendMessageA(hWnd, WM_SETFONT, (WPARAM)hFont, FALSE);
 }
 
+static void EnableAnsiConsole(void) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(hOut, &mode);
+    SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
 static void AttachConsoleStreams(void)
 {
     FILE *dummy;
@@ -405,6 +464,7 @@ static void AttachConsoleStreams(void)
     freopen_s(&dummy, "CONIN$", "r", stdin);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    EnableAnsiConsole();
 }
 
 static void OpenOwnedConsole(const char *title)
@@ -852,7 +912,7 @@ static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuL
 /* Check if a model has saved configuration */
 static BOOL HasModelConfig(const char *modelName)
 {
-    char section[64];
+    char section[MAX_PATH + 8];
     char value[32];
 
     if (!modelName || !*modelName)
@@ -869,7 +929,7 @@ static BOOL HasModelConfig(const char *modelName)
 /* Get per-model configuration, fall back to defaults if not set */
 static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *gpu, int gpuLen, char *threads, int threadsLen)
 {
-    char section[64];
+    char section[MAX_PATH + 8];
 
     if (!modelName || !*modelName) {
         /* Use global defaults */
@@ -986,11 +1046,23 @@ static BOOL IsModelUsable(const char *modelName, int vramMB)
 }
 
 /* Print animation frame */
+static void ClearConsole(void) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    DWORD written, size;
+    COORD origin = {0, 0};
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
+    size = csbi.dwSize.X * csbi.dwSize.Y;
+    FillConsoleOutputCharacterA(hConsole, ' ', size, origin, &written);
+    FillConsoleOutputAttribute(hConsole, csbi.wAttributes, size, origin, &written);
+    SetConsoleCursorPosition(hConsole, origin);
+}
+
 static void PrintAnimation(const char *message)
 {
     printf("\r%s %s", animationFrames[animFrame], message);
     fflush(stdout);
-    animFrame = (animFrame + 1) % 10;
+    animFrame = (animFrame + 1) % 4;
 }
 
 static int GetSelectorPriority(const char *modelName, BOOL usable, int sizeMB)
@@ -1213,25 +1285,7 @@ static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int 
         snprintf(gpu, sizeof(gpu), "%d", customGpu);
 
     if (includeLocalIp) {
-        WSADATA wsd;
-        char localIp[32] = "";
-        if (WSAStartup(MAKEWORD(2, 2), &wsd) == 0) {
-            char hostname[256];
-            if (gethostname(hostname, sizeof(hostname)) == 0) {
-                struct hostent *he = gethostbyname(hostname);
-                if (he && he->h_addr_list[0]) {
-                    struct in_addr addr;
-                    memcpy(&addr, he->h_addr_list[0], sizeof(addr));
-                    lstrcpynA(localIp, inet_ntoa(addr), sizeof(localIp));
-                }
-            }
-            WSACleanup();
-        }
-        if (localIp[0]) {
-            snprintf(host, sizeof(host), "127.0.0.1,%s", localIp);
-        } else {
-            lstrcpynA(host, "127.0.0.1", sizeof(host));
-        }
+        lstrcpynA(host, "0.0.0.0", sizeof(host));
     } else {
         lstrcpynA(host, (nServerType == 1) ? "0.0.0.0" : "127.0.0.1", sizeof(host));
     }
@@ -2888,8 +2942,9 @@ static int RunCli(int argc, char **argv)
             char projector[MAX_PATH] = "";
             int ctxLen = atoi(ctxBuf);
             int gpuLayers = atoi(gpuBuf);
-            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
-            safety = CheckLoadSafety(sSelectedModel, projector, ctxLen, gpuLayers);
+            if (strcmp(GetModelTypeLabel(sSelectedModel), "Vision") == 0)
+                FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            safety = CheckLoadSafety(sSelectedModel, projector[0] ? projector : NULL, ctxLen, gpuLayers);
 
             if (safety == SAFETY_REFUSE) {
                 PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
@@ -2970,8 +3025,9 @@ static int RunCli(int argc, char **argv)
         {
             char projector[MAX_PATH] = "";
             int ctxLen = customCtx[0] ? atoi(customCtx) : 2048;
-            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
-            safety = CheckLoadSafety(sSelectedModel, projector, ctxLen, customGpu >= 0 ? customGpu : -1);
+            if (strcmp(GetModelTypeLabel(sSelectedModel), "Vision") == 0)
+                FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            safety = CheckLoadSafety(sSelectedModel, projector[0] ? projector : NULL, ctxLen, customGpu >= 0 ? customGpu : -1);
 
             if (safety == SAFETY_REFUSE) {
                 PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
@@ -3009,16 +3065,16 @@ static int RunCli(int argc, char **argv)
         return RunChildProcess(sCommand);
     }
 
-    if (lstrcmpiA(argv[1], "get") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Usage: valora get <huggingface_url>\n");
-            fprintf(stderr, "Example: valora get LiquidAI/LFM2.5-1.2B-Instruct-GGUF\n");
-            return 1;
-        }
-        return DownloadFromHuggingFace(argv[2]);
-    }
-
     if (lstrcmpiA(argv[1], "chat") == 0 || lstrcmpiA(argv[1], "cli") == 0) {
+        int argIdx = 2;
+        while (argc > argIdx) {
+            if (lstrcmpiA(argv[argIdx], "--debug") == 0) {
+                sDebugMode = TRUE;
+            } else if (lstrcmpiA(argv[argIdx], "--ollama") == 0) {
+                sOllamaMode = TRUE;
+            }
+            argIdx++;
+        }
         return RunChatMode();
     }
 
@@ -3051,6 +3107,272 @@ static BOOL sWebSearchEnabled = FALSE;
 static void ChatInit(void) {
     memset(&sChatHistory, 0, sizeof(sChatHistory));
     sChatHistory.max_tokens = 4096;
+}
+
+static char** sOllamaModels = NULL;
+static int sOllamaModelCount = 0;
+
+static char* HttpPost(const char *url, const char *json_data);
+static char* HttpGetUrl(const char *full_url);
+
+static void FreeOllamaModels(void) {
+    if (sOllamaModels) {
+        for (int i = 0; i < sOllamaModelCount; i++) {
+            if (sOllamaModels[i]) free(sOllamaModels[i]);
+        }
+        free(sOllamaModels);
+        sOllamaModels = NULL;
+    }
+    sOllamaModelCount = 0;
+}
+
+static int FetchOllamaModels(void) {
+    char url[512];
+    snprintf(url, sizeof(url), "%s/v1/models", sOllamaUrl);
+    
+    printf("\x1b[90mFetching models from: %s\x1b[0m\n", url);
+    
+    char *response = HttpGetUrl(url);
+    if (!response) {
+        printf("\x1b[31mFailed to connect to Ollama server\x1b[0m\n");
+        return -1;
+    }
+    
+    printf("\x1b[90m[DEBUG] Response: %.200s...\x1b[0m\n", response);
+    
+    FreeOllamaModels();
+    sOllamaModels = malloc(sizeof(char*) * 50);
+    if (!sOllamaModels) {
+        free(response);
+        return -1;
+    }
+    
+    const char *data_start = strstr(response, "\"data\":");
+    if (data_start) {
+        data_start += 7;
+        const char *p = data_start;
+        int in_array = 0;
+        int brace_depth = 0;
+        
+        while (*p) {
+            if (*p == '[' && !in_array) {
+                in_array = 1;
+            } else if (*p == '{' && in_array) {
+                brace_depth++;
+            } else if (*p == '}' && in_array) {
+                brace_depth--;
+                if (brace_depth == 0 && in_array) {
+                }
+            } else if (*p == ']' && in_array) {
+                break;
+            } else if (in_array && brace_depth >= 1 && strncmp(p, "\"id\":\"", 6) == 0) {
+                p += 6;
+                const char *end = strchr(p, '"');
+                if (end && end > p) {
+                    int len = (int)(end - p);
+                    if (len > 0 && len < 256) {
+                        sOllamaModels[sOllamaModelCount] = malloc(len + 1);
+                        if (sOllamaModels[sOllamaModelCount]) {
+                            strncpy(sOllamaModels[sOllamaModelCount], p, len);
+                            sOllamaModels[sOllamaModelCount][len] = '\0';
+                            sOllamaModelCount++;
+                        }
+                    }
+                }
+            }
+            p++;
+        }
+    }
+    
+    free(response);
+    return sOllamaModelCount;
+}
+
+static int SelectOllamaModel(char *selected, int selSize) {
+    int count = FetchOllamaModels();
+    if (count <= 0) {
+        printf("\x1b[31mFailed to fetch models from Ollama. Is Ollama running?\x1b[0m\n");
+        printf("\x1b[33mStart Ollama with: ollama serve\x1b[0m\n");
+        return -1;
+    }
+    
+    while (1) {
+        ClearConsole();
+        printf("\x1b[36m+===+-------------------------------------------+--------------------+\x1b[0m\n");
+        printf("\x1b[36m|\x1b[0m   \x1b[36m|\x1b[0m              SELECT A MODEL               \x1b[36m|\x1b[0m      Server       \x1b[36m|\x1b[0m\n");
+        printf("\x1b[36m+===+-------------------------------------------+--------------------+\x1b[0m\n\n");
+
+        printf("\x1b[90mServer:\x1b[0m %s\n\n", sOllamaUrl);
+
+        printf("\x1b[36m+===+-------------------------------------------+--------------------+\x1b[0m\n");
+        printf("\x1b[36m|\x1b[0m \x1b[33m#\x1b[0m \x1b[36m|\x1b[0m Model Name                                  \x1b[36m|\x1b[0m Status         \x1b[36m|\x1b[0m\n");
+        printf("\x1b[36m+===+-------------------------------------------+--------------------+\x1b[0m\n");
+        
+        for (int i = 0; i < count; i++) {
+            int name_len = strlen(sOllamaModels[i]);
+            printf("\x1b[36m|\x1b[0m \x1b[33m%2d\x1b[0m \x1b[36m|\x1b[0m %s", i + 1, sOllamaModels[i]);
+            int pad = 43 - name_len;
+            for (int j = 0; j < pad; j++) putchar(' ');
+            printf("\x1b[36m|\x1b[0m Ready          \x1b[36m|\x1b[0m\n");
+        }
+        printf("\x1b[36m+===+-------------------------------------------+--------------------+\x1b[0m\n\n");
+        printf("\x1b[90mEnter number (1-%d) or 0 to cancel: \x1b[0m", count);
+        
+        char input[32];
+        if (!fgets(input, sizeof(input), stdin)) {
+            return -1;
+        }
+        input[strcspn(input, "\n")] = '\0';
+        
+        int choice = atoi(input);
+        if (choice >= 1 && choice <= count) {
+            strncpy(selected, sOllamaModels[choice - 1], selSize - 1);
+            selected[selSize - 1] = '\0';
+            return 0;
+        }
+        if (choice == 0) {
+            return -1;
+        }
+        printf("\x1b[31mInvalid choice. Press Enter to try again...\x1b[0m");
+        getchar();
+    }
+}
+
+static char* BuildOllamaPayload(const char *user_message) {
+    static char payload[32768];
+    int offset;
+    int i;
+    
+    offset = snprintf(payload, sizeof(payload),
+        "{\"model\":\"%s\",\"stream\":false,\"messages\":[", sSelectedOllamaModel);
+    
+    for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
+        if (i > 0) {
+            offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
+        }
+        
+        char escaped[8192] = "";
+        const char *src = sChatHistory.messages[i].content;
+        char *dst = escaped;
+        while (*src && dst < escaped + sizeof(escaped) - 4) {
+            if (*src == '"' || *src == '\\') {
+                *dst++ = '\\';
+            } else if (*src == '\n') {
+                *dst++ = '\\';
+                *dst++ = 'n';
+                src++;
+                continue;
+            } else if (*src == '\r') {
+                src++;
+                continue;
+            }
+            *dst++ = *src++;
+        }
+        
+        offset += snprintf(payload + offset, sizeof(payload) - offset,
+            "{\"role\":\"%s\",\"content\":\"%s\"}",
+            sChatHistory.messages[i].role, escaped);
+    }
+    
+    if (user_message) {
+        char escaped[8192] = "";
+        const char *src = user_message;
+        char *dst = escaped;
+        while (*src && dst < escaped + sizeof(escaped) - 4) {
+            if (*src == '"' || *src == '\\') {
+                *dst++ = '\\';
+            } else if (*src == '\n') {
+                *dst++ = '\\';
+                *dst++ = 'n';
+                src++;
+                continue;
+            } else if (*src == '\r') {
+                src++;
+                continue;
+            }
+            *dst++ = *src++;
+        }
+        offset += snprintf(payload + offset, sizeof(payload) - offset,
+            "],\"content\":\"%s\"}", escaped);
+    } else {
+        offset += snprintf(payload + offset, sizeof(payload) - offset, "]}");
+    }
+    
+    return payload;
+}
+
+static char* ParseOllamaResponse(const char *json_response) {
+    static char result[8192];
+    const char *content_start;
+    const char *content_end;
+    
+    if (!json_response) return NULL;
+    if (strstr(json_response, "\"error\"")) return NULL;
+    
+    content_start = strstr(json_response, "\"content\":\"");
+    if (!content_start) return NULL;
+    
+    content_start += 11;
+    content_end = content_start;
+    while (*content_end) {
+        if (*content_end == '\\' && *(content_end+1) == '"') {
+            content_end += 2;
+        } else if (*content_end == '"') {
+            break;
+        } else {
+            content_end++;
+        }
+    }
+    
+    if (!content_end || content_end <= content_start) return NULL;
+    
+    int len = (int)(content_end - content_start);
+    if (len >= sizeof(result)) len = sizeof(result) - 1;
+    
+    strncpy(result, content_start, len);
+    result[len] = '\0';
+    
+    char *dst = result;
+    const char *src = result;
+    while (*src) {
+        if (*src == '\\' && *(src + 1)) {
+            if (*(src + 1) == 'n') {
+                *dst++ = '\n';
+                src += 2;
+            } else if (*(src + 1) == 't') {
+                *dst++ = '\t';
+                src += 2;
+            } else if (*(src + 1) == 'r') {
+                *dst++ = '\r';
+                src += 2;
+            } else if (*(src + 1) == '\\') {
+                *dst++ = '\\';
+                src += 2;
+            } else if (*(src + 1) == '"') {
+                *dst++ = '"';
+                src += 2;
+            } else {
+                *dst++ = *src++;
+            }
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    
+    return result;
+}
+
+static void PrintWebSearchReport(const char *query, int resultCount) {
+    printf("\n");
+    printf("\x1b[36m\x1b[1m+========================================+\x1b[0m\n");
+    printf("\x1b[36m\x1b[1m|\x1b[0m        \x1b[1mWEB SEARCH REPORT\x1b[0m             \x1b[36m\x1b[1m|\x1b[0m\n");
+    printf("\x1b[36m\x1b[1m+========================================+\x1b[0m\n");
+    printf("\n");
+    
+    printf("\x1b[33m[*]\x1b[0m Query: \x1b[37m%s\x1b[0m\n", query);
+    printf("\x1b[32m[+]\x1b[0m Found: \x1b[37m%d result(s)\x1b[0m\n", resultCount);
+    printf("\x1b[90m+========================================+\x1b[0m\n\n");
 }
 
 static void ChatAddMessage(const char *role, const char *content) {
@@ -3153,6 +3475,13 @@ static char* HttpPost(const char *url, const char *json_data) {
     if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hSession); return NULL; }
     
     {
+        DWORD timeout = 30000;
+        InternetSetOption(hRequest, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOption(hRequest, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOption(hRequest, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    }
+    
+    {
         bResults = HttpSendRequest(hRequest, "Content-Type: application/json", 
             (DWORD)strlen("Content-Type: application/json"), (LPVOID)json_data, (DWORD)strlen(json_data));
     }
@@ -3176,26 +3505,97 @@ static char* HttpPost(const char *url, const char *json_data) {
     return result;
 }
 
+static BOOL sToolsEnabled = FALSE;
+static BOOL sToolsForcedDisabled = FALSE;
+
+static BOOL ShouldUseTools(void) {
+    /* Disable tools for small models that don't support function calling */
+    /* Models below 1B parameters typically can't handle tool calls */
+    if (sToolsForcedDisabled) return FALSE;
+    return sToolsEnabled;
+}
+
+static const char* GetToolsDefinition(void) {
+    if (!ShouldUseTools()) return "";
+    
+    static const char *tools = 
+        "["
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"wikipedia\","
+        "\"description\": \"Get a summary from Wikipedia for a given topic. Use when you need factual information about people, places, events, or topics.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"topic\": {"
+        "\"type\": \"string\","
+        "\"description\": \"The Wikipedia article topic to look up (e.g., 'World_War_II', 'Artificial_intelligence')\""
+        "},"
+        "\"required\": [\"topic\"]"
+        "}"
+        "}"
+        "}"
+        "}"
+        "]";
+    return tools;
+}
+
 static char* BuildChatPayload(const char *user_message) {
-    static char payload[16384];
+    static char payload[24576];
     int offset;
     int i;
     
     offset = snprintf(payload, sizeof(payload),
         "{\"model\":\"auto\",\"messages\":["
-        "{\"role\":\"system\",\"content\":\"%s\"},",
+        "{\"role\":\"system\",\"content\":\"%s. Available tools: wikipedia(topic) - lookup Wikipedia articles.\"},",
         GetSystemPrompt());
     
     for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
         if (i > 0)
             offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
+        
+        char escaped[8192] = "";
+        const char *src = sChatHistory.messages[i].content;
+        char *dst = escaped;
+        while (*src && dst < escaped + sizeof(escaped) - 4) {
+            if (*src == '"' || *src == '\\') {
+                *dst++ = '\\';
+            } else if (*src == '\n') {
+                *dst++ = '\\';
+                *dst++ = 'n';
+                src++;
+                continue;
+            } else if (*src == '\r') {
+                *dst++ = '\\';
+                *dst++ = 'r';
+                src++;
+                continue;
+            } else if (*src == '\t') {
+                *dst++ = '\\';
+                *dst++ = 't';
+                src++;
+                continue;
+            }
+            *dst++ = *src++;
+        }
+        
         offset += snprintf(payload + offset, sizeof(payload) - offset,
             "{\"role\":\"%s\",\"content\":\"%s\"}",
             sChatHistory.messages[i].role,
-            sChatHistory.messages[i].content);
+            escaped);
     }
     
     if (user_message) {
+        const char *tools = GetToolsDefinition();
+        if (tools && tools[0]) {
+            offset += snprintf(payload + offset, sizeof(payload) - offset,
+                "],\"tools\":%s,\"max_tokens\":%d}", tools, sChatHistory.max_tokens);
+        } else {
+            offset += snprintf(payload + offset, sizeof(payload) - offset,
+                "],\"max_tokens\":%d}", sChatHistory.max_tokens);
+        }
+    } else {
         offset += snprintf(payload + offset, sizeof(payload) - offset,
             "],\"max_tokens\":%d}", sChatHistory.max_tokens);
     }
@@ -3211,10 +3611,36 @@ static char* ParseChatResponse(const char *json_response) {
     if (!json_response)
         return NULL;
     
-    if (strstr(json_response, "\"error\""))
+    if (strstr(json_response, "\"error\"")) {
+        const char *err = strstr(json_response, "\"error\"");
+        if (err) {
+            char *colon = strchr(err, ':');
+            if (colon) {
+                char *start = colon + 1;
+                while (*start == ' ' || *start == '"') start++;
+                char *end = strchr(start, '}');
+                if (!end) end = strchr(start, '"');
+                if (end && end > start) {
+                    len = (int)(end - start);
+                    if (len > 0 && len < sizeof(result)) {
+                        strncpy(result, start, len);
+                        result[len] = '\0';
+                        fprintf(stderr, "\x1b[31mServer error: %s\x1b[0m\n", result);
+                        return NULL;
+                    }
+                }
+            }
+        }
         return NULL;
+    }
     
-    content_start = strstr(json_response, "\"content\"");
+    const char *msg_start = strstr(json_response, "\"message\":");
+    if (msg_start) {
+        content_start = strstr(msg_start, "\"content\"");
+    } else {
+        content_start = strstr(json_response, "\"content\"");
+    }
+    
     if (!content_start) {
         content_start = strstr(json_response, "\"text\"");
     }
@@ -3268,20 +3694,119 @@ static char* ParseChatResponse(const char *json_response) {
     return result;
 }
 
+static BOOL HasToolCall(const char *json_response) {
+    if (!json_response) return FALSE;
+    return (strstr(json_response, "\"tool_calls\":") != NULL || 
+            strstr(json_response, "wikipedia") != NULL);
+}
+
+static char* ExtractToolCall(const char *json_response) {
+    static char tool_call[4096];
+    const char *start, *end;
+    
+    tool_call[0] = '\0';
+    if (!json_response) return tool_call;
+    
+    start = strstr(json_response, "\"name\":\"");
+    if (!start) start = strstr(json_response, "\"name\": \"");
+    if (!start) return tool_call;
+    
+    start += 8;
+    end = strstr(start, "\"");
+    if (!end || end - start >= (int)sizeof(tool_call)) return tool_call;
+    
+    strncpy(tool_call, start, end - start);
+    tool_call[end - start] = '\0';
+    
+    return tool_call;
+}
+
+static char* ExtractToolArgs(const char *json_response) {
+    static char args[4096];
+    const char *start, *end;
+    
+    args[0] = '\0';
+    if (!json_response) return args;
+    
+    start = strstr(json_response, "\"arguments\":\"");
+    if (!start) start = strstr(json_response, "\"arguments\": \"");
+    if (!start) {
+        start = strstr(json_response, "{\"topic\":\"");
+        if (!start) return args;
+    } else {
+        start += 14;
+    }
+    
+    end = strstr(start, "\"");
+    if (!end) return args;
+    
+    int len = (int)(end - start);
+    if (len >= (int)sizeof(args)) len = sizeof(args) - 1;
+    
+    strncpy(args, start, len);
+    args[len] = '\0';
+    
+    return args;
+}
+
+static char* DoWikiSearch(const char *searchQuery);
+
+static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *result, int resultLen) {
+    if (!tool_name || !result || resultLen <= 0) return FALSE;
+    
+    result[0] = '\0';
+    
+    if (strcmp(tool_name, "wikipedia") == 0) {
+        char topic[512] = "";
+        const char *topic_start = strstr(tool_args, "\"topic\":\"");
+        if (!topic_start) topic_start = strstr(tool_args, "topic:");
+        if (topic_start) {
+            if (strstr(tool_args, "\"topic\":\"")) {
+                topic_start += 9;
+            } else {
+                topic_start += 7;
+            }
+            const char *topic_end = strstr(topic_start, "\"");
+            if (!topic_end) topic_end = topic_start + strlen(topic_start);
+            int len = (int)(topic_end - topic_start);
+            if (len > 500) len = 500;
+            strncpy(topic, topic_start, len);
+            topic[len] = '\0';
+        }
+        
+        if (topic[0]) {
+            char *wiki_result = DoWikiSearch(topic);
+            if (wiki_result && wiki_result[0]) {
+                strncpy(result, wiki_result, resultLen - 1);
+                result[resultLen - 1] = '\0';
+                return TRUE;
+            }
+        }
+    }
+    
+    return FALSE;
+}
+
 static void PrintWrapped(const char *text, int width) {
-    int len = (int)strlen(text);
-    int delay = (len < 50) ? 30 : (len < 200) ? 15 : 3;
-    int col = 0;
-    while (*text) {
-        if (*text == '\n') { putchar('\n'); col = 0; text++; continue; }
-        if (col >= width) { putchar('\n'); col = 0; }
-        putchar(*text);
-        if (delay > 3) { fflush(stdout); Sleep(delay); }
-        col++;
-        text++;
+    if (!text || !*text) return;
+    
+    const char *p = text;
+    while (*p) {
+        if (*p == '\\' && *(p+1) == 'n') {
+            putchar('\n');
+            p += 2;
+            if (*p == '\n') putchar('\n');
+            continue;
+        }
+        if (*p == '\n') {
+            putchar('\n');
+            p++;
+            continue;
+        }
+        putchar(*p);
+        p++;
     }
     fflush(stdout);
-    if (col > 0) putchar('\n');
 }
 
 static void EnsureServerRunning(void) {
@@ -3321,53 +3846,174 @@ static void StopChatServer(void) {
         CloseHandle(sChatServerProcess);
         sChatServerProcess = NULL;
     }
+    if (sChatServerProcessId)
+        KillProcessTree(sChatServerProcessId);
     sChatServerProcessId = 0;
-    system("taskkill /F /IM llama-server.exe 2>nul");
 }
 
 static char* HttpGet(const char *query);
 
-static void DoWebSearch(void) {
-    char searchQuery[512] = {0};
-    char apiKey[256] = {0};
-    int choice;
+static DWORD WINAPI SearchAnimationThread(LPVOID param) {
+    int *running = (int*)param;
+    const char *frames = "|/-\\";
+    int frame = 0;
+    while (*running) {
+        printf("\r\x1b[36m[%c]\x1b[0m \x1b[33mSearching...\x1b[0m ", frames[frame % 4]);
+        fflush(stdout);
+        Sleep(100);
+        frame++;
+    }
+    printf("\r                                    \r");
+    fflush(stdout);
+    return 0;
+}
+
+static char* DoWikiSearch(const char *searchQuery) {
+    char *result = NULL;
+    char url[2048];
     
-    printf("\n\x1b[36m=== Web Search ===\x1b[0m\n");
-    printf("1. DuckDuckGo (free)\n");
-    printf("2. SerpAPI (requires key)\n");
-    printf("0. Cancel\n");
-    printf("Choice: ");
-    choice = getchar();
-    while (getchar() != '\n');
+    if (!searchQuery || !*searchQuery) return NULL;
     
-    if (choice == '0') return;
-    if (choice == '2') {
-        printf("SerpAPI key (Enter for saved): ");
-        if (fgets(apiKey, sizeof(apiKey), stdin)) {
-            apiKey[strcspn(apiKey, "\n")] = 0;
-            if (apiKey[0]) WritePrivateProfileStringA("search", "serp_api_key", apiKey, sConfigPath);
-            else GetPrivateProfileStringA("search", "serp_api_key", "", apiKey, sizeof(apiKey), sConfigPath);
+    int running = 1;
+    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &running, 0, NULL);
+    
+    printf("\x1b[90mWiki: \x1b[33m%s\x1b[0m\n", searchQuery);
+    fflush(stdout);
+    
+    snprintf(url, sizeof(url), "https://en.wikipedia.org/api/rest_v1/page/summary/%s", searchQuery);
+    result = HttpGet(url);
+    
+    running = 0;
+    if (hThread) {
+        Sleep(200);
+        CloseHandle(hThread);
+    }
+    
+    if (result) {
+        static char formatted[8192] = "";
+        char *desc_start, *desc_end;
+        
+        formatted[0] = '\0';
+        
+        char *extract = strstr(result, "\"extract\":\"");
+        if (extract) {
+            extract += 11;
+            desc_end = strstr(extract, "\"");
+            if (desc_end && desc_end > extract) {
+                int len = (int)(desc_end - extract);
+                if (len > 4000) len = 4000;
+                strncpy(formatted, extract, len);
+                formatted[len] = '\0';
+                
+                char *p = formatted, *q = formatted;
+                while (*p) {
+                    if (*p == '\\' && *(p+1) == 'n') { *q++ = ' '; p += 2; }
+                    else if (*p == '\\' && *(p+1) == 't') { *q++ = '\t'; p += 2; }
+                    else if (*p == '\\' && *(p+1) == 'r') { p += 2; }
+                    else if (*p == '"') { p++; }
+                    else *q++ = *p++;
+                }
+                *q = '\0';
+            }
         }
-        if (!apiKey[0]) { printf("\x1b[31mNo API key\x1b[0m\n"); return; }
+        
+        if (!formatted[0]) {
+            char *title = strstr(result, "\"title\":\"");
+            if (title) {
+                title += 9;
+                char *title_end = strstr(title, "\"");
+                if (title_end && title_end > title) {
+                    int len = (int)(title_end - title);
+                    if (len > 200) len = 200;
+                    strncpy(formatted, "No summary available for: ", 26);
+                    strncat(formatted, title, len);
+                }
+            }
+        }
+        
+        free(result);
+        return formatted[0] ? formatted : NULL;
     }
     
-    printf("Search query: ");
-    if (fgets(searchQuery, sizeof(searchQuery), stdin)) {
-        searchQuery[strcspn(searchQuery, "\n")] = 0;
-    }
-    if (!searchQuery[0]) return;
+    return NULL;
+}
+
+static char* DoWebSearch(const char *searchQuery) {
+    char *result = NULL;
     
-    printf("\x1b[90mSearching...\x1b[0m\n");
+    if (!searchQuery || !*searchQuery) return NULL;
     
-    if (choice == '1') {
-        char *result = HttpGet(searchQuery);
-        if (result) { printf("\x1b[36m=== Results ===\x1b[0m\n%s\n", result); free(result); }
-        else printf("\x1b[31mSearch failed\x1b[0m\n");
-    } else if (choice == '2') {
-        char *result = HttpGet(searchQuery);
-        if (result) { printf("\x1b[36m=== Results ===\x1b[0m\n%s\n", result); free(result); }
-        else printf("\x1b[31mSearch failed\x1b[0m\n");
+    int running = 1;
+    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &running, 0, NULL);
+    
+    printf("\x1b[90mQuery: \x1b[33m%s\x1b[0m\n", searchQuery);
+    fflush(stdout);
+    
+    result = HttpGet(searchQuery);
+    
+    running = 0;
+    if (hThread) {
+        Sleep(200);
+        CloseHandle(hThread);
     }
+    
+    if (result) {
+        static char formatted[16384] = "";
+        char *titleStart, *titleEnd;
+        char *snippetStart, *snippetEnd;
+        int count = 0;
+        
+        formatted[0] = '\0';
+        
+        char *p = result;
+        char *jsonStart = strstr(p, "\"results\":[");
+        if (!jsonStart) jsonStart = p;
+        
+        while (count < 3) {
+            titleStart = strstr(jsonStart, "\"title\":\"");
+            if (!titleStart) break;
+            titleStart += 9;
+            titleEnd = strstr(titleStart, "\"");
+            if (!titleEnd) break;
+            
+            snippetStart = strstr(titleEnd, "\"snippet\":\"");
+            if (snippetStart) {
+                snippetStart += 11;
+                snippetEnd = strstr(snippetStart, "\"");
+            }
+            
+            char entry[512] = "";
+            
+            if (titleEnd > titleStart) {
+                int titleLen = (int)(titleEnd - titleStart);
+                if (titleLen > 80) titleLen = 80;
+                strncat(entry, titleStart, titleLen);
+            }
+            
+            if (snippetStart && snippetEnd && snippetEnd > snippetStart) {
+                int snippetLen = (int)(snippetEnd - snippetStart);
+                if (snippetLen > 200) snippetLen = 200;
+                strcat(entry, " - ");
+                strncat(entry, snippetStart, snippetLen);
+            }
+            
+            if (count > 0) strcat(formatted, "|||");
+            strcat(formatted, entry);
+            
+            count++;
+            jsonStart = titleEnd;
+        }
+        
+        if (count == 0) {
+            strncpy(formatted, result, sizeof(formatted) - 1);
+            formatted[sizeof(formatted) - 1] = '\0';
+        }
+        
+        free(result);
+        return formatted;
+    }
+    
+    return NULL;
 }
 
 static char* HttpGet(const char *query) {
@@ -3398,14 +4044,96 @@ static char* HttpGet(const char *query) {
     
     bResults = HttpSendRequest(hRequest, NULL, 0, NULL, 0);
     if (bResults) {
-        char buffer[8192];
-        while (InternetReadFile(hRequest, buffer, sizeof(buffer)-1, &bytesRead) && bytesRead > 0) {
-            buffer[bytesRead] = 0;
+        char buffer[16384];
+        while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
             size_t len = result ? strlen(result) : 0;
             char *newresult = realloc(result, len + bytesRead + 1);
             if (newresult) {
                 result = newresult;
                 memcpy(result + len, buffer, bytesRead + 1);
+            } else {
+                free(result);
+                result = NULL;
+                break;
+            }
+        }
+    }
+    
+    if (hRequest) InternetCloseHandle(hRequest);
+    if (hConnect) InternetCloseHandle(hConnect);
+    if (hSession) InternetCloseHandle(hSession);
+    
+    return result;
+}
+
+static char* HttpGetUrl(const char *full_url) {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    char *result = NULL;
+    char host[256] = {0}, path[1024] = {0};
+    const char *p;
+    BOOL bResults;
+    DWORD bytesRead;
+    int use_ssl = 0;
+    int port = 80;
+    
+    if (!full_url || !*full_url) return NULL;
+    
+    if (strncmp(full_url, "https://", 8) == 0) {
+        use_ssl = 1;
+        port = 443;
+        p = full_url + 8;
+    } else if (strncmp(full_url, "http://", 7) == 0) {
+        p = full_url + 7;
+    } else {
+        return NULL;
+    }
+    
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    
+    if (colon && (!slash || colon < slash)) {
+        strncpy(host, p, colon - p);
+        host[colon - p] = '\0';
+        port = atoi(colon + 1);
+        if (slash) {
+            strncpy(path, slash, sizeof(path) - 1);
+        } else {
+            strcpy(path, "/");
+        }
+    } else if (slash) {
+        strncpy(host, p, slash - p);
+        host[slash - p] = '\0';
+        strncpy(path, slash, sizeof(path) - 1);
+    } else {
+        strncpy(host, p, sizeof(host) - 1);
+        strcpy(path, "/");
+    }
+    
+    hSession = InternetOpen("Valora/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hSession) return NULL;
+    
+    hConnect = InternetConnect(hSession, host, port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) { InternetCloseHandle(hSession); return NULL; }
+    
+    hRequest = HttpOpenRequest(hConnect, "GET", path, NULL, NULL, NULL, 
+        use_ssl ? INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_IGNORE_CERT_CN_INVALID : 0, 0);
+    if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hSession); return NULL; }
+    
+    bResults = HttpSendRequest(hRequest, NULL, 0, NULL, 0);
+    if (bResults) {
+        char buffer[16384];
+        while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            size_t len = result ? strlen(result) : 0;
+            char *newresult = realloc(result, len + bytesRead + 1);
+            if (newresult) {
+                result = newresult;
+                memcpy(result + len, buffer, bytesRead + 1);
+            } else {
+                free(result);
+                result = NULL;
+                break;
             }
         }
     }
@@ -3448,8 +4176,7 @@ static BOOL IsServerRunning(void) {
     return running;
 }
 
-static int StartServerForChat(void) {
-    char cliPath[MAX_PATH];
+static int StartServerForChat(const char *customCtx) {
     char modelPath[MAX_PATH * 2];
     char projectorPath[MAX_PATH * 2];
     char ctx[32], gpu[32], threads[32];
@@ -3514,20 +4241,25 @@ static int StartServerForChat(void) {
         printf("\n\x1b[33m[SAFETY WARNING] %s - proceeding with caution\x1b[0m\n\n", sLastSafetyReason);
     }
     
-    lstrcpynA(cliPath, sServer, sizeof(cliPath));
-    {
-        char *lastSlash = strrchr(cliPath, '\\');
-        if (lastSlash) lstrcpynA(lastSlash + 1, "llama-server.exe", sizeof(cliPath) - (int)(lastSlash - cliPath) - 1);
-        else lstrcpynA(cliPath, "llama-server.exe", sizeof(cliPath));
-    }
     BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
     GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads));
     
-    availRAM = GetAvailableRamMB();
+    if (customCtx && customCtx[0])
+        lstrcpynA(ctx, customCtx, sizeof(ctx));
+    
+        availRAM = GetAvailableRamMB();
     totalRAM = GetSystemRamMB();
     modelMB = GetModelSizeMB(sSelectedModel);
+
+    /* Auto-disable tools for small models (< 500MB ~= 350M-500M params) that don't support function calling */
+    if (modelMB > 0 && modelMB < 500) {
+        sToolsForcedDisabled = TRUE;
+        printf("\n\x1b[90m[Auto-disabled tools for small model]\x1b[0m\n\n");
+    } else {
+        sToolsForcedDisabled = FALSE;
+    }
     
-    system("cls");
+    ClearConsole();
     
     printf("\x1b[36m========================================\x1b[0m\n");
     printf("\x1b[36m       VALORA SERVER STARTING\x1b[0m\n");
@@ -3542,11 +4274,11 @@ static int StartServerForChat(void) {
     if (projectorPath[0]) {
         snprintf(command, sizeof(command),
             "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1",
-            cliPath, modelPath, projectorPath, ctx, gpu, threads);
+            sServer, modelPath, projectorPath, ctx, gpu, threads);
     } else {
         snprintf(command, sizeof(command),
             "\"%s\" -m \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1",
-            cliPath, modelPath, ctx, gpu, threads);
+            sServer, modelPath, ctx, gpu, threads);
     }
     
     ZeroMemory(&si, sizeof(si));
@@ -3567,9 +4299,30 @@ static int StartServerForChat(void) {
     sChatServerProcessId = pi.dwProcessId;
     CloseHandle(pi.hThread);
     
-    Sleep(3000);
-    
-    return 0;
+    printf("\x1b[90mWaiting for server");
+    fflush(stdout);
+    for (int i = 0; i < 30; i++) {
+        Sleep(1000);
+        DWORD exitCode;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+            printf("\n\x1b[31mServer process exited early (code %lu). Check model and path.\x1b[0m\n", exitCode);
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hProcess);
+            sChatServerProcess = NULL;
+            return -1;
+        }
+        if (IsServerRunning()) {
+            printf("\x1b[90m OK\x1b[0m\n\n");
+            return 0;
+        }
+        printf("\x1b[90m.\x1b[0m");
+        fflush(stdout);
+    }
+    printf("\n\x1b[31mServer did not become ready in 30s.\x1b[0m\n");
+    TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    sChatServerProcess = NULL;
+    return -1;
 }
 
 static int RunChatMode(void) {
@@ -3582,27 +4335,48 @@ static int RunChatMode(void) {
     
     ChatInit();
     
-    if (IsServerRunning()) {
-        system("cls");
+    if (sOllamaMode) {
+        ClearConsole();
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
+        
+        if (SelectOllamaModel(sSelectedOllamaModel, sizeof(sSelectedOllamaModel)) != 0) {
+            printf("\x1b[90mModel selection cancelled.\x1b[0m\n");
+            return 1;
+        }
+        
+        ClearConsole();
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
+        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
+        printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedOllamaModel);
+        printf("\x1b[32mServer:\x1b[0m %s\n\n", sOllamaUrl);
+        
+        snprintf(url, sizeof(url), "%s/api/chat", sOllamaUrl);
+    } else if (IsServerRunning()) {
+        ClearConsole();
         printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
         printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
         printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
         printf("\x1b[90mUsing existing server.\x1b[0m\n\n");
+        snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     } else {
-        if (StartServerForChat() != 0) {
+        if (StartServerForChat(NULL) != 0) {
             return 1;
         }
         sServerStartedByUs = TRUE;
         SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-        system("cls");
+        ClearConsole();
         printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
         printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
         printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
         printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
         printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
+        snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     }
-    
-    snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     
     printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen | '\x1b[33m/\x1b[90m' for commands\n\n");
     
@@ -3615,31 +4389,23 @@ static int RunChatMode(void) {
         
 input[strcspn(input, "\n")] = '\0';
         
+        char *p = input;
+        while (*p == ' ') p++;
+        if (p != input) memmove(input, p, strlen(p) + 1);
+        
         if (input[0] == '/' && input[1] == '\0') {
             printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
-            printf("  /exit        Exit and stop server\n");
-            printf("  /clear       Clear chat history\n");
-            printf("  /cls         Clear terminal\n");
-            printf("  /model       Change model\n");
-            printf("  /restart     Restart llama server\n");
-            printf("  /websearch   Search web (DuckDuckGo/SerpAPI)\n");
-            printf("  /search      Same as /websearch\n");
-            printf("  /help        Show help\n\n");
-            printf("\x1b[32mYou \x1b[0m> ");
-            if (!fgets(input, sizeof(input), stdin)) { exitCode = 0; break; }
-            input[strcspn(input, "\n")] = '\0';
-        }
-        
-        if (input[0] == '/' && input[1] != '\0') {
-            printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
-            printf("  /exit        Exit and stop server\n");
-            printf("  /clear       Clear chat history\n");
-            printf("  /cls         Clear terminal\n");
-            printf("  /model       Change model\n");
-            printf("  /restart     Restart llama server\n");
-            printf("  /websearch   Search web (DuckDuckGo/SerpAPI)\n");
-            printf("  /search      Same as /websearch\n");
-            printf("  /help        Show help\n\n");
+            printf("  /exit              Exit and stop server\n");
+            printf("  /clear             Clear chat history\n");
+            printf("  /cls               Clear terminal\n");
+            printf("  /model             Change model\n");
+            printf("  /restart           Restart llama server\n");
+            printf("  /restart --context N  Restart with context N\n");
+            printf("  /websearch <query> Search web (optional query)\n");
+            printf("  /search <query>    Same as /websearch\n");
+            printf("  /web <query>       Same as /websearch\n");
+            printf("  /wiki <topic>      Get Wikipedia summary\n");
+            printf("  /help              Show help\n\n");
             printf("\x1b[32mYou \x1b[0m> ");
             if (!fgets(input, sizeof(input), stdin)) { exitCode = 0; break; }
             input[strcspn(input, "\n")] = '\0';
@@ -3651,12 +4417,20 @@ input[strcspn(input, "\n")] = '\0';
         }
         
         if (strcmp(input, "/cls") == 0) {
-            system("cls");
+            ClearConsole();
             printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
             printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
+            if (sOllamaMode) {
+                printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
+            }
             printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
-            printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
-            printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
+            if (sOllamaMode) {
+                printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedOllamaModel);
+                printf("\x1b[32mServer:\x1b[0m %s\n\n", sOllamaUrl);
+            } else {
+                printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
+                printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
+            }
             printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen\n\n");
             continue;
         }
@@ -3675,22 +4449,137 @@ input[strcspn(input, "\n")] = '\0';
             continue;
         }
         
-        if (strcmp(input, "/restart") == 0) {
-            printf("\x1b[90mRestarting server...\x1b[0m\n");
+        if (strncmp(input, "/restart", 8) == 0) {
+            char customCtx[32] = "";
+            char *ctxArg = strstr(input, "--context");
+            if (ctxArg) {
+                ctxArg += 9;
+                while (*ctxArg == ' ') ctxArg++;
+                int ctxLen = 0;
+                while (ctxArg[ctxLen] && ctxArg[ctxLen] != ' ' && ctxLen < 31) {
+                    customCtx[ctxLen] = ctxArg[ctxLen];
+                    ctxLen++;
+                }
+                customCtx[ctxLen] = '\0';
+            }
+            if (customCtx[0]) {
+                printf("\x1b[90mRestarting server with context %s...\x1b[0m\n", customCtx);
+            } else {
+                printf("\x1b[90mRestarting server...\x1b[0m\n");
+            }
             if (sServerStartedByUs && sChatServerProcess) {
                 StopChatServer();
             }
             Sleep(1000);
-            if (StartServerForChat() != 0) {
+            if (StartServerForChat(customCtx[0] ? customCtx : NULL) != 0) {
                 printf("\x1b[31mFailed to restart server\x1b[0m\n");
             } else {
-                printf("\x1b[32mServer restarted\x1b[0m\n");
+                if (customCtx[0]) {
+                    printf("\x1b[32mServer restarted with context %s\x1b[0m\n", customCtx);
+                } else {
+                    printf("\x1b[32mServer restarted\x1b[0m\n");
+                }
             }
             continue;
         }
         
-        if (strcmp(input, "/websearch") == 0 || strcmp(input, "/search") == 0) {
-            DoWebSearch();
+        if (strncmp(input, "/websearch", 10) == 0 || strncmp(input, "/search", 7) == 0 || strncmp(input, "/web", 4) == 0) {
+            char searchQuery[512] = "";
+            char *queryStart = strchr(input, ' ');
+            if (queryStart) {
+                queryStart++;
+                while (*queryStart == ' ') queryStart++;
+                lstrcpynA(searchQuery, queryStart, sizeof(searchQuery));
+            }
+            
+            if (!searchQuery[0]) {
+                printf("\x1b[90mSearch query: \x1b[0m");
+                if (fgets(searchQuery, sizeof(searchQuery), stdin)) {
+                    searchQuery[strcspn(searchQuery, "\n")] = 0;
+                }
+            }
+            
+            if (searchQuery[0]) {
+                char *result = DoWebSearch(searchQuery);
+                if (result && result[0]) {
+                    char searchResults[3][4096];
+                    int resultCount = 0;
+                    
+                    char *token = strtok(result, "|||");
+                    while (token && resultCount < 3) {
+                        strncpy(searchResults[resultCount], token, sizeof(searchResults[resultCount]) - 1);
+                        searchResults[resultCount][sizeof(searchResults[resultCount]) - 1] = '\0';
+                        resultCount++;
+                        token = strtok(NULL, "|||");
+                    }
+                    
+                    if (resultCount == 0) {
+                        strncpy(searchResults[0], result, sizeof(searchResults[0]) - 1);
+                        searchResults[0][sizeof(searchResults[0]) - 1] = '\0';
+                        resultCount = 1;
+                    }
+                    
+                    ChatClear();
+                    
+                    char searchHeader[512];
+                    snprintf(searchHeader, sizeof(searchHeader), "[Web Search: %s]", searchQuery);
+                    ChatAddMessage("system", searchHeader);
+                    
+                    for (int i = 0; i < resultCount; i++) {
+                        char contextMsg[8192];
+                        snprintf(contextMsg, sizeof(contextMsg), "[Search result %d]\n%s", i + 1, searchResults[i]);
+                        ChatAddMessage("user", contextMsg);
+                    }
+                    
+                    PrintWebSearchReport(searchQuery, resultCount);
+                    
+                    printf("\x1b[90mSearch results added to chat history. Ask me anything about this topic!\x1b[0m\n\n");
+                    continue;
+                } else {
+                    printf("\x1b[31m[✗] Search failed\x1b[0m\n\n");
+                }
+            } else {
+                printf("\x1b[90mSearch cancelled.\x1b[0m\n");
+            }
+            continue;
+        }
+        
+        if (strncmp(input, "/wiki", 5) == 0) {
+            char searchQuery[512] = "";
+            char *queryStart = strchr(input, ' ');
+            if (queryStart) {
+                queryStart++;
+                while (*queryStart == ' ') queryStart++;
+                lstrcpynA(searchQuery, queryStart, sizeof(searchQuery));
+            }
+            
+            if (!searchQuery[0]) {
+                printf("\x1b[90mWikipedia article: \x1b[0m");
+                if (fgets(searchQuery, sizeof(searchQuery), stdin)) {
+                    searchQuery[strcspn(searchQuery, "\n")] = 0;
+                }
+            }
+            
+            if (searchQuery[0]) {
+                char *result = DoWikiSearch(searchQuery);
+                if (result && result[0]) {
+                    ChatClear();
+                    
+                    char wikiHeader[512];
+                    snprintf(wikiHeader, sizeof(wikiHeader), "[Wikipedia: %s]", searchQuery);
+                    ChatAddMessage("system", wikiHeader);
+                    
+                    char contextMsg[8192];
+                    snprintf(contextMsg, sizeof(contextMsg), "%s", result);
+                    ChatAddMessage("user", contextMsg);
+                    
+                    printf("\x1b[90mWikipedia article added to chat history. Ask me anything about this topic!\x1b[0m\n\n");
+                } else {
+                    printf("\x1b[31mFailed to fetch Wikipedia article\x1b[0m\n");
+                }
+            } else {
+                printf("\x1b[90mSearch cancelled.\x1b[0m\n");
+            }
             continue;
         }
         
@@ -3700,6 +4589,11 @@ input[strcspn(input, "\n")] = '\0';
             printf("  /clear    - Clear chat history\n");
             printf("  /cls      - Clear terminal screen\n");
             printf("  /model    - Change model (requires restart)\n");
+            printf("  /restart  - Restart llama server\n");
+            printf("  /websearch <query> - Search web and get AI response\n");
+            printf("  /search   - Same as /websearch\n");
+            printf("  /web      - Same as /websearch\n");
+            printf("  /wiki     - Get Wikipedia summary\n");
             printf("  /help     - Show this help\n\n");
             continue;
         }
@@ -3709,25 +4603,109 @@ input[strcspn(input, "\n")] = '\0';
         
         ChatAddMessage("user", input);
         
-        BOOL thinking = TRUE;
-        HANDLE hThread = CreateThread(NULL, 0, ThinkingAnimationThread, &thinking, 0, NULL);
+        if (sDebugMode) {
+            printf("\x1b[90m[DEBUG] Sending to URL: %s\x1b[0m\n", url);
+        }
         
-        response = HttpPost(url, BuildChatPayload(input));
-        
-        thinking = FALSE;
-        if (hThread) { WaitForSingleObject(hThread, INFINITE); CloseHandle(hThread); }
+        response = NULL;
+        for (int retry = 0; retry < 3 && !response; retry++) {
+            if (retry > 0) {
+                printf("\x1b[90m[Retry %d/3]...\x1b[0m\n", retry);
+                Sleep(1000);
+            }
+            
+            BOOL thinking = TRUE;
+            HANDLE hThread = CreateThread(NULL, 0, ThinkingAnimationThread, &thinking, 0, NULL);
+            
+            if (sOllamaMode) {
+                response = HttpPost(url, BuildOllamaPayload(input));
+            } else {
+                response = HttpPost(url, BuildChatPayload(input));
+            }
+            
+            thinking = FALSE;
+            if (hThread) { WaitForSingleObject(hThread, INFINITE); CloseHandle(hThread); }
+        }
         
         if (!response) {
+            DWORD err = GetLastError();
+            if (sDebugMode) {
+                if (err == 0) {
+                    printf("\x1b[31m[DEBUG] HttpPost returned NULL, no Win32 error set - possible connection reset or timeout\x1b[0m\n");
+                } else {
+                    char buffer[256];
+                    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err, 0, buffer, sizeof(buffer), NULL);
+                    printf("\x1b[31m[DEBUG] HTTP POST failed. LastError: %lu - %s\x1b[0m\n", err, buffer);
+                }
+            }
             printf("\x1b[31mFailed to get response. Is the server running?\x1b[0m\n");
             ChatAddMessage("assistant", "");
             continue;
         }
         
-        printf("\x1b[90m[DEBUG] Response: %s\x1b[0m\n", response);
+        if (sDebugMode) {
+            int dbgLen = strlen(response);
+            if (dbgLen > 500) {
+                printf("\x1b[90m[DEBUG] Response (first 500 chars): %.500s...\x1b[0m\n\n", response);
+            } else {
+                printf("\x1b[90m[DEBUG] Response: %.500s\x1b[0m\n\n", response);
+            }
+        }
         
-        assistant_msg = ParseChatResponse(response);
+        if (!sOllamaMode && HasToolCall(response)) {
+            char tool_name[256] = "";
+            char tool_args[4096] = "";
+            char tool_result[8192] = "";
+            
+            strncpy(tool_name, ExtractToolCall(response), sizeof(tool_name) - 1);
+            tool_name[sizeof(tool_name) - 1] = '\0';
+            strncpy(tool_args, ExtractToolArgs(response), sizeof(tool_args) - 1);
+            tool_args[sizeof(tool_args) - 1] = '\0';
+            
+            if (tool_name[0] && ExecuteToolCall(tool_name, tool_args, tool_result, sizeof(tool_result))) {
+                printf("\x1b[90m[Tool] Executed %s: %.100s...\x1b[0m\n", tool_name, tool_result);
+                
+                char tool_msg[16384];
+                snprintf(tool_msg, sizeof(tool_msg),
+                    "{\"role\":\"tool\",\"content\":\"%s\",\"name\":\"%s\"}",
+                    tool_result, tool_name);
+                ChatAddMessage("user", tool_msg);
+                
+                free(response);
+                if (sOllamaMode) {
+                    response = HttpPost(url, BuildOllamaPayload(NULL));
+                } else {
+                    response = HttpPost(url, BuildChatPayload(NULL));
+                }
+                
+                if (!response) {
+                    printf("\x1b[31mFailed to get follow-up response\x1b[0m\n");
+                    continue;
+                }
+            }
+        }
+        
+        if (sOllamaMode) {
+            assistant_msg = ParseOllamaResponse(response);
+        } else {
+            assistant_msg = ParseChatResponse(response);
+        }
+        
         if (!assistant_msg || !assistant_msg[0]) {
-            printf("\x1b[31mFailed to parse response: %s\x1b[0m\n", response);
+            if (sOllamaMode) {
+                printf("\x1b[31mFailed to parse Ollama response.\x1b[0m\n");
+            } else {
+                printf("\x1b[31mServer error. Restarting...\x1b[0m\n");
+                if (sServerStartedByUs && sChatServerProcess) {
+                    StopChatServer();
+                }
+                Sleep(1000);
+                if (StartServerForChat(NULL) != 0) {
+                    printf("\x1b[31mFailed to restart server\x1b[0m\n");
+                } else {
+                    printf("\x1b[32mServer restarted\x1b[0m\n");
+                }
+            }
             free(response);
             ChatAddMessage("assistant", "");
             continue;
@@ -3737,7 +4715,8 @@ input[strcspn(input, "\n")] = '\0';
         
         printf("\n\x1b[35mAI >\x1b[0m ");
         PrintWrapped(assistant_msg, 80);
-        printf("\n");
+        printf("\n\n");
+        fflush(stdout);
         
         free(response);
     }
