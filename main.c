@@ -95,8 +95,8 @@ static BOOL sModelLoaded = FALSE;
 #define SAFE_RAM_BUFFER_MB 2048
 #define SAFE_VRAM_BUFFER_MB 512
 #define WARNING_RAM_MB 4096
-#define WARNING_COMMIT_PERCENT 85
-#define DANGER_COMMIT_PERCENT 92
+#define WARNING_COMMIT_PERCENT 92
+#define DANGER_COMMIT_PERCENT 97
 
 /* ──────────────────────────────────────────────
    Handles
@@ -1717,9 +1717,17 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("}\n", fp);
     fputs("\n", fp);
     fputs("$targetPath = Join-Path $ModelsFolder ([System.IO.Path]::GetFileName($selected.Name))\n", fp);
+    fputs("# Create org/model subfolder structure\n", fp);
+    fputs("$repoParts = $Repo -split '/'\n", fp);
+    fputs("$orgName = $repoParts[0]\n", fp);
+    fputs("$modelName = $repoParts[1]\n", fp);
+    fputs("$orgFolder = Join-Path $ModelsFolder $orgName\n", fp);
+    fputs("$modelFolder = Join-Path $orgFolder $modelName\n", fp);
+    fputs("if (-not (Test-Path -LiteralPath $orgFolder)) { New-Item -ItemType Directory -Path $orgFolder | Out-Null }\n", fp);
+    fputs("if (-not (Test-Path -LiteralPath $modelFolder)) { New-Item -ItemType Directory -Path $modelFolder | Out-Null }\n", fp);
+    fputs("$targetPath = Join-Path $modelFolder ([System.IO.Path]::GetFileName($selected.Name))\n", fp);
     fputs("if (Test-Path -LiteralPath $targetPath) {\n", fp);
-    fputs("  do { $overwrite = Read-Host 'File already exists. Overwrite? (y/n)' } until ($overwrite -match '^[YyNn]$')\n", fp);
-    fputs("  if ($overwrite -match '^[Nn]$') { Write-Host 'Cancelled.'; exit 0 }\n", fp);
+    fputs("  Write-Host 'File already exists, overwriting...' -ForegroundColor Yellow\n", fp);
     fputs("}\n", fp);
     fputs("$projectorTargetPath = $null\n", fp);
     fputs("$overwriteProjector = 'Y'\n", fp);
@@ -1737,10 +1745,9 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("}\n", fp);
     fputs("if ($selectedProjector) {\n", fp);
     fputs("  $projectorName = if ($selectedProjector.PSObject.Properties['rfilename']) { $selectedProjector.rfilename } else { $selectedProjector.Name }\n", fp);
-    fputs("  $projectorTargetPath = Join-Path $ModelsFolder ([System.IO.Path]::GetFileName($projectorName))\n", fp);
+    fputs("  $projectorTargetPath = Join-Path $modelFolder ([System.IO.Path]::GetFileName($projectorName))\n", fp);
     fputs("  if (Test-Path -LiteralPath $projectorTargetPath) {\n", fp);
-    fputs("    do { $overwriteProjector = Read-Host 'Projector file already exists. Overwrite? (y/n)' } until ($overwriteProjector -match '^[YyNn]$')\n", fp);
-    fputs("    if ($overwriteProjector -match '^[Nn]$') { Write-Host 'Keeping existing projector file.' -ForegroundColor Yellow }\n", fp);
+    fputs("    Write-Host 'Projector file already exists, overwriting...' -ForegroundColor Yellow\n", fp);
     fputs("  }\n", fp);
     fputs("}\n", fp);
     fputs("Write-Host ''\n", fp);
@@ -1748,7 +1755,7 @@ static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen
     fputs("Write-Host ('Saving to ' + $targetPath)\n", fp);
     fputs("Write-Host 'Download progress:' -ForegroundColor DarkGray\n", fp);
     fputs("Download-WithProgress $selected.Url $targetPath\n", fp);
-    fputs("if ($selectedProjector -and $projectorTargetPath -and ($overwriteProjector -notmatch '^[Nn]$' -or -not (Test-Path -LiteralPath $projectorTargetPath))) {\n", fp);
+    fputs("if ($selectedProjector -and $projectorTargetPath) {\n", fp);
     fputs("  $projectorName = if ($selectedProjector.PSObject.Properties['rfilename']) { $selectedProjector.rfilename } else { $selectedProjector.Name }\n", fp);
     fputs("  $escapedProjectorName = [System.Uri]::EscapeDataString($projectorName) -replace '%2F', '/'\n", fp);
     fputs("  $projectorUrl = 'https://huggingface.co/' + $Repo + '/resolve/main/' + $escapedProjectorName + '?download=true'\n", fp);
@@ -1943,14 +1950,49 @@ static int PrintModels(void)
 
 static int PrintUsage(void)
 {
-    printf("Valora commands:\n");
-    printf("  valora setup   Open the GUI setup window\n");
-    printf("  valora list    Alias for valora models\n");
-    printf("  valora models  List configured models\n");
-    printf("  valora run     Run the saved model in llama-cli\n");
-    printf("  valora serve [model]  Start a model in llama-server (optional model name)\n");
-    printf("  valora get <owner/repo|hf_url>  Download a GGUF model from Hugging Face\n");
-    printf("  valora chat    Start interactive chat mode (requires server running)\n");
+    printf("\x1b[36mValora CLI - Local AI Model Manager\x1b[0m\n\n");
+    
+    printf("\x1b[33mGeneral:\x1b[0m\n");
+    printf("  valora setup           Open the GUI setup window\n");
+    printf("  valora help           Show this help message\n");
+    printf("  valora version        Show version information\n");
+    
+    printf("\n\x1b[33mModel Management:\x1b[0m\n");
+    printf("  valora list           List configured models (alias: valora models)\n");
+    printf("  valora models         List configured models\n");
+    printf("  valora run [model]    Run model in llama-cli\n");
+    printf("    Options (all optional):\n");
+    printf("      --context <n>     Context length (default: 2048)\n");
+    printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
+    printf("      --debug           Enable debug output\n");
+    printf("  valora get <repo>     Download GGUF model from Hugging Face\n");
+    printf("    Example: valora get TheBloke/Mistral-7B-v0.1-GGUF\n");
+    
+    printf("\n\x1b[33mServer:\x1b[0m\n");
+    printf("  valora serve [model]  Start model in llama-server\n");
+    printf("    Options (all optional):\n");
+    printf("      --context <n>     Context length (default: 2048)\n");
+    printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
+    printf("      --ip              Show local IP in server URL\n");
+    printf("      --port <n>        Server port (default: 8080)\n");
+    printf("  valora chat           Start interactive chat (requires server running)\n");
+    printf("    Options (all optional):\n");
+    printf("      --debug           Enable debug mode\n");
+    printf("      --ollama          Use Ollama-compatible API\n");
+    
+    printf("\n\x1b[33mUtilities:\x1b[0m\n");
+    printf("  valora info           Show system information (RAM, GPU)\n");
+    printf("  valora kill           Terminate running model server\n");
+    printf("  valora status         Check if server is running\n");
+    
+    printf("\n\x1b[90mQuick Start:\x1b[0m\n");
+    printf("  1. Run 'valora setup' to configure your models folder\n");
+    printf("  2. Run 'valora list' to see available models\n");
+    printf("  3. Run 'valora run' to run a model in CLI mode (will prompt for model selection)\n");
+    printf("  4. Run 'valora serve' to start the server (will prompt for model selection)\n");
+    printf("  5. Run 'valora chat' to start chatting\n");
+    printf("\n\x1b[90mNote: Commands work without any flags. Use flags only to customize behavior.\x1b[0m\n");
+    
     fflush(stdout);
     return 1;
 }
@@ -2125,8 +2167,10 @@ static void ShowOnlyOnPage(HWND hwnd)
 }
 
 /* ──────────────────────────────────────────────
-   Model scanning
+   Model scanning (with recursive subfolder support)
    ────────────────────────────────────────────── */
+static void ScanModelsRecursively(const char *basePath, int *count);
+
 static void ScanModels(void)
 {
     int selectedIndex = 0;
@@ -2142,31 +2186,8 @@ static void ScanModels(void)
 
     if (!sFolder[0]) return;
 
-    char pattern[MAX_PATH * 2];
-    snprintf(pattern, sizeof(pattern), "%s\\*.gguf", sFolder);
-
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(pattern, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            if (nModels < MAX_MODELS && !IsProjectorFileName(fd.cFileName)) {
-                lstrcpynA(sModels[nModels], fd.cFileName, MAX_PATH);
-                lstrcpynA(sModelTypes[nModels], GetModelTypeLabel(fd.cFileName), (int)sizeof(sModelTypes[nModels]));
-                if (_stricmp(sModelTypes[nModels], "Vision") == 0) {
-                    FindMatchingProjector(fd.cFileName, sModelProjectors[nModels], MAX_PATH);
-                } else {
-                    sModelProjectors[nModels][0] = '\0';
-                }
-                if (hModelCombo)
-                    SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[nModels]);
-                nModels++;
-            }
-        }
-    } while (FindNextFileA(hFind, &fd));
-
-    FindClose(hFind);
+    /* Scan models recursively from all subfolders */
+    ScanModelsRecursively(sFolder, &nModels);
 
     if (!EnsureSelectedModelExists())
         return;
@@ -2181,6 +2202,63 @@ static void ScanModels(void)
     if (hModelCombo && nModels > 0) {
         SendMessageA(hModelCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
         AutoDetectAndSetGpuLayers();
+    }
+}
+
+/* Recursive function to scan for GGUF files in subfolders */
+static void ScanModelsRecursively(const char *basePath, int *count)
+{
+    char searchPattern[MAX_PATH * 2];
+    char subfolderPath[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind;
+
+    /* First, scan GGUF files in current directory */
+    snprintf(searchPattern, sizeof(searchPattern), "%s\\*.gguf", basePath);
+    hFind = FindFirstFileA(searchPattern, &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                if (*count < MAX_MODELS && !IsProjectorFileName(fd.cFileName)) {
+                    /* Store full relative path from models folder */
+                    const char *relativePath = basePath + lstrlenA(sFolder);
+                    if (*relativePath == '\\') relativePath++;
+                    
+                    if (*relativePath) {
+                        snprintf(sModels[*count], MAX_PATH, "%s\\%s", relativePath, fd.cFileName);
+                    } else {
+                        lstrcpynA(sModels[*count], fd.cFileName, MAX_PATH);
+                    }
+                    
+                    lstrcpynA(sModelTypes[*count], GetModelTypeLabel(fd.cFileName), (int)sizeof(sModelTypes[*count]));
+                    if (_stricmp(sModelTypes[*count], "Vision") == 0) {
+                        FindMatchingProjector(fd.cFileName, sModelProjectors[*count], MAX_PATH);
+                    } else {
+                        sModelProjectors[*count][0] = '\0';
+                    }
+                    if (hModelCombo)
+                        SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[*count]);
+                    (*count)++;
+                }
+            }
+        } while (FindNextFileA(hFind, &fd) && *count < MAX_MODELS);
+        FindClose(hFind);
+    }
+
+    /* Then, recurse into subdirectories */
+    snprintf(searchPattern, sizeof(searchPattern), "%s\\*", basePath);
+    hFind = FindFirstFileA(searchPattern, &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                /* Skip . and .. */
+                if (lstrcmpA(fd.cFileName, ".") != 0 && lstrcmpA(fd.cFileName, "..") != 0) {
+                    snprintf(subfolderPath, sizeof(subfolderPath), "%s\\%s", basePath, fd.cFileName);
+                    ScanModelsRecursively(subfolderPath, count);
+                }
+            }
+        } while (FindNextFileA(hFind, &fd) && *count < MAX_MODELS);
+        FindClose(hFind);
     }
 }
 
@@ -2259,11 +2337,6 @@ static void GenerateCommand(HWND hwnd)
     if (!sFolder[0] && hFolderEdit)
         GetWindowTextA(hFolderEdit, sFolder, sizeof(sFolder));
 
-    if (idx == CB_ERR) {
-        MessageBoxA(hwnd, "No model selected. Browse a model folder first.", "Setup incomplete", MB_ICONERROR);
-        return;
-    }
-
     if (!sServer[0]) {
         MessageBoxA(hwnd, "Select the server executable first.", "Setup incomplete", MB_ICONERROR);
         return;
@@ -2274,7 +2347,13 @@ static void GenerateCommand(HWND hwnd)
         return;
     }
 
-    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
+    /* Allow saving even with no models - user may add models later */
+    if (idx != CB_ERR) {
+        SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
+    } else {
+        sSelectedModel[0] = '\0';  /* No model selected - that's okay for empty folder */
+    }
+
     if (!SaveConfigToDisk()) {
         MessageBoxA(hwnd, "Could not save the Valora configuration.", "Save failed", MB_ICONERROR);
         return;
@@ -2863,9 +2942,10 @@ static int EnsureModelsFolderReady(void)
 
 static int RunCli(int argc, char **argv)
 {
+    /* When no arguments, show help (user can run 'valora setup' to open GUI) */
     if (argc <= 1) {
-        HideStandaloneConsoleWindow();
-        return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+        AttachConsoleStreams();
+        return PrintUsage();
     }
 
     if (lstrcmpiA(argv[1], "setup") == 0) {
@@ -2895,6 +2975,7 @@ static int RunCli(int argc, char **argv)
         char ctxBuf[32] = "2048";
         char gpuBuf[32] = "-1";
         BOOL modelProvidedAsArg = FALSE;
+        BOOL enableDebug = FALSE;
         SafetyDecision safety;
 
         SafetyInit();
@@ -2911,6 +2992,8 @@ static int RunCli(int argc, char **argv)
             } else if (lstrcmpiA(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
                 customGpu = atoi(argv[i + 1]);
                 i++;
+            } else if (lstrcmpiA(argv[i], "--debug") == 0) {
+                enableDebug = TRUE;
             } else if (argv[i][0] != '-') {
                 lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
                 modelProvidedAsArg = TRUE;
@@ -2986,6 +3069,7 @@ static int RunCli(int argc, char **argv)
         char customCtx[32] = "";
         BOOL includeLocalIp = FALSE;
         BOOL modelProvidedAsArg = FALSE;
+        int customPort = 0;
         SafetyDecision safety;
 
         SafetyInit();
@@ -3002,6 +3086,9 @@ static int RunCli(int argc, char **argv)
                 i++;
             } else if (lstrcmpiA(argv[i], "--ip") == 0) {
                 includeLocalIp = TRUE;
+            } else if (lstrcmpiA(argv[i], "--port") == 0 && i + 1 < argc) {
+                customPort = atoi(argv[i + 1]);
+                i++;
             } else if (argv[i][0] != '-') {
                 lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
                 modelProvidedAsArg = TRUE;
@@ -3076,6 +3163,70 @@ static int RunCli(int argc, char **argv)
             argIdx++;
         }
         return RunChatMode();
+    }
+
+    /* Version command */
+    if (lstrcmpiA(argv[1], "version") == 0 || lstrcmpiA(argv[1], "ver") == 0) {
+        printf("\x1b[36mValora CLI v1.0.0\x1b[0m\n");
+        printf("Local AI Model Manager\n");
+        printf("Built with llama.cpp\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    /* Info command - Show system information */
+    if (lstrcmpiA(argv[1], "info") == 0 || lstrcmpiA(argv[1], "sysinfo") == 0) {
+        ULONGLONG availRAM = GetAvailableRamMB();
+        ULONGLONG totalRAM = GetSystemRamMB();
+        
+        printf("\x1b[36m=== System Information ===\x1b[0m\n\n");
+        printf("\x1b[33mMemory:\x1b[0m\n");
+        printf("  Available: %llu MB\n", availRAM);
+        printf("  Total:     %llu MB\n", totalRAM);
+        printf("  Used:      %llu MB\n", totalRAM - availRAM);
+        
+        /* Check for running server */
+        if (sModelLoaded) {
+            printf("\n\x1b[32m[Server Running]\x1b[0m Model is currently loaded\n");
+        } else {
+            printf("\n\x1b[90m[No Server] No model server is currently running\x1b[0m\n");
+        }
+        
+        /* Show configured models folder */
+        if (LoadConfigFromDisk() && sFolder[0]) {
+            printf("\n\x1b[33mConfig:\x1b[0m\n");
+            printf("  Models folder: %s\n", sFolder);
+        }
+        
+        fflush(stdout);
+        return 0;
+    }
+
+    /* Kill command - Terminate running server */
+    if (lstrcmpiA(argv[1], "kill") == 0 || lstrcmpiA(argv[1], "stop") == 0) {
+        if (sModelLoaded) {
+            TerminateActiveProcess();
+            sModelLoaded = FALSE;
+            printf("\x1b[32mServer terminated successfully.\x1b[0m\n");
+        } else {
+            printf("\x1b[90mNo server is currently running.\x1b[0m\n");
+        }
+        fflush(stdout);
+        return 0;
+    }
+
+    /* Status command - Check if server is running */
+    if (lstrcmpiA(argv[1], "status") == 0) {
+        if (sModelLoaded) {
+            printf("\x1b[32m[Running]\x1b[0m Model server is active\n");
+            if (sSelectedModel[0]) {
+                printf("  Model: %s\n", sSelectedModel);
+            }
+        } else {
+            printf("\x1b[90m[Stopped] No model server is running\x1b[0m\n");
+        }
+        fflush(stdout);
+        return 0;
     }
 
     return PrintUsage();
@@ -3881,7 +4032,7 @@ static char* DoWikiSearch(const char *searchQuery) {
     fflush(stdout);
     
     snprintf(url, sizeof(url), "https://en.wikipedia.org/api/rest_v1/page/summary/%s", searchQuery);
-    result = HttpGet(url);
+    result = HttpGetUrl(url);
     
     running = 0;
     if (hThread) {
@@ -4039,7 +4190,7 @@ static char* HttpGet(const char *query) {
     hConnect = InternetConnect(hSession, host, 443, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
     if (!hConnect) { InternetCloseHandle(hSession); return NULL; }
     
-    hRequest = HttpOpenRequest(hConnect, "GET", path, NULL, NULL, NULL, INTERNET_FLAG_SECURE, 0);
+    hRequest = HttpOpenRequest(hConnect, "GET", path, NULL, NULL, NULL, INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_IGNORE_CERT_CN_INVALID, 0);
     if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hSession); return NULL; }
     
     bResults = HttpSendRequest(hRequest, NULL, 0, NULL, 0);
