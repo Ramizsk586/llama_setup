@@ -44,10 +44,10 @@
 /* ──────────────────────────────────────────────
    Layout Constants (Compact Style)
    ────────────────────────────────────────────── */
-#define APP_W       820
-#define APP_H       620
+#define APP_W       700
+#define APP_H       500
 #define CARD_MAX_W  660
-#define HEADER_H    88
+#define HEADER_H    50
 #define FOOTER_H    20
 #define PAD         12
 
@@ -106,11 +106,13 @@ static BOOL sModelLoaded = FALSE;
    ────────────────────────────────────────────── */
 static HWND hServerEdit, hFolderEdit, hModelCombo;
 static HWND hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit;
-static HWND hServerTypeCombo, hCommandTypeCombo;
+static HWND hKvCacheKCombo;
+static HWND hKvCacheVCombo;
+static HWND hServerTypeCombo;
 static HWND hOutputEdit;
 static HWND hBtnServer, hBtnFolder, hBtnPrev, hBtnNext, hBtnGenerate, hBtnCopy;
 // NEW: Static controls for labels so they align perfectly
-static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads, hLblServerType, hLblCommandType;
+static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads, hLblServerType, hLblCommandType, hLblKvCacheK, hLblKvCacheV;
 
 /* ──────────────────────────────────────────────
    GDI resources
@@ -596,6 +598,7 @@ static BOOL SaveConfigToDisk(void)
     char port[32] = "8000";
     char threads[32] = "4";
     char serverType[16];
+    char kvCacheBoth[32];
 
     if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath)))
         return FALSE;
@@ -611,6 +614,34 @@ static BOOL SaveConfigToDisk(void)
 
     snprintf(serverType, sizeof(serverType), "%d", nServerType);
 
+    /* Get KV cache K type from combo */
+    char kvCacheK[16] = "f16";
+    if (hKvCacheKCombo) {
+        int sel = (int)SendMessageA(hKvCacheKCombo, CB_GETCURSEL, 0, 0);
+        switch (sel) {
+            case 0: lstrcpynA(kvCacheK, "f16", sizeof(kvCacheK)); break;
+            case 1: lstrcpynA(kvCacheK, "q8_0", sizeof(kvCacheK)); break;
+            case 2: lstrcpynA(kvCacheK, "q4_0", sizeof(kvCacheK)); break;
+            case 3: lstrcpynA(kvCacheK, "q4_1", sizeof(kvCacheK)); break;
+            default: lstrcpynA(kvCacheK, "f16", sizeof(kvCacheK)); break;
+        }
+    }
+
+    /* Get KV cache V type from combo */
+    char kvCacheV[16] = "f16";
+    if (hKvCacheVCombo) {
+        int sel = (int)SendMessageA(hKvCacheVCombo, CB_GETCURSEL, 0, 0);
+        switch (sel) {
+            case 0: lstrcpynA(kvCacheV, "f16", sizeof(kvCacheV)); break;
+            case 1: lstrcpynA(kvCacheV, "q8_0", sizeof(kvCacheV)); break;
+            case 2: lstrcpynA(kvCacheV, "q4_0", sizeof(kvCacheV)); break;
+            case 3: lstrcpynA(kvCacheV, "q4_1", sizeof(kvCacheV)); break;
+            default: lstrcpynA(kvCacheV, "f16", sizeof(kvCacheV)); break;
+        }
+    }
+
+    snprintf(kvCacheBoth, sizeof(kvCacheBoth), "%s,%s", kvCacheK, kvCacheV);
+
     WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
     WritePrivateProfileStringA("paths", "models_folder", sFolder, sConfigPath);
     WritePrivateProfileStringA("paths", "default_model", sSelectedModel, sConfigPath);
@@ -620,6 +651,7 @@ static BOOL SaveConfigToDisk(void)
     WritePrivateProfileStringA("settings", "port", port, sConfigPath);
     WritePrivateProfileStringA("settings", "threads", threads, sConfigPath);
     WritePrivateProfileStringA("settings", "server_type", serverType, sConfigPath);
+    WritePrivateProfileStringA("settings", "kv_cache_type", kvCacheBoth, sConfigPath);
 
     return TRUE;
 }
@@ -659,6 +691,43 @@ static void ApplyLoadedConfigToControls(void)
 
     GetPrivateProfileStringA("settings", "threads", "4", value, sizeof(value), sConfigPath);
     SetWindowTextA(hThreadsEdit, value);
+    
+    /* Load KV cache type - format: "k_type,v_type" */
+    GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", value, sizeof(value), sConfigPath);
+    
+    char kvK[16] = "f16";
+    char kvV[16] = "f16";
+    char *comma = strchr(value, ',');
+    if (comma) {
+        *comma = '\0';
+        lstrcpynA(kvK, value, sizeof(kvK));
+        lstrcpynA(kvV, comma + 1, sizeof(kvV));
+    } else {
+        lstrcpynA(kvK, value, sizeof(kvK));
+        lstrcpynA(kvV, value, sizeof(kvV));
+    }
+    
+    /* Set KV cache K combo */
+    if (lstrcmpiA(kvK, "q8_0") == 0) {
+        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 1, 0);
+    } else if (lstrcmpiA(kvK, "q4_0") == 0) {
+        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 2, 0);
+    } else if (lstrcmpiA(kvK, "q4_1") == 0) {
+        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 3, 0);
+    } else {
+        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 0, 0);
+    }
+    
+    /* Set KV cache V combo */
+    if (lstrcmpiA(kvV, "q8_0") == 0) {
+        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 1, 0);
+    } else if (lstrcmpiA(kvV, "q4_0") == 0) {
+        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 2, 0);
+    } else if (lstrcmpiA(kvV, "q4_1") == 0) {
+        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 3, 0);
+    } else {
+        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 0, 0);
+    }
 
     SendMessageA(hServerTypeCombo, CB_SETCURSEL, (WPARAM)nServerType, 0);
 }
@@ -934,12 +1003,38 @@ static int FindModelIndexByName(const char *modelName)
     return -1;
 }
 
-static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen)
+static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen, char *kvCache, int kvCacheLen)
 {
     if (ctx && ctxLen > 0) GetPrivateProfileStringA("settings", "ctx", "2048", ctx, ctxLen, sConfigPath);
     if (gpu && gpuLen > 0) GetPrivateProfileStringA("settings", "gpu", "-1", gpu, gpuLen, sConfigPath);
     if (port && portLen > 0) GetPrivateProfileStringA("settings", "port", "8000", port, portLen, sConfigPath);
     if (threads && threadsLen > 0) GetPrivateProfileStringA("settings", "threads", "4", threads, threadsLen, sConfigPath);
+    if (kvCache && kvCacheLen > 0) {
+        char stored[64];
+        GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", stored, sizeof(stored), sConfigPath);
+        char *comma = strchr(stored, ',');
+        if (comma) {
+            *comma = '\0';
+            lstrcpynA(kvCache, stored, kvCacheLen);
+        } else {
+            lstrcpynA(kvCache, stored, kvCacheLen);
+        }
+    }
+}
+
+static void GetConfiguredServerValuesBoth(char *kvCacheK, int kvCacheKLen, char *kvCacheV, int kvCacheVLen)
+{
+    char stored[64];
+    GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", stored, sizeof(stored), sConfigPath);
+    char *comma = strchr(stored, ',');
+    if (comma) {
+        *comma = '\0';
+        if (kvCacheK && kvCacheKLen > 0) lstrcpynA(kvCacheK, stored, kvCacheKLen);
+        if (kvCacheV && kvCacheVLen > 0) lstrcpynA(kvCacheV, comma + 1, kvCacheVLen);
+    } else {
+        if (kvCacheK && kvCacheKLen > 0) lstrcpynA(kvCacheK, stored, kvCacheKLen);
+        if (kvCacheV && kvCacheVLen > 0) lstrcpynA(kvCacheV, stored, kvCacheVLen);
+    }
 }
 
 /* Check if a model has saved configuration */
@@ -1306,11 +1401,12 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
 static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int customGpu, BOOL includeLocalIp)
 {
     char modelPath[MAX_PATH * 2];
-    char ctx[32], gpu[32], port[32], threads[32];
+    char ctx[32], gpu[32], port[32], threads[32], kvCacheK[16], kvCacheV[16];
     char host[128];
 
     BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
-    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), port, sizeof(port), threads, sizeof(threads));
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), port, sizeof(port), threads, sizeof(threads), kvCacheK, sizeof(kvCacheK));
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
 
     if (customCtx && customCtx[0])
         lstrcpynA(ctx, customCtx, sizeof(ctx));
@@ -1325,8 +1421,8 @@ static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int 
 
     snprintf(
         dst, dstLen,
-        "\"%s\" -m \"%s\" -c %s -ngl %s --port %s -t %s --host %s",
-        sServer, modelPath, ctx, gpu, port, threads, host
+        "\"%s\" -m \"%s\" -c %s -ngl %s --port %s -t %s --host %s --cache-type-k %s --cache-type-v %s",
+        sServer, modelPath, ctx, gpu, port, threads, host, kvCacheK, kvCacheV
     );
 }
 
@@ -1335,7 +1431,7 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
     char cliPath[MAX_PATH];
     char modelPath[MAX_PATH * 2];
     char projectorPath[MAX_PATH * 2];
-    char ctx[32], gpu[32], threads[32];
+    char ctx[32], gpu[32], threads[32], kvCacheK[16] = "f16", kvCacheV[16] = "f16";
     int modelIndex;
     const char *targetModel;
 
@@ -1344,9 +1440,11 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
     BuildModelPath(modelPath, sizeof(modelPath), targetModel);
     GetModelConfig(targetModel, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
     
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
+    
     if (sCustomCtx[0])
         lstrcpynA(ctx, sCustomCtx, sizeof(ctx));
-    
+
     modelIndex = FindModelIndexByName(targetModel);
 
     if (modelIndex >= 0 &&
@@ -1355,14 +1453,14 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
         BuildModelPath(projectorPath, sizeof(projectorPath), sModelProjectors[modelIndex]);
         snprintf(
             dst, dstLen,
-            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s",
-            cliPath, modelPath, projectorPath, ctx, gpu, threads
+            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --cache-type-k %s --cache-type-v %s",
+            cliPath, modelPath, projectorPath, ctx, gpu, threads, kvCacheK, kvCacheV
         );
     } else {
         snprintf(
             dst, dstLen,
-            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s",
-            cliPath, modelPath, ctx, gpu, threads
+            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s --cache-type-k %s --cache-type-v %s",
+            cliPath, modelPath, ctx, gpu, threads, kvCacheK, kvCacheV
         );
     }
 }
@@ -2756,14 +2854,19 @@ static int PrintUsage(void)
     
     printf("\n\x1b[33mModel Management:\x1b[0m\n");
     printf("  valora list           List configured models (alias: valora models)\n");
+    printf("  valora list --dir <path>  Change models folder path\n");
     printf("  valora models         List configured models\n");
     printf("  valora run [model]    Run model in llama-cli\n");
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
-    printf("      --debug           Enable debug output\n");
+    printf("      --debug           Show command before running\n");
     printf("  valora get <repo>     Download GGUF model from Hugging Face\n");
     printf("    Example: valora get TheBloke/Mistral-7B-v0.1-GGUF\n");
+    
+    printf("\n\x1b[33mllama.cpp:\x1b[0m\n");
+    printf("  valora llama          Show current llama.cpp path\n");
+    printf("  valora llama --dir <path>  Change llama.cpp folder path\n");
     
     printf("\n\x1b[33mServer:\x1b[0m\n");
     printf("  valora serve [model]  Start model in llama-server\n");
@@ -2944,7 +3047,6 @@ static void ShowOnlyOnPage(HWND hwnd)
     ShowWindow(hPortEdit,      SW_SHOW);
     ShowWindow(hThreadsEdit,   SW_SHOW);
     ShowWindow(hServerTypeCombo, SW_SHOW);
-    ShowWindow(hCommandTypeCombo, SW_SHOW);
     ShowWindow(hLblServer,     SW_SHOW);
     ShowWindow(hLblFolder,     SW_SHOW);
     ShowWindow(hLblModel,      SW_SHOW);
@@ -3126,8 +3228,6 @@ static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int 
 static void GenerateCommand(HWND hwnd)
 {
     int idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
-    int cmdTypeIdx = (int)SendMessageA(hCommandTypeCombo, CB_GETCURSEL, 0, 0);
-    int isCliMode = (cmdTypeIdx == 1);
 
     if (!sServer[0] && hServerEdit)
         GetWindowTextA(hServerEdit, sServer, sizeof(sServer));
@@ -3159,7 +3259,7 @@ static void GenerateCommand(HWND hwnd)
     snprintf(
         sCommand, sizeof(sCommand),
         "valora models\r\nvalora run\r\nvalora serve\r\n\r\nCurrent quick command: %s",
-        isCliMode ? "valora run" : "valora serve"
+        "valora serve"
     );
     CopyToClipboardA(hwnd, sCommand);
     MessageBoxA(
@@ -3240,78 +3340,71 @@ static void LayoutControls(HWND hwnd)
 
     int W = rc.right;
     int H = rc.bottom;
+    int padding = 16;
+    int rowH = 26;
+    int labelH = 14;
+    int gapY = 8;
+    int colGap = 12;
+    int y = padding + 10;
 
-    int cardW = (CARD_MAX_W < (W - 2 * PAD)) ? CARD_MAX_W : (W - 2 * PAD);
-    if (cardW < 440) cardW = W - 2 * PAD;
-    int cardH = H - HEADER_H - FOOTER_H - 12;
+    int labelW = 90;
+    int editW = 140;
+    int btnW = 70;
+    int editH = 24;
+    int comboH = 100;
 
-    int cardX = (W - cardW) / 2;
-    int cardY = HEADER_H + 12;
-
-    int innerX = cardX + 28;
-    int innerW = cardW - 56;
-    int rowH = 28;
-    int labelH = 16;    
-    int gapY = 11;
-    int colW = (innerW - 12) / 2;
-    int y = cardY + 22;
-
-    // Server Type (new option)
-    MoveWindow(hLblServerType, innerX, y, innerW, labelH, TRUE);
+    // Server Type
+    MoveWindow(hLblServerType, padding, y, 100, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hServerTypeCombo, innerX, y, innerW, 100, TRUE);
-    y += rowH + gapY + 4;
+    MoveWindow(hServerTypeCombo, padding, y, 180, comboH, TRUE);
+    y += rowH + gapY;
 
-    // Command Type (Server vs CLI)
-    MoveWindow(hLblCommandType, innerX, y, innerW, labelH, TRUE);
+    // Server Path
+    MoveWindow(hLblServer, padding, y, 80, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hCommandTypeCombo, innerX, y, innerW, 100, TRUE);
-    y += rowH + gapY + 4;
-
-    // Server Executable
-    MoveWindow(hLblServer, innerX, y, innerW, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hServerEdit, innerX, y, innerW - 98, rowH, TRUE);
-    MoveWindow(hBtnServer,  innerX + innerW - 88, y - 1, 88, rowH + 2, TRUE);
+    MoveWindow(hServerEdit, padding, y, W - padding * 2 - btnW - 8, editH, TRUE);
+    MoveWindow(hBtnServer, W - padding - btnW, y - 1, btnW, editH + 2, TRUE);
     y += rowH + gapY;
 
     // Model Folder
-    MoveWindow(hLblFolder, innerX, y, innerW, labelH, TRUE);
+    MoveWindow(hLblFolder, padding, y, 80, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hFolderEdit, innerX, y, innerW - 98, rowH, TRUE);
-    MoveWindow(hBtnFolder,  innerX + innerW - 88, y - 1, 88, rowH + 2, TRUE);
+    MoveWindow(hFolderEdit, padding, y, W - padding * 2 - btnW - 8, editH, TRUE);
+    MoveWindow(hBtnFolder, W - padding - btnW, y - 1, btnW, editH + 2, TRUE);
     y += rowH + gapY;
 
-    // Model Combo (Height is dropdown height)
-    MoveWindow(hLblModel, innerX, y, innerW, labelH, TRUE);
+    // Model Combo
+    MoveWindow(hLblModel, padding, y, 80, labelH, TRUE);
     y += labelH + 2;
-    MoveWindow(hModelCombo, innerX, y, innerW, 100, TRUE);
-    y += rowH + gapY + 4;
-
-    // Parameters in 2-column grid
-    // Left column: Context Size
-    MoveWindow(hLblCtx, innerX, y, colW, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hCtxEdit, innerX, y, colW, rowH, TRUE);
-    
-    // Right column: GPU Layers (at same y level)
-    int rightColX = innerX + colW + 12;
-    MoveWindow(hLblGpu, rightColX, y - labelH - 2, colW, labelH, TRUE);
-    MoveWindow(hGpuEdit, rightColX, y, colW, rowH, TRUE);
+    MoveWindow(hModelCombo, padding, y, W - padding * 2, comboH, TRUE);
     y += rowH + gapY;
 
-    // Left column: Port
-    MoveWindow(hLblPort, innerX, y, colW, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hPortEdit, innerX, y, colW, rowH, TRUE);
+    // Context & GPU in same row
+    MoveWindow(hLblCtx, padding, y, labelW, labelH, TRUE);
+    MoveWindow(hCtxEdit, padding + labelW + 4, y, 100, editH, TRUE);
     
-    // Right column: Threads (at same y level)
-    MoveWindow(hLblThreads, rightColX, y - labelH - 2, colW, labelH, TRUE);
-    MoveWindow(hThreadsEdit, rightColX, y, colW, rowH, TRUE);
-    y += rowH + 20;
+    MoveWindow(hLblGpu, padding + labelW + 110, y, 70, labelH, TRUE);
+    MoveWindow(hGpuEdit, padding + labelW + 110 + 75, y, 80, editH, TRUE);
+    y += rowH + gapY;
 
-    // Generate button - positioned with more spacing
-    MoveWindow(hBtnNext, innerX, y, innerW, 38, TRUE);
+    // Port & Threads in same row
+    MoveWindow(hLblPort, padding, y, labelW, labelH, TRUE);
+    MoveWindow(hPortEdit, padding + labelW + 4, y, 80, editH, TRUE);
+    
+    MoveWindow(hLblThreads, padding + labelW + 110, y, 70, labelH, TRUE);
+    MoveWindow(hThreadsEdit, padding + labelW + 110 + 75, y, 80, editH, TRUE);
+    y += rowH + gapY;
+
+    // KV Cache K and V (side by side)
+    MoveWindow(hLblKvCacheK, padding, y, 80, labelH, TRUE);
+    MoveWindow(hKvCacheKCombo, padding + 85, y, 130, comboH, TRUE);
+    MoveWindow(hLblKvCacheV, padding + 225, y, 80, labelH, TRUE);
+    MoveWindow(hKvCacheVCombo, padding + 225 + 85, y, 130, comboH, TRUE);
+    y += rowH + gapY + 20;
+
+    // Buttons
+    MoveWindow(hBtnPrev, padding, y, 100, 32, TRUE);
+    MoveWindow(hBtnNext, W - padding - 100, y, 100, 32, TRUE);
 }
 
 /* ──────────────────────────────────────────────
@@ -3327,12 +3420,6 @@ static void OnPaint(HWND hwnd)
 
     FillRect(hdc, &rc, brBg);
 
-    DrawHeader(hdc, rc);
-    DrawCardFrame(hdc, rc);
-    
-    // Labels are now drawn via standard STATIC controls to ensure 
-    // mathematically perfect alignment with the layout engine.
-
     EndPaint(hwnd, &ps);
 }
 
@@ -3343,32 +3430,26 @@ static void CreateControls(HWND hwnd)
 {
     HINSTANCE hi = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
 
-    // Labels
+    // Labels - short and compact
     hLblServerType = CreateWindowA("STATIC", "Server Type", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblCommandType = CreateWindowA("STATIC", "Command Type", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblServer = CreateWindowA("STATIC", "Server Executable File", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblFolder = CreateWindowA("STATIC", "Models Directory", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblModel  = CreateWindowA("STATIC", "Target Model", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblCtx    = CreateWindowA("STATIC", "Context Size", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblServer = CreateWindowA("STATIC", "Server", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblFolder = CreateWindowA("STATIC", "Models Folder", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblModel  = CreateWindowA("STATIC", "Model", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblCtx    = CreateWindowA("STATIC", "Context", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblGpu    = CreateWindowA("STATIC", "GPU Layers", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblPort   = CreateWindowA("STATIC", "Port", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
     hLblThreads = CreateWindowA("STATIC", "Threads", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    // KV Cache K and V (side by side)
+    hLblKvCacheK = CreateWindowA("STATIC", "KV Cache K", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    hLblKvCacheV = CreateWindowA("STATIC", "KV Cache V", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
 
     // Server Type Combo
     hServerTypeCombo = CreateWindowA("COMBOBOX", "",
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
         0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Local - same device only");
-    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"LAN/IP - same Wi-Fi network");
+    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Local");
+    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"LAN");
     SendMessageA(hServerTypeCombo, CB_SETCURSEL, 0, 0);
-
-    // Command Type Combo
-    hCommandTypeCombo = CreateWindowA("COMBOBOX", "",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    SendMessageA(hCommandTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Llama Server");
-    SendMessageA(hCommandTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Llama CLI");
-    SendMessageA(hCommandTypeCombo, CB_SETCURSEL, 0, 0);
 
     // Inputs
     hServerEdit = CreateWindowA("EDIT", "",
@@ -3378,10 +3459,6 @@ static void CreateControls(HWND hwnd)
     hBtnServer = CreateWindowA("BUTTON", "Browse",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_SERVER, hi, NULL);
-
-    hFolderEdit = CreateWindowA("EDIT", "",
-        WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
 
     hBtnFolder = CreateWindowA("BUTTON", "Browse",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
@@ -3407,40 +3484,38 @@ static void CreateControls(HWND hwnd)
         WS_CHILD | WS_VISIBLE | ES_NUMBER | WS_BORDER,
         0, 0, 0, 0, hwnd, NULL, hi, NULL);
 
+    /* KV Cache K Type Combo */
+    hKvCacheKCombo = CreateWindowA("COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
+        0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"F16");
+    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q8_0");
+    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_0");
+    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_1");
+    SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 0, 0);
+
+    /* KV Cache V Type Combo */
+    hKvCacheVCombo = CreateWindowA("COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
+        0, 0, 0, 0, hwnd, NULL, hi, NULL);
+    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"F16");
+    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q8_0");
+    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_0");
+    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_1");
+    SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 0, 0);
+
     /* Output controls */
     hOutputEdit = CreateWindowA("EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_HSCROLL,
         0, 0, 0, 0, hwnd, NULL, hi, NULL);
 
-    hBtnPrev = CreateWindowA("BUTTON", "Previous",
+    hBtnPrev = CreateWindowA("BUTTON", "Prev",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PREV, hi, NULL);
 
-    hBtnNext = CreateWindowA("BUTTON", "Save Setup",
+    hBtnNext = CreateWindowA("BUTTON", "Next",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hi, NULL);
-
-    hBtnGenerate = CreateWindowA("BUTTON", "Generate",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_GENERATE, hi, NULL);
-
-    hBtnCopy = CreateWindowA("BUTTON", "Copy",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_COPY, hi, NULL);
-
-    // Apply Fonts
-    HWND ctrls[] = { hServerTypeCombo, hCommandTypeCombo, hServerEdit, hFolderEdit, hModelCombo, hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit, hOutputEdit };
-    for (int i = 0; i < (int)(sizeof(ctrls) / sizeof(ctrls[0])); i++) SetCtlFont(ctrls[i], hFontBody);
-
-    HWND labels[] = { hLblServerType, hLblCommandType, hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads };
-    for (int i = 0; i < (int)(sizeof(labels) / sizeof(labels[0])); i++) SetCtlFont(labels[i], hFontLabel);
-
-    SetCtlFont(hBtnServer, hFontBody);
-    SetCtlFont(hBtnFolder, hFontBody);
-    SetCtlFont(hBtnNext, hFontBold);
-
-    ShowOnlyOnPage(hwnd);
-    LayoutControls(hwnd);
 }
 
 /* ──────────────────────────────────────────────
@@ -3763,9 +3838,61 @@ static int RunCli(int argc, char **argv)
         return 1;
     }
 
+    if (lstrcmpiA(argv[1], "llama") == 0) {
+        AttachConsoleStreams();
+        int i;
+        for (i = 2; i < argc; i++) {
+            if (lstrcmpiA(argv[i], "--dir") == 0 && i + 1 < argc) {
+                lstrcpynA(sLlamaCppPath, argv[i + 1], sizeof(sLlamaCppPath));
+                if (sConfigPath[0]) {
+                    WritePrivateProfileStringA("paths", "llama_cpp_path", sLlamaCppPath, sConfigPath);
+                    
+                    /* Also update server path */
+                    {
+                        WIN32_FIND_DATAA findData;
+                        HANDLE hFind;
+                        char searchPath[MAX_PATH];
+                        snprintf(searchPath, sizeof(searchPath), "%s\\*llama-server.exe", sLlamaCppPath);
+                        hFind = FindFirstFileA(searchPath, &findData);
+                        if (hFind != INVALID_HANDLE_VALUE) {
+                            FindClose(hFind);
+                            snprintf(sServer, sizeof(sServer), "%s\\%s", sLlamaCppPath, findData.cFileName);
+                            WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
+                        }
+                    }
+                }
+                printf("llama.cpp folder updated to: %s\n", sLlamaCppPath);
+                return 0;
+            }
+        }
+        /* Show current llama.cpp path */
+        if (!LoadConfigFromDisk()) {
+            fprintf(stderr, "Valora is not configured. Run 'valora setup' first.\n");
+            return 1;
+        }
+        if (sLlamaCppPath[0]) {
+            printf("Current llama.cpp folder: %s\n", sLlamaCppPath);
+            printf("Usage: valora llama --dir <path> to change\n");
+        } else {
+            printf("llama.cpp not configured. Run 'valora setup --llama.cpp' first.\n");
+        }
+        return 0;
+    }
+
     AttachConsoleStreams();
 
     if (lstrcmpiA(argv[1], "models") == 0 || lstrcmpiA(argv[1], "list") == 0) {
+        int i;
+        for (i = 2; i < argc; i++) {
+            if (lstrcmpiA(argv[i], "--dir") == 0 && i + 1 < argc) {
+                lstrcpynA(sFolder, argv[i + 1], sizeof(sFolder));
+                if (sConfigPath[0]) {
+                    WritePrivateProfileStringA("paths", "models_folder", sFolder, sConfigPath);
+                }
+                printf("Models folder updated to: %s\n", sFolder);
+                return 0;
+            }
+        }
         if (EnsureCliConfigReady(FALSE) != 0)
             return 1;
         return PrintModels();
@@ -3860,6 +3987,10 @@ static int RunCli(int argc, char **argv)
         BuildRunCommand(sCommand, sizeof(sCommand), NULL);
         if (sCustomCtx[0])
             printf("Using custom context length: %s\n", sCustomCtx);
+
+        if (enableDebug) {
+            printf("\n--- DEBUG: Command being executed ---\n%s\n--- END DEBUG ---\n\n", sCommand);
+        }
 
         {
             ULONGLONG availRAM = GetAvailableRamMB();
@@ -5141,18 +5272,114 @@ static int StartServerForChat(const char *customCtx) {
     char modelPath[MAX_PATH * 2];
     char projectorPath[MAX_PATH * 2];
     char ctx[32], gpu[32], threads[32];
+    char selectedModel[256];
+    int selResult;
+    ULONGLONG availRAM;
+    ULONGLONG totalRAM;
+    int modelMB;
+    int safety;
     char command[MAX_CMD];
+    char kvCacheK[16], kvCacheV[16];
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-    char selectedModel[MAX_PATH];
-    int selResult;
-    SafetyDecision safety;
-    ULONGLONG availRAM, totalRAM;
-    int modelMB;
+
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads), kvCacheK, sizeof(kvCacheK));
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
     
-    if (IsServerRunning()) {
-        printf("\x1b[90mServer already running.\x1b[0m\n");
-        return 0;
+    printf("\x1b[32mContext:\x1b[0m %s\n", ctx);
+    printf("\x1b[32mGPU Layers:\x1b[0m %s\n", gpu);
+    printf("\x1b[32mThreads:\x1b[0m %s\n", threads);
+    printf("\x1b[32mKV Cache K:\x1b[0m %s\n", kvCacheK);
+    printf("\x1b[32mKV Cache V:\x1b[0m %s\n\n", kvCacheV);
+    
+    if (EnsureCliConfigReady(FALSE) != 0)
+        return -1;
+    
+    SafetyInit();
+    
+    printf("\x1b[36m=== Select Model for Chat ===\x1b[0m\n\n");
+    selResult = RunInteractiveModelSelector(selectedModel, sizeof(selectedModel));
+    
+    if (selResult < 0) {
+        printf("Model selection cancelled.\n");
+        return -1;
+    }
+    
+    lstrcpynA(sSelectedModel, selectedModel, sizeof(sSelectedModel));
+    
+    {
+        char projector[MAX_PATH] = "";
+        if (strcmp(GetModelTypeLabel(sSelectedModel), "Vision") == 0) {
+            FindMatchingProjector(sSelectedModel, projector, sizeof(projector));
+            if (projector[0])
+                lstrcpynA(projectorPath, projector, sizeof(projectorPath));
+            else
+                projectorPath[0] = '\0';
+        } else {
+            projectorPath[0] = '\0';
+        }
+    }
+    
+    safety = CheckLoadSafety(sSelectedModel, projectorPath[0] ? projectorPath : NULL, 2048, -1);
+    
+    if (safety == SAFETY_REFUSE) {
+        PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+            "Suggestion: Try a smaller model or close other applications.");
+        return -1;
+    }
+    
+    if (safety == SAFETY_KILL) {
+        TerminateActiveProcess();
+        PrintSafetyRefusal(sLastSafetyReason, sSelectedModel,
+            "Process terminated. Try again after closing other apps.");
+        return -1;
+    }
+    
+    if (safety == SAFETY_ALLOW_WITH_WARNINGS) {
+        printf("\n\x1b[33m[SAFETY WARNING] %s - proceeding with caution\x1b[0m\n\n", sLastSafetyReason);
+    }
+    
+    BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads), kvCacheK, sizeof(kvCacheK));
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
+    
+    if (customCtx && customCtx[0])
+        lstrcpynA(ctx, customCtx, sizeof(ctx));
+    
+    availRAM = GetAvailableRamMB();
+    totalRAM = GetSystemRamMB();
+    modelMB = GetModelSizeMB(sSelectedModel);
+
+    /* Auto-disable tools for small models (< 500MB ~= 350M-500M params) that don't support function calling */
+    if (modelMB > 0 && modelMB < 500) {
+        sToolsForcedDisabled = TRUE;
+        printf("\n\x1b[90m[Auto-disabled tools for small model]\x1b[0m\n\n");
+    } else {
+        sToolsForcedDisabled = FALSE;
+    }
+    
+    ClearConsole();
+    
+    printf("\x1b[36m========================================\x1b[0m\n");
+    printf("\x1b[36m       VALORA SERVER STARTING\x1b[0m\n");
+    printf("\x1b[36m========================================\x1b[0m\n\n");
+    printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
+    printf("\x1b[32mContext:\x1b[0m %s\n", ctx);
+    printf("\x1b[32mGPU Layers:\x1b[0m %s\n", gpu);
+    printf("\x1b[32mThreads:\x1b[0m %s\n", threads);
+    printf("\x1b[32mKV Cache K:\x1b[0m %s\n", kvCacheK);
+    printf("\x1b[32mKV Cache V:\x1b[0m %s\n\n", kvCacheV);
+    printf("\x1b[90mRAM: %llu/%llu MB | Model: %d MB\x1b[0m\n", availRAM, totalRAM, modelMB);
+    printf("\x1b[90mServer: http://127.0.0.1:8000\x1b[0m\n\n");
+    
+    if (projectorPath[0]) {
+        snprintf(command, sizeof(command),
+            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1 --cache-type-k %s --cache-type-v %s",
+            sServer, modelPath, projectorPath, ctx, gpu, threads, kvCacheK, kvCacheV);
+    } else {
+        snprintf(command, sizeof(command),
+            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s --port 8000 --host 127.0.0.1 --cache-type-k %s --cache-type-v %s",
+            sServer, modelPath, ctx, gpu, threads, kvCacheK, kvCacheV);
     }
     
     if (EnsureCliConfigReady(FALSE) != 0)
@@ -5203,9 +5430,8 @@ static int StartServerForChat(const char *customCtx) {
     }
     
     BuildModelPath(modelPath, sizeof(modelPath), sSelectedModel);
-    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads));
-    
-    if (customCtx && customCtx[0])
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads), kvCacheK, sizeof(kvCacheK));
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
         lstrcpynA(ctx, customCtx, sizeof(ctx));
     
         availRAM = GetAvailableRamMB();
