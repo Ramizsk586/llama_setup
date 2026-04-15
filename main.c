@@ -159,13 +159,13 @@ typedef struct {
 } LlamaCppBuild;
 
 static OSType DetectOS(void);
-static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count);
+static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count, const char *buildPattern);
 static void FreeLlamaCppBuilds(LlamaCppBuild *builds, int count);
 static int SelectBuildMenu(LlamaCppBuild *builds, int count);
-static int DownloadBuild(const char *url, const char *destPath);
 static int ExtractZip(const char *zipPath, const char *destDir);
 static BOOL VerifyLlamaCppInstall(const char *installPath);
 static int SetupLlamaCpp(void);
+static int UpdateLlamaCpp(void);
 
 /* ──────────────────────────────────────────────
    Safety Controller
@@ -2018,7 +2018,7 @@ static const char* GetOSFilterPattern(OSType os)
     }
 }
 
-static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
+static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count, const char *buildPattern)
 {
     char command[MAX_CMD];
     char tempFile[MAX_PATH];
@@ -2109,29 +2109,28 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
         /* Look for \"name\" field in an asset - handle both formats */
         nameStart = strstr(p, "\"name\":");
         if (!nameStart) break;
-        nameStart += 7;
-        while (*nameStart == ' ' || *nameStart == '\t') nameStart++;
-        if (*nameStart != '"') { p = nameStart + 1; continue; }
+        nameStart = strchr(nameStart + 7, '\"');
+        if (!nameStart) break;
         nameStart++;
-        nameEnd = strchr(nameStart, '"');
+        nameEnd = strstr(nameStart, "\"");
         if (!nameEnd) break;
         
-        /* Look for \"browser_download_url\" */
-        browserUrlStart = strstr(nameEnd, "\"browser_download_url\":");
+        sizeStart = strstr(nameEnd, "\"size\":");
+        if (!sizeStart) { p = nameEnd + 1; continue; }
+        sizeStart += 6;
+        while (*sizeStart == ' ' || *sizeStart == '\t') sizeStart++;
+        if (*sizeStart == ':') sizeStart++;
+        while (*sizeStart == ' ' || *sizeStart == '\t') sizeStart++;
+        sizeEnd = sizeStart;
+        while (*sizeEnd != ',' && *sizeEnd != '}' && *sizeEnd != '\0') sizeEnd++;
+        
+        browserUrlStart = strstr(sizeStart, "\"browser_download_url\":");
         if (!browserUrlStart) break;
-        browserUrlStart = strchr(browserUrlStart, '\"');
+        browserUrlStart = strchr(browserUrlStart + 22, '\"');
         if (!browserUrlStart) break;
-        browserUrlStart++; /* skip opening quote */
+        browserUrlStart++;
         browserUrlEnd = strstr(browserUrlStart, "\"");
         if (!browserUrlEnd) break;
-        
-        /* Look for \"size\" */
-        sizeStart = strstr(browserUrlEnd, "\"size\":");
-        if (!sizeStart) break;
-        sizeStart += 7;
-        sizeEnd = strstr(sizeStart, ",");
-        if (!sizeEnd) sizeEnd = strstr(sizeStart, "}");
-        if (!sizeEnd) break;
         
         /* Extract and validate build name */
         {
@@ -2143,6 +2142,13 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
             
             /* Check if this build matches our OS */
             if (strstr(buildName, osFilter) != NULL) {
+                
+                /* If buildPattern specified, filter by it (for updates) */
+                if (buildPattern && !strstr(buildName, buildPattern)) {
+                    p = browserUrlEnd + 1;
+                    continue;
+                }
+                
                 /* Check if it's a binary archive (not source) */
                 BOOL isValid = (
                     strstr(buildName, "bin-") != NULL ||
@@ -2172,7 +2178,8 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
                         if (sizeLen >= sizeof(sizeStr)) sizeLen = sizeof(sizeStr) - 1;
                         memcpy(sizeStr, sizeStart, sizeLen);
                         sizeStr[sizeLen] = '\0';
-                        tempBuilds[buildIdx].size = atoi(sizeStr) / (1024*1024);
+                        long long sizeBytes = (long long)strtod(sizeStr, NULL);
+                        tempBuilds[buildIdx].size = (int)(sizeBytes / (1024*1024));
                     }
                     
                     /* Determine if CPU or Vulkan */
@@ -2281,17 +2288,89 @@ static int SelectBuildMenu(LlamaCppBuild *builds, int count)
     }
 }
 
-static int DownloadBuild(const char *url, const char *destPath)
+static int DownloadBuildWithProgress(const char *url, const char *destPath)
 {
+    char scriptPath[MAX_PATH];
+    char tempPath[MAX_PATH];
+    FILE *fp;
     char command[MAX_CMD];
-    
-    printf("Downloading: %s\n", destPath);
-    
+    int result;
+
+    if (!GetTempPathA(sizeof(tempPath), tempPath)) {
+        fprintf(stderr, "Failed to get temp path.\n");
+        return 1;
+    }
+
+    snprintf(scriptPath, sizeof(scriptPath), "%svalora_llama_dl.ps1", tempPath);
+
+    fp = fopen(scriptPath, "w");
+    if (!fp) {
+        fprintf(stderr, "Failed to create download script.\n");
+        return 1;
+    }
+
+    fputs("$ErrorActionPreference = 'Stop'\n", fp);
+    fputs("$ProgressPreference = 'SilentlyContinue'\n", fp);
+    fprintf(fp, "$url  = '%s'\n", url);
+    fprintf(fp, "$dest = '%s'\n", destPath);
+    fputs("\n", fp);
+    fputs("try {\n", fp);
+    fputs("  if (Test-Path $dest) { Remove-Item $dest -Force }\n", fp);
+    fputs("\n", fp);
+    fputs("  $head = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing\n", fp);
+    fputs("  $totalBytes = [Int64]$head.Headers['Content-Length']\n", fp);
+    fputs("  if ($totalBytes -le 0) { throw 'Could not determine file size' }\n", fp);
+    fputs("  $totalMB = [Math]::Floor($totalBytes / 1MB)\n", fp);
+    fputs("  Write-Host \"Downloading $totalMB MB...\"\n", fp);
+    fputs("\n", fp);
+    fputs("  Add-Type -AssemblyName System.Net.Http\n", fp);
+    fputs("  $client = [System.Net.Http.HttpClient]::new()\n", fp);
+    fputs("  $client.DefaultRequestHeaders.Add('User-Agent', 'Valora/1.0')\n", fp);
+    fputs("  $resp = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()\n", fp);
+    fputs("  $resp.EnsureSuccessStatusCode()\n", fp);
+    fputs("  $netStream  = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()\n", fp);
+    fputs("  $fileStream = [System.IO.File]::OpenWrite($dest)\n", fp);
+    fputs("  $buffer     = New-Object byte[] 65536\n", fp);
+    fputs("  $downloaded = [Int64]0\n", fp);
+    fputs("\n", fp);
+    fputs("  while (($read = $netStream.Read($buffer, 0, $buffer.Length)) -gt 0) {\n", fp);
+    fputs("    $fileStream.Write($buffer, 0, $read)\n", fp);
+    fputs("    $downloaded += $read\n", fp);
+    fputs("    $pct    = [Math]::Min(100, [int](($downloaded * 100) / $totalBytes))\n", fp);
+    fputs("    $filled = [Math]::Floor(40 * $pct / 100)\n", fp);
+    fputs("    $bar    = ('#' * $filled).PadRight(40, '-')\n", fp);
+    fputs("    $dlMB   = [Math]::Floor($downloaded / 1MB)\n", fp);
+    fputs("    Write-Host -NoNewline \"`r[$bar] $($pct.ToString('00'))% ($dlMB / $totalMB MB)\"\n", fp);
+    fputs("  }\n", fp);
+    fputs("\n", fp);
+    fputs("  $fileStream.Close()\n", fp);
+    fputs("  $netStream.Close()\n", fp);
+    fputs("  $client.Dispose()\n", fp);
+    fputs("\n", fp);
+    fputs("  $fileSize = (Get-Item $dest).Length\n", fp);
+    fputs("  if ($fileSize -lt $totalBytes) { throw \"Incomplete download: got $fileSize of $totalBytes bytes\" }\n", fp);
+    fputs("\n", fp);
+    fputs("  Write-Host ''\n", fp);
+    fputs("  Write-Host 'Download complete!' -ForegroundColor Green\n", fp);
+    fputs("  exit 0\n", fp);
+    fputs("} catch {\n", fp);
+    fputs("  Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red\n", fp);
+    fputs("  try { if ($fileStream) { $fileStream.Close() } } catch {}\n", fp);
+    fputs("  if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }\n", fp);
+    fputs("  exit 1\n", fp);
+    fputs("}\n", fp);
+
+    fclose(fp);
+
     snprintf(command, sizeof(command),
-        "powershell.exe -NoProfile -Command \"Invoke-WebRequest -Uri '%s' -OutFile '%s'\"",
-        url, destPath);
-    
-    return RunChildProcess(command);
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\"",
+        scriptPath);
+
+    result = RunChildProcess(command);
+
+    DeleteFileA(scriptPath);
+
+    return result;
 }
 
 static int ExtractZip(const char *zipPath, const char *destDir)
@@ -2376,7 +2455,7 @@ static int SetupLlamaCpp(void)
     /* Fetch releases */
     printf("Fetching latest releases from GitHub...\n");
     
-    if (FetchLlamaCppReleases(&builds, &buildCount) != 0) {
+    if (FetchLlamaCppReleases(&builds, &buildCount, NULL) != 0) {
         fprintf(stderr, "Failed to fetch releases.\n");
         return 1;
     }
@@ -2430,7 +2509,7 @@ static int SetupLlamaCpp(void)
     printf("  Downloading...\n");
     printf("================================================================\n\n");
     
-    result = DownloadBuild(builds[selectedIdx].downloadUrl, zipPath);
+    result = DownloadBuildWithProgress(builds[selectedIdx].downloadUrl, zipPath);
     if (result != 0) {
         fprintf(stderr, "Download failed with exit code %d\n", result);
         DeleteFileA(zipPath);
@@ -2478,11 +2557,14 @@ static int SetupLlamaCpp(void)
                 if (len < sizeof(buildPattern)) {
                     memcpy(buildPattern, osStart, len);
                     buildPattern[len] = '\0';
+                    
+                    /* Save build pattern for later updates */
+                    if (sConfigPath[0]) {
+                        WritePrivateProfileStringA("paths", "llama_cpp_build", buildPattern, sConfigPath);
+                    }
                 }
             }
         }
-        lstrcpynA(buildPattern, builds[selectedIdx].name, sizeof(buildPattern));
-        WritePrivateProfileStringA("paths", "llama_cpp_build", buildPattern, sConfigPath);
     }
     
     /* Check if we need to update config */
@@ -2492,9 +2574,8 @@ static int SetupLlamaCpp(void)
         WritePrivateProfileStringA("paths", "llama_cpp_path", sLlamaCppPath, sConfigPath);
     }
     
-    /* Update server path if not already set */
-    if (!sServer[0]) {
-        /* Try to find the executable */
+    /* Update server path to new installation */
+    {
         WIN32_FIND_DATAA findData;
         HANDLE hFind;
         char searchPath[MAX_PATH];
@@ -2524,6 +2605,141 @@ static int SetupLlamaCpp(void)
     return 0;
 }
 
+static int UpdateLlamaCpp(void)
+{
+    LlamaCppBuild *builds = NULL;
+    int buildCount = 0;
+    int selectedIdx = -1;
+    char installDir[MAX_PATH];
+    char zipPath[MAX_PATH];
+    int result = 0;
+    
+    printf("\n================================================================\n");
+    printf("  llama.cpp Update\n");
+    printf("================================================================\n\n");
+    
+    /* Load config to get current llama.cpp path */
+    if (!LoadConfigFromDisk()) {
+        fprintf(stderr, "Valora is not configured. Run 'valora setup --llama.cpp' first.\n");
+        return 1;
+    }
+    
+    if (!sLlamaCppPath[0]) {
+        fprintf(stderr, "llama.cpp path not found in config. Run 'valora setup --llama.cpp' first.\n");
+        return 1;
+    }
+    
+    printf("Fetching latest releases from GitHub...\n\n");
+    
+    /* Fetch all releases - let user choose any build */
+    if (FetchLlamaCppReleases(&builds, &buildCount, NULL) != 0) {
+        fprintf(stderr, "Failed to fetch releases.\n");
+        return 1;
+    }
+    
+    if (buildCount == 0) {
+        fprintf(stderr, "No builds found for Windows.\n");
+        return 1;
+    }
+    
+    printf("Found %d matching build(s)\n\n", buildCount);
+    
+    /* Let user select the build */
+    selectedIdx = SelectBuildMenu(builds, buildCount);
+    if (selectedIdx < 0) {
+        printf("\nSelection cancelled.\n");
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 0;
+    }
+    
+    printf("\nSelected: %s\n", builds[selectedIdx].name);
+    
+    /* Use existing install directory */
+    lstrcpynA(installDir, sLlamaCppPath, sizeof(installDir));
+    
+    /* Delete existing installation */
+    printf("\n================================================================\n");
+    printf("  Removing old installation...\n");
+    printf("================================================================\n\n");
+    
+    {
+        char command[MAX_PATH * 2];
+        snprintf(command, sizeof(command),
+            "powershell.exe -NoProfile -Command \"Remove-Item -Path '%s\\*' -Recurse -Force\"",
+            installDir);
+        result = RunChildProcess(command);
+    }
+    
+    /* Download the new build */
+    GetTempFileNameA(".", "valora_llama_", 0, zipPath);
+    lstrcatA(zipPath, ".zip");
+    
+    printf("\n================================================================\n");
+    printf("  Downloading...\n");
+    printf("================================================================\n\n");
+    
+    result = DownloadBuildWithProgress(builds[selectedIdx].downloadUrl, zipPath);
+    if (result != 0) {
+        fprintf(stderr, "Download failed with exit code %d\n", result);
+        DeleteFileA(zipPath);
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Extract the build */
+    printf("\n================================================================\n");
+    printf("  Extracting...\n");
+    printf("================================================================\n\n");
+    
+    result = ExtractZip(zipPath, installDir);
+    DeleteFileA(zipPath);
+    
+    if (result != 0) {
+        fprintf(stderr, "Extraction failed with exit code %d\n", result);
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Verify installation */
+    printf("\n================================================================\n");
+    printf("  Verifying...\n");
+    printf("================================================================\n\n");
+    
+    if (!VerifyLlamaCppInstall(installDir)) {
+        fprintf(stderr, "Installation verification failed.\n");
+        FreeLlamaCppBuilds(builds, buildCount);
+        return 1;
+    }
+    
+    /* Update server path to new installation */
+    {
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind;
+        char searchPath[MAX_PATH];
+        
+        snprintf(searchPath, sizeof(searchPath), "%s\\*llama-server.exe", installDir);
+        hFind = FindFirstFileA(searchPath, &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            FindClose(hFind);
+            snprintf(sServer, sizeof(sServer), "%s\\%s", installDir, findData.cFileName);
+            
+            if (sConfigPath[0]) {
+                WritePrivateProfileStringA("paths", "server", sServer, sConfigPath);
+            }
+        }
+    }
+    
+    FreeLlamaCppBuilds(builds, buildCount);
+    
+    printf("\n================================================================\n");
+    printf("  \x1b[32mUpdate completed successfully!\x1b[0m\n");
+    printf("================================================================\n\n");
+    
+    printf("llama.cpp updated at: %s\n\n", sLlamaCppPath);
+    
+    return 0;
+}
+
 static int PrintUsage(void)
 {
     printf("\x1b[36mValora CLI - Local AI Model Manager\x1b[0m\n\n");
@@ -2536,6 +2752,7 @@ static int PrintUsage(void)
     printf("\n\x1b[33mSetup:\x1b[0m\n");
     printf("  valora setup --llama.cpp  Setup llama.cpp from GitHub releases\n");
     printf("  valora setup --models     Download models from Hugging Face\n");
+    printf("  valora update --llama.cpp Update installed llama.cpp to latest\n");
     
     printf("\n\x1b[33mModel Management:\x1b[0m\n");
     printf("  valora list           List configured models (alias: valora models)\n");
@@ -3535,6 +3752,15 @@ static int RunCli(int argc, char **argv)
         }
         HideStandaloneConsoleWindow();
         return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+    }
+    
+    if (lstrcmpiA(argv[1], "update") == 0) {
+        if (argc > 2 && lstrcmpiA(argv[2], "--llama.cpp") == 0) {
+            AttachConsoleStreams();
+            return UpdateLlamaCpp();
+        }
+        fprintf(stderr, "Usage: valora update --llama.cpp\n");
+        return 1;
     }
 
     AttachConsoleStreams();
