@@ -2026,8 +2026,8 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
     DWORD jsonSize = 0;
     HANDLE hFile;
     DWORD bytesRead;
-    int i, buildIdx = 0;
-    char *tagStart, *tagEnd, *nameStart, *nameEnd;
+    int buildIdx = 0;
+    char *nameStart, *nameEnd;
     char *browserUrlStart, *browserUrlEnd;
     char *sizeStart, *sizeEnd;
     char *p;
@@ -2055,6 +2055,7 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
     
     /* Create temp file for JSON response */
     GetTempFileNameA(".", "valora_releases_", 0, tempFile);
+    DeleteFileA(tempFile);
     lstrcatA(tempFile, ".json");
     
     /* Fetch JSON from GitHub API */
@@ -2108,10 +2109,11 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
         /* Look for \"name\" field in an asset - handle both formats */
         nameStart = strstr(p, "\"name\":");
         if (!nameStart) break;
-        nameStart = strchr(nameStart, '\"');
-        if (!nameStart) break;
-        nameStart++; /* skip opening quote */
-        nameEnd = strstr(nameStart, "\"");
+        nameStart += 7;
+        while (*nameStart == ' ' || *nameStart == '\t') nameStart++;
+        if (*nameStart != '"') { p = nameStart + 1; continue; }
+        nameStart++;
+        nameEnd = strchr(nameStart, '"');
         if (!nameEnd) break;
         
         /* Look for \"browser_download_url\" */
@@ -2139,12 +2141,8 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
             memcpy(buildName, nameStart, nameLen);
             buildName[nameLen] = '\0';
             
-            /* DEBUG: Show what build name was extracted */
-            printf("DEBUG: Extracted build name: '%s'\n", buildName);
-            
             /* Check if this build matches our OS */
             if (strstr(buildName, osFilter) != NULL) {
-                printf("DEBUG: Build '%s' matches OS filter '%s'\n", buildName, osFilter);
                 /* Check if it's a binary archive (not source) */
                 BOOL isValid = (
                     strstr(buildName, "bin-") != NULL ||
@@ -2155,7 +2153,7 @@ static int FetchLlamaCppReleases(LlamaCppBuild **builds, int *count)
                     strstr(buildName, ".tgz") != NULL
                 );
                 
-                if (isValid && buildIdx < 64) {
+                if (isValid && buildIdx < capacity) {
                     /* Extract URL */
                     int urlLen = (int)(browserUrlEnd - browserUrlStart);
                     if (urlLen >= sizeof(tempBuilds[buildIdx].downloadUrl)) {
@@ -2231,21 +2229,30 @@ static int SelectBuildMenu(LlamaCppBuild *builds, int count)
     int ch;
     DWORD mode;
     HANDLE hConsole;
+    COORD menuOrigin;
     
     if (count <= 0) return -1;
     
-    /* Get console handle */
-    hConsole = GetStdHandle(STD_INPUT_HANDLE);
-    if (hConsole == INVALID_HANDLE_VALUE) return -1;
+    /* Get console handles */
+    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hInput == INVALID_HANDLE_VALUE || hOutput == INVALID_HANDLE_VALUE) return -1;
     
     /* Save and modify console mode */
-    GetConsoleMode(hConsole, &mode);
-    SetConsoleMode(hConsole, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+    GetConsoleMode(hInput, &mode);
+    SetConsoleMode(hInput, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
     
     printf("\n=== Select llama.cpp Build ===\n\n");
     printf("\x1b[90mUse UP/DOWN arrow keys to navigate, ENTER to select, ESC to cancel\x1b[0m\n\n");
     
     PrintBuildMenu(selectedIndex, builds, count);
+    
+    {
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        GetConsoleScreenBufferInfo(hOutput, &csbi);
+        menuOrigin = csbi.dwCursorPosition;
+        menuOrigin.Y -= count;
+    }
     
     /* Input loop */
     while (1) {
@@ -2255,19 +2262,20 @@ static int SelectBuildMenu(LlamaCppBuild *builds, int count)
             if (ch == 72) {  /* Up arrow */
                 previousIndex = selectedIndex;
                 selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : count - 1;
-                printf("\r                \r");
-                PrintBuildMenu(selectedIndex, builds, count);
             } else if (ch == 80) {  /* Down arrow */
                 previousIndex = selectedIndex;
                 selectedIndex = (selectedIndex < count - 1) ? selectedIndex + 1 : 0;
-                printf("\r                \r");
+            }
+            
+            if (previousIndex != selectedIndex) {
+                SetConsoleCursorPosition(hOutput, menuOrigin);
                 PrintBuildMenu(selectedIndex, builds, count);
             }
         } else if (ch == 13) {  /* Enter */
-            SetConsoleMode(hConsole, mode);
+            SetConsoleMode(hInput, mode);
             return selectedIndex;
         } else if (ch == 27) {  /* Escape */
-            SetConsoleMode(hConsole, mode);
+            SetConsoleMode(hInput, mode);
             return -1;
         }
     }
@@ -2367,17 +2375,6 @@ static int SetupLlamaCpp(void)
     
     /* Fetch releases */
     printf("Fetching latest releases from GitHub...\n");
-    
-    /* Debug: Show what OS filter we're using */
-    {
-        OSType detectedOS;
-        const char *osFilter;
-        detectedOS = DetectOS();
-        osFilter = GetOSFilterPattern(detectedOS);
-        printf("DEBUG: Detected OS: %s, Filter pattern: '%s'\n", GetOSName(detectedOS), osFilter);
-        printf("DEBUG: Looking for build names containing '%s'...\n", osFilter);
-        printf("DEBUG: Example Windows build: llama-b3088-bin-win-x64.zip\n");
-    }
     
     if (FetchLlamaCppReleases(&builds, &buildCount) != 0) {
         fprintf(stderr, "Failed to fetch releases.\n");
