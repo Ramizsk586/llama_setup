@@ -2466,6 +2466,25 @@ static int SetupLlamaCpp(void)
     /* Save path to config */
     lstrcpynA(sLlamaCppPath, installDir, sizeof(sLlamaCppPath));
     
+    /* Save the build name pattern for later updates */
+    {
+        char buildPattern[64];
+        const char *p = strstr(builds[selectedIdx].name, "-bin-");
+        if (p) {
+            const char *osStart = p + 5;
+            const char *osEnd = strchr(osStart, '-');
+            if (osEnd) {
+                int len = (int)(osEnd - osStart);
+                if (len < sizeof(buildPattern)) {
+                    memcpy(buildPattern, osStart, len);
+                    buildPattern[len] = '\0';
+                }
+            }
+        }
+        lstrcpynA(buildPattern, builds[selectedIdx].name, sizeof(buildPattern));
+        WritePrivateProfileStringA("paths", "llama_cpp_build", buildPattern, sConfigPath);
+    }
+    
     /* Check if we need to update config */
     if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath))) {
         fprintf(stderr, "Warning: Could not build config path. Path saved in memory only.\n");
@@ -2511,9 +2530,12 @@ static int PrintUsage(void)
     
     printf("\x1b[33mGeneral:\x1b[0m\n");
     printf("  valora setup           Open the GUI setup window\n");
-    printf("  valora setup --llama.cpp  Setup llama.cpp from GitHub releases\n");
     printf("  valora help           Show this help message\n");
     printf("  valora version        Show version information\n");
+    
+    printf("\n\x1b[33mSetup:\x1b[0m\n");
+    printf("  valora setup --llama.cpp  Setup llama.cpp from GitHub releases\n");
+    printf("  valora setup --models     Download models from Hugging Face\n");
     
     printf("\n\x1b[33mModel Management:\x1b[0m\n");
     printf("  valora list           List configured models (alias: valora models)\n");
