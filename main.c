@@ -934,12 +934,14 @@ static int ScoreProjectorCandidate(const char *modelName, const char *candidateN
 static BOOL FindMatchingProjector(const char *modelName, char *projectorName, int projectorNameLen)
 {
     char pattern[MAX_PATH * 2];
+    char modelBasePath[MAX_PATH];
     WIN32_FIND_DATAA fd;
     HANDLE hFind;
     int bestScore = -1;
     ULONGLONG bestSize = 0;
     ULONGLONG fallbackSize = 0;
     char fallbackName[MAX_PATH] = "";
+    const char *basePath;
 
     if (!projectorName || projectorNameLen <= 0) return FALSE;
     projectorName[0] = '\0';
@@ -947,7 +949,17 @@ static BOOL FindMatchingProjector(const char *modelName, char *projectorName, in
     if (!sFolder[0] || !modelName || !*modelName)
         return FALSE;
 
-    snprintf(pattern, sizeof(pattern), "%s\\*.gguf", sFolder);
+    basePath = sFolder;
+    if (strchr(modelName, '\\')) {
+        const char *lastBackslash = strrchr(modelName, '\\');
+        size_t baseLen = (size_t)(lastBackslash - modelName);
+        if (baseLen > 0 && baseLen < sizeof(modelBasePath) - 1) {
+            snprintf(modelBasePath, sizeof(modelBasePath), "%s\\%.*s", sFolder, (int)baseLen, modelName);
+            basePath = modelBasePath;
+        }
+    }
+
+    snprintf(pattern, sizeof(pattern), "%s\\*.gguf", basePath);
     hFind = FindFirstFileA(pattern, &fd);
     if (hFind == INVALID_HANDLE_VALUE)
         return FALSE;
@@ -1082,22 +1094,57 @@ static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *g
 static const char* animationFrames[] = {"-", "\\", "|", "/"};
 static int animFrame = 0;
 
-/* Get available VRAM in MB */
-static int GetAvailableVRAM(void)
+/* Get GPU VRAM info using WMI - returns total bytes */
+static ULONGLONG GetGpuMemoryBytes(void)
 {
-    /* Try to get GPU memory from WMI */
-    MEMORYSTATUSEX statex;
-    statex.dwLength = sizeof(statex);
-    
-    if (GlobalMemoryStatusEx(&statex)) {
-        ULONGLONG availMB = statex.ullAvailPhys / (1024 * 1024);
-        if (availMB > 8192) return 16384;
-        if (availMB > 4096) return 8192;
-        if (availMB > 2048) return 4096;
-        if (availMB > 1024) return 2048;
-        return 1024;
+    FILE *fp;
+    char output[512] = "";
+    ULONGLONG bytes = 0;
+
+    fp = _popen("powershell.exe -NoProfile -c \"(Get-CimInstance Win32_VideoController | Select -First 1).AdapterRAM\"", "r");
+    if (fp) {
+        if (fgets(output, sizeof(output), fp)) {
+            char *p, *end;
+            for (p = output; *p && (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t'); p++);
+            for (end = p; *end && (*end >= '0' && *end <= '9'); end++);
+            *end = '\0';
+            bytes = (ULONGLONG)atoll(p);
+        }
+        _pclose(fp);
     }
-    return 2048;
+
+    return bytes;
+}
+
+static int GetTotalVRAM(void)
+{
+    ULONGLONG bytes = GetGpuMemoryBytes();
+    return (int)(bytes / (1024 * 1024));
+}
+
+/* Get GPU name using WMI */
+static void GetGpuName(char *buffer, int bufferLen)
+{
+    FILE *fp;
+    char output[256] = "";
+
+    if (!buffer || bufferLen <= 0) return;
+
+    fp = _popen("powershell.exe -NoProfile -c \"(Get-CimInstance Win32_VideoController | Select -First 1).Name\"", "r");
+    if (fp) {
+        if (fgets(output, sizeof(output), fp)) {
+            char *p, *end;
+            for (p = output; *p && (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t'); p++);
+            for (end = p; *end && *end != '\r' && *end != '\n'; end++);
+            *end = '\0';
+            lstrcpynA(buffer, p, bufferLen);
+        } else {
+            lstrcpynA(buffer, "Unknown", bufferLen);
+        }
+        _pclose(fp);
+    } else {
+        lstrcpynA(buffer, "Unknown", bufferLen);
+    }
 }
 
 /* Get model file size in MB */
@@ -1326,7 +1373,7 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     ScanModels();
     
     /* Get VRAM info */
-    availableVRAM = GetAvailableVRAM();
+    availableVRAM = GetTotalVRAM();
     
     /* Calculate sizes for all models */
     for (i = 0; i < nModels; i++) {
@@ -1450,7 +1497,15 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
     if (modelIndex >= 0 &&
         _stricmp(sModelTypes[modelIndex], "Vision") == 0 &&
         sModelProjectors[modelIndex][0]) {
-        BuildModelPath(projectorPath, sizeof(projectorPath), sModelProjectors[modelIndex]);
+        if (strchr(targetModel, '\\')) {
+            const char *lastBackslash = strrchr(targetModel, '\\');
+            char fullProjectorPath[MAX_PATH];
+            snprintf(fullProjectorPath, sizeof(fullProjectorPath), "%.*s\\%s",
+                (int)(lastBackslash - targetModel), targetModel, sModelProjectors[modelIndex]);
+            BuildModelPath(projectorPath, sizeof(projectorPath), fullProjectorPath);
+        } else {
+            BuildModelPath(projectorPath, sizeof(projectorPath), sModelProjectors[modelIndex]);
+        }
         snprintf(
             dst, dstLen,
             "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --cache-type-k %s --cache-type-v %s",
@@ -2860,6 +2915,11 @@ static int PrintUsage(void)
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
+    printf("      --cache-type-k <t>  K cache type (default: f16)\n");
+    printf("      --cache-type-v <t>  V cache type (default: f16)\n");
+    printf("        Types: f16, f32, bf16, q8_0, q6_k, q5_k_m, q5_k_s, q5_1, q5_0,\n");
+    printf("               q4_k_m, q4_k_s, q4_1, q4_0, q3_k_m, q3_k_s, q2_k,\n");
+    printf("               iq4_nl, iq3_xxs, iq2_xs, iq2_xxs, iq1_s, iq1_m\n");
     printf("      --debug           Show command before running\n");
     printf("  valora get <repo>     Download GGUF model from Hugging Face\n");
     printf("    Example: valora get TheBloke/Mistral-7B-v0.1-GGUF\n");
@@ -2873,6 +2933,11 @@ static int PrintUsage(void)
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
+    printf("      --cache-type-k <t>  K cache type (default: f16)\n");
+    printf("      --cache-type-v <t>  V cache type (default: f16)\n");
+    printf("        Types: f16, f32, bf16, q8_0, q6_k, q5_k_m, q5_k_s, q5_1, q5_0,\n");
+    printf("               q4_k_m, q4_k_s, q4_1, q4_0, q3_k_m, q3_k_s, q2_k,\n");
+    printf("               iq4_nl, iq3_xxs, iq2_xs, iq2_xxs, iq1_s, iq1_m\n");
     printf("      --ip              Show local IP in server URL\n");
     printf("      --port <n>        Server port (default: 8080)\n");
     printf("  valora chat           Start interactive chat (requires server running)\n");
@@ -2949,8 +3014,8 @@ static int EstimateGpuLayers(const char *folderPath, const char *modelName)
         const char *quantType = DetectQuantizationType(modelName);
         double scaleFactor = GetQuantizationScaleFactor(quantType);
         
-        /* Get available VRAM */
-        int vramMB = GetAvailableVRAM();
+        /* Get VRAM */
+        int vramMB = GetTotalVRAM();
         
         /* Available for layers = total VRAM - model size - reserves */
         int availForLayers = vramMB - modelSizeMB - reservedMB;
@@ -3123,15 +3188,18 @@ static void ScanModelsRecursively(const char *basePath, int *count)
                     const char *relativePath = basePath + lstrlenA(sFolder);
                     if (*relativePath == '\\') relativePath++;
                     
+                    char fullRelPath[MAX_PATH];
                     if (*relativePath) {
-                        snprintf(sModels[*count], MAX_PATH, "%s\\%s", relativePath, fd.cFileName);
+                        snprintf(fullRelPath, sizeof(fullRelPath), "%s\\%s", relativePath, fd.cFileName);
                     } else {
-                        lstrcpynA(sModels[*count], fd.cFileName, MAX_PATH);
+                        lstrcpynA(fullRelPath, fd.cFileName, MAX_PATH);
                     }
+                    
+                    lstrcpynA(sModels[*count], fullRelPath, MAX_PATH);
                     
                     lstrcpynA(sModelTypes[*count], GetModelTypeLabel(fd.cFileName), (int)sizeof(sModelTypes[*count]));
                     if (_stricmp(sModelTypes[*count], "Vision") == 0) {
-                        FindMatchingProjector(fd.cFileName, sModelProjectors[*count], MAX_PATH);
+                        FindMatchingProjector(fullRelPath, sModelProjectors[*count], MAX_PATH);
                     } else {
                         sModelProjectors[*count][0] = '\0';
                     }
@@ -4119,12 +4187,20 @@ static int RunCli(int argc, char **argv)
     if (lstrcmpiA(argv[1], "info") == 0 || lstrcmpiA(argv[1], "sysinfo") == 0) {
         ULONGLONG availRAM = GetAvailableRamMB();
         ULONGLONG totalRAM = GetSystemRamMB();
+        int vramMB = GetTotalVRAM();
+        char gpuName[256] = "";
+        
+        GetGpuName(gpuName, sizeof(gpuName));
         
         printf("\x1b[36m=== System Information ===\x1b[0m\n\n");
         printf("\x1b[33mMemory:\x1b[0m\n");
-        printf("  Available: %llu MB\n", availRAM);
-        printf("  Total:     %llu MB\n", totalRAM);
-        printf("  Used:      %llu MB\n", totalRAM - availRAM);
+        printf("  Available RAM: %llu MB\n", availRAM);
+        printf("  Total RAM:   %llu MB\n", totalRAM);
+        printf("  Used RAM:   %llu MB\n", totalRAM - availRAM);
+        
+        printf("\n\x1b[33mGPU:\x1b[0m\n");
+        printf("  Name:    %s\n", gpuName);
+        printf("  VRAM:    %d MB\n", vramMB);
         
         /* Check for running server */
         if (sModelLoaded) {
