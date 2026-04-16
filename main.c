@@ -2917,9 +2917,7 @@ static int PrintUsage(void)
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
     printf("      --cache-type-k <t>  K cache type (default: f16)\n");
     printf("      --cache-type-v <t>  V cache type (default: f16)\n");
-    printf("        Types: f16, f32, bf16, q8_0, q6_k, q5_k_m, q5_k_s, q5_1, q5_0,\n");
-    printf("               q4_k_m, q4_k_s, q4_1, q4_0, q3_k_m, q3_k_s, q2_k,\n");
-    printf("               iq4_nl, iq3_xxs, iq2_xs, iq2_xxs, iq1_s, iq1_m\n");
+    printf("        Types: f16, q8_0, q4_0, q4_1\n");
     printf("      --debug           Show command before running\n");
     printf("  valora get <repo>     Download GGUF model from Hugging Face\n");
     printf("    Example: valora get TheBloke/Mistral-7B-v0.1-GGUF\n");
@@ -2935,9 +2933,7 @@ static int PrintUsage(void)
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
     printf("      --cache-type-k <t>  K cache type (default: f16)\n");
     printf("      --cache-type-v <t>  V cache type (default: f16)\n");
-    printf("        Types: f16, f32, bf16, q8_0, q6_k, q5_k_m, q5_k_s, q5_1, q5_0,\n");
-    printf("               q4_k_m, q4_k_s, q4_1, q4_0, q3_k_m, q3_k_s, q2_k,\n");
-    printf("               iq4_nl, iq3_xxs, iq2_xs, iq2_xxs, iq1_s, iq1_m\n");
+    printf("        Types: f16, q8_0, q4_0, q4_1\n");
     printf("      --ip              Show local IP in server URL\n");
     printf("      --port <n>        Server port (default: 8080)\n");
     printf("  valora chat           Start interactive chat (requires server running)\n");
