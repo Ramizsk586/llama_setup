@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <conio.h>
+#include <time.h>
+
+static int RunDaemonCommand(int argc, char **argv);
+static int RunDaemonLoop(int port);
 
 #define IDI_ICON1 101
 #define VALORA_APP_DIR "Valora"
@@ -476,27 +480,47 @@ static void SetCtlFont(HWND hWnd, HFONT hFont)
     if (hWnd) SendMessageA(hWnd, WM_SETFONT, (WPARAM)hFont, FALSE);
 }
 
-static void EnableAnsiConsole(void) {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+static BOOL HasConsoleHandle(HANDLE hConsole)
+{
     DWORD mode = 0;
-    GetConsoleMode(hOut, &mode);
-    SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    return hConsole != NULL &&
+           hConsole != INVALID_HANDLE_VALUE &&
+           GetConsoleMode(hConsole, &mode) != 0;
 }
 
-static void AttachConsoleStreams(void)
+static void EnableAnsiConsole(void)
+{
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+
+    if (!HasConsoleHandle(hOut))
+        return;
+
+    mode |= ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+    if (GetConsoleMode(hOut, &mode))
+        SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+static void AttachConsoleStreams(BOOL allowAlloc)
 {
     FILE *dummy;
 
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-        if (!AllocConsole())
-            return;
+    if (!HasConsoleHandle(GetStdHandle(STD_OUTPUT_HANDLE)) ||
+        !HasConsoleHandle(GetStdHandle(STD_INPUT_HANDLE))) {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_ACCESS_DENIED) {
+                if (!allowAlloc || !AllocConsole())
+                    return;
+            }
+        }
     }
 
     freopen_s(&dummy, "CONOUT$", "w", stdout);
     freopen_s(&dummy, "CONOUT$", "w", stderr);
     freopen_s(&dummy, "CONIN$", "r", stdin);
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     EnableAnsiConsole();
 }
 
@@ -516,7 +540,7 @@ static void OpenOwnedConsole(const char *title)
         }
     }
     
-    AttachConsoleStreams();
+    AttachConsoleStreams(TRUE);
 }
 
 static void HideStandaloneConsoleWindow(void)
@@ -2940,7 +2964,24 @@ static int PrintUsage(void)
     printf("    Options (all optional):\n");
     printf("      --debug           Enable debug mode\n");
     printf("      --ollama          Use Ollama-compatible API\n");
-    
+
+    printf("\n\x1b[33mDaemon (Background Server):\x1b[0m\n");
+    printf("  valora daemon start           Start daemon in background (default port: 11435)\n");
+    printf("    --port <n>                  Use custom port\n");
+    printf("    --fg, --foreground          Run in foreground (for debugging)\n");
+    printf("  valora daemon stop            Stop running daemon\n");
+    printf("  valora daemon status          Show daemon status and current model\n");
+    printf("  valora daemon restart         Restart the daemon\n");
+    printf("  valora daemon log [N]         Show last N lines of daemon log (default: 50)\n");
+    printf("\n  Daemon API Endpoints:\n");
+    printf("    GET  /api/tags              List available models (Ollama-compatible)\n");
+    printf("    GET  /v1/models             List models (OpenAI-compatible)\n");
+    printf("    POST /api/generate           Generate completion\n");
+    printf("    POST /api/chat              Chat completion\n");
+    printf("    POST /v1/chat/completions   OpenAI-style chat\n");
+    printf("    DELETE /api/delete          Unload current model\n");
+    printf("    GET  /api/version           Daemon version\n");
+
     printf("\n\x1b[33mUtilities:\x1b[0m\n");
     printf("  valora info           Show system information (RAM, GPU)\n");
     printf("  valora kill           Terminate running model server\n");
@@ -3880,13 +3921,13 @@ static int RunCli(int argc, char **argv)
 {
     /* When no arguments, show help (user can run 'valora setup' to open GUI) */
     if (argc <= 1) {
-        AttachConsoleStreams();
+        AttachConsoleStreams(FALSE);
         return PrintUsage();
     }
 
     if (lstrcmpiA(argv[1], "setup") == 0) {
         if (argc > 2 && lstrcmpiA(argv[2], "--llama.cpp") == 0) {
-            AttachConsoleStreams();
+            AttachConsoleStreams(TRUE);
             return SetupLlamaCpp();
         }
         HideStandaloneConsoleWindow();
@@ -3895,7 +3936,7 @@ static int RunCli(int argc, char **argv)
     
     if (lstrcmpiA(argv[1], "update") == 0) {
         if (argc > 2 && lstrcmpiA(argv[2], "--llama.cpp") == 0) {
-            AttachConsoleStreams();
+            AttachConsoleStreams(TRUE);
             return UpdateLlamaCpp();
         }
         fprintf(stderr, "Usage: valora update --llama.cpp\n");
@@ -3903,7 +3944,7 @@ static int RunCli(int argc, char **argv)
     }
 
     if (lstrcmpiA(argv[1], "llama") == 0) {
-        AttachConsoleStreams();
+        AttachConsoleStreams(TRUE);
         int i;
         for (i = 2; i < argc; i++) {
             if (lstrcmpiA(argv[i], "--dir") == 0 && i + 1 < argc) {
@@ -3943,7 +3984,7 @@ static int RunCli(int argc, char **argv)
         return 0;
     }
 
-    AttachConsoleStreams();
+    AttachConsoleStreams(TRUE);
 
     if (lstrcmpiA(argv[1], "models") == 0 || lstrcmpiA(argv[1], "list") == 0) {
         int i;
@@ -4240,6 +4281,11 @@ static int RunCli(int argc, char **argv)
         }
         fflush(stdout);
         return 0;
+    }
+
+    /* Daemon command - Background server mode */
+    if (lstrcmpiA(argv[1], "daemon") == 0) {
+        return RunDaemonCommand(argc, argv);
     }
 
     return PrintUsage();
@@ -5988,13 +6034,1932 @@ input[strcspn(input, "\n")] = '\0';
     return exitCode;
 }
 
+/* ──────────────────────────────────────────────
+   DAEMON MODE IMPLEMENTATION
+   ────────────────────────────────────────────── */
+
+#define DAEMON_DEFAULT_PORT 11435
+#define DAEMON_INTERNAL_PORT 11436
+#define DAEMON_LOG_MAX_SIZE (10 * 1024 * 1024)
+#define DAEMON_THREAD_POOL_SIZE 4
+
+typedef struct {
+    char method[16];
+    char path[512];
+    char query[256];
+    char body[65536];
+    int  bodyLen;
+    char contentType[64];
+} HttpRequest;
+
+typedef struct {
+    char model[256];
+    char prompt[32768];
+    BOOL stream;
+    char messages[50][2048];
+    int messageCount;
+} OllamaRequest;
+
+static char    sCurrentDaemonModel[MAX_PATH] = "";
+static HANDLE  sDaemonChildHandle = NULL;
+static DWORD   sDaemonChildPid = 0;
+static HANDLE  sDaemonModelMutex = NULL;
+static BOOL    sDaemonRunning = FALSE;
+static int     sDaemonPort = DAEMON_DEFAULT_PORT;
+static int     sDaemonInternalPort = DAEMON_INTERNAL_PORT;
+static HANDLE  sDaemonLogFile = INVALID_HANDLE_VALUE;
+static ULONGLONG sDaemonStartTime = 0;
+static char    sDaemonLogPath[MAX_PATH] = "";
+static SOCKET  sDaemonListenSocket = INVALID_SOCKET;
+
+static CRITICAL_SECTION sDaemonLogCS;
+
+static void DaemonLogClose(void);
+
+static BOOL BuildPidFilePath(char *path, int len)
+{
+    char appData[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appData) != S_OK)
+        return FALSE;
+    snprintf(path, len, "%s\\%s\\daemon.pid", appData, VALORA_APP_DIR);
+    return TRUE;
+}
+
+static void WritePidFile(DWORD pid)
+{
+    char path[MAX_PATH];
+    FILE *fp;
+    if (!BuildPidFilePath(path, sizeof(path)))
+        return;
+    fp = fopen(path, "w");
+    if (fp) {
+        fprintf(fp, "%lu", pid);
+        fclose(fp);
+    }
+}
+
+static DWORD ReadPidFile(void)
+{
+    char path[MAX_PATH];
+    FILE *fp;
+    DWORD pid = 0;
+    if (!BuildPidFilePath(path, sizeof(path)))
+        return 0;
+    fp = fopen(path, "r");
+    if (fp) {
+        fscanf(fp, "%lu", &pid);
+        fclose(fp);
+    }
+    return pid;
+}
+
+static void DeletePidFile(void)
+{
+    char path[MAX_PATH];
+    if (BuildPidFilePath(path, sizeof(path)))
+        DeleteFileA(path);
+}
+
+static BOOL IsDaemonRunning(void)
+{
+    DWORD pid = ReadPidFile();
+    if (pid == 0)
+        return FALSE;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        CloseHandle(hProc);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void DaemonLogOpen(void)
+{
+    char appData[MAX_PATH];
+    char dirPath[MAX_PATH];
+    
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appData) != S_OK)
+        return;
+    
+    snprintf(dirPath, sizeof(dirPath), "%s\\%s", appData, VALORA_APP_DIR);
+    CreateDirectoryA(dirPath, NULL);
+    snprintf(sDaemonLogPath, sizeof(sDaemonLogPath), "%s\\daemon.log", dirPath);
+    
+    InitializeCriticalSection(&sDaemonLogCS);
+    
+    sDaemonLogFile = CreateFileA(sDaemonLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+static void DaemonLogClose(void)
+{
+    EnterCriticalSection(&sDaemonLogCS);
+    if (sDaemonLogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(sDaemonLogFile);
+        sDaemonLogFile = INVALID_HANDLE_VALUE;
+    }
+    LeaveCriticalSection(&sDaemonLogCS);
+    DeleteCriticalSection(&sDaemonLogCS);
+}
+
+static void DaemonLog(const char *fmt, ...)
+{
+    char timestamp[64];
+    char buffer[4096];
+    SYSTEMTIME st;
+    va_list args;
+    
+    GetLocalTime(&st);
+    snprintf(timestamp, sizeof(timestamp), "[%04d-%02d-%02d %02d:%02d:%02d]",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    
+    EnterCriticalSection(&sDaemonLogCS);
+    
+    if (sDaemonLogFile != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        char line[4600];
+        snprintf(line, sizeof(line), "%s %s\n", timestamp, buffer);
+        WriteFile(sDaemonLogFile, line, (DWORD)strlen(line), &written, NULL);
+        
+        LARGE_INTEGER fileSize;
+        if (GetFileSizeEx(sDaemonLogFile, &fileSize) && fileSize.QuadPart > DAEMON_LOG_MAX_SIZE) {
+            LeaveCriticalSection(&sDaemonLogCS);
+            
+            char backupPath[MAX_PATH];
+            snprintf(backupPath, sizeof(backupPath), "%s.bak", sDaemonLogPath);
+            
+            EnterCriticalSection(&sDaemonLogCS);
+            CloseHandle(sDaemonLogFile);
+            
+            DeleteFileA(backupPath);
+            MoveFileExA(sDaemonLogPath, backupPath, MOVEFILE_REPLACE_EXISTING);
+            
+            sDaemonLogFile = CreateFileA(sDaemonLogPath, CREATE_NEW, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+    }
+    
+    LeaveCriticalSection(&sDaemonLogCS);
+}
+
+static int DaemonLogPrint(int nLines)
+{
+    char path[MAX_PATH];
+    FILE *fp;
+    char **lines = NULL;
+    int count = 0;
+    int i;
+    
+    if (!BuildPidFilePath(path, sizeof(path)))
+        return 1;
+    
+    snprintf(path, sizeof(path), "%s", sDaemonLogPath);
+    
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "Could not open daemon log file.\n");
+        fflush(stderr);
+        return 1;
+    }
+    
+    lines = malloc(sizeof(char*) * 1000);
+    if (!lines) {
+        fclose(fp);
+        return 1;
+    }
+    
+    while (count < 1000) {
+        char line[4096];
+        if (fgets(line, sizeof(line), fp)) {
+            lines[count] = _strdup(line);
+            if (lines[count])
+                count++;
+        } else {
+            break;
+        }
+    }
+    fclose(fp);
+    
+    if (nLines <= 0 || nLines > count)
+        nLines = count;
+    
+    for (i = count - nLines; i < count; i++) {
+        printf("%s", lines[i]);
+        free(lines[i]);
+    }
+    
+    free(lines);
+    fflush(stdout);
+    return 0;
+}
+
+static void SendHttpResponse(SOCKET s, int status, const char *contentType, const char *body, int bodyLen)
+{
+    char header[1024];
+    int headerLen;
+    
+    const char *statusText = "OK";
+    if (status == 400) statusText = "Bad Request";
+    else if (status == 404) statusText = "Not Found";
+    else if (status == 503) statusText = "Service Unavailable";
+    
+    headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status, statusText, contentType, bodyLen);
+    
+    send(s, header, headerLen, 0);
+    if (bodyLen > 0 && body)
+        send(s, body, bodyLen, 0);
+}
+
+static void SendStreamChunk(SOCKET s, const char *data, int len)
+{
+    char header[32];
+    int headerLen;
+    
+    if (len <= 0) return;
+    
+    headerLen = snprintf(header, sizeof(header), "%x\r\n", len);
+    send(s, header, headerLen, 0);
+    send(s, data, len, 0);
+    send(s, "\r\n", 2, 0);
+}
+
+static void SendStreamEnd(SOCKET s)
+{
+    send(s, "0\r\n\r\n", 5, 0);
+}
+
+static void SendErrorResponse(SOCKET s, int status, const char *message)
+{
+    char body[1024];
+    int bodyLen = snprintf(body, sizeof(body), "{\"error\":{\"message\":\"%s\",\"code\":%d}}", message, status);
+    SendHttpResponse(s, status, "application/json", body, bodyLen);
+}
+
+static void BuildServeCommandForDaemon(char *dst, int dstLen, const char *modelName, int port)
+{
+    char modelPath[MAX_PATH * 2];
+    char ctx[32], gpu[32], threads[32], kvCacheK[16], kvCacheV[16];
+    char projectorPath[MAX_PATH] = "";
+    
+    BuildModelPath(modelPath, sizeof(modelPath), modelName);
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads), kvCacheK, sizeof(kvCacheK));
+    GetConfiguredServerValuesBoth(kvCacheK, sizeof(kvCacheK), kvCacheV, sizeof(kvCacheV));
+    
+    GetModelConfig(modelName, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+    
+    if (_stricmp(GetModelTypeLabel(modelName), "Vision") == 0) {
+        char projectorName[MAX_PATH];
+        if (FindMatchingProjector(modelName, projectorName, sizeof(projectorName))) {
+            if (strchr(modelName, '\\')) {
+                const char *lastBackslash = strrchr(modelName, '\\');
+                snprintf(projectorPath, sizeof(projectorPath), "%.*s\\%s",
+                    (int)(lastBackslash - modelName), modelName, projectorName);
+            } else {
+                lstrcpynA(projectorPath, projectorName, sizeof(projectorPath));
+            }
+        }
+    }
+    
+    if (projectorPath[0]) {
+        snprintf(dst, dstLen,
+            "\"%s\" -m \"%s\" --mmproj \"%s\" -c %s -ngl %s -t %s --port %d --host 127.0.0.1 --cache-type-k %s --cache-type-v %s",
+            sServer, modelPath, projectorPath, ctx, gpu, threads, port, kvCacheK, kvCacheV);
+    } else {
+        snprintf(dst, dstLen,
+            "\"%s\" -m \"%s\" -c %s -ngl %s -t %s --port %d --host 127.0.0.1 --cache-type-k %s --cache-type-v %s",
+            sServer, modelPath, ctx, gpu, threads, port, kvCacheK, kvCacheV);
+    }
+}
+
+static BOOL DaemonWaitForServer(int port, int timeoutMs)
+{
+    int waited = 0;
+    SOCKET testSock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0)
+        return FALSE;
+    
+    while (waited < timeoutMs) {
+        testSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (testSock == INVALID_SOCKET) {
+            WSACleanup();
+            return FALSE;
+        }
+        
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((u_short)port);
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        
+        if (connect(testSock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            closesocket(testSock);
+            WSACleanup();
+            return TRUE;
+        }
+        
+        closesocket(testSock);
+        Sleep(200);
+        waited += 200;
+    }
+    
+    WSACleanup();
+    return FALSE;
+}
+
+static void DaemonUnloadModel(void)
+{
+    if (sDaemonChildPid == 0 && sDaemonChildHandle == NULL)
+        return;
+    
+    if (sDaemonChildPid != 0) {
+        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, sDaemonChildPid);
+        if (hProc) {
+            TerminateProcess(hProc, 0);
+            CloseHandle(hProc);
+        }
+        KillProcessTree(sDaemonChildPid);
+    }
+    
+    if (sDaemonChildHandle) {
+        WaitForSingleObject(sDaemonChildHandle, 3000);
+        CloseHandle(sDaemonChildHandle);
+    }
+    
+    sDaemonChildHandle = NULL;
+    sDaemonChildPid = 0;
+    sCurrentDaemonModel[0] = '\0';
+    
+    DaemonLog("[INFO] Model unloaded");
+}
+
+static int DaemonLaunchModel(const char *modelName)
+{
+    char command[MAX_CMD];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD startTime = GetTickCount();
+    
+    BuildServeCommandForDaemon(command, sizeof(command), modelName, sDaemonInternalPort);
+    
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    
+    DaemonLog("[INFO] Launching model: %s", modelName);
+    DaemonLog("[DEBUG] Command: %s", command);
+    
+    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+        DaemonLog("[ERROR] Failed to launch model: %lu", GetLastError());
+        return -1;
+    }
+    
+    sDaemonChildHandle = pi.hProcess;
+    sDaemonChildPid = pi.dwProcessId;
+    lstrcpynA(sCurrentDaemonModel, modelName, sizeof(sCurrentDaemonModel));
+    
+    CloseHandle(pi.hThread);
+    
+    if (!DaemonWaitForServer(sDaemonInternalPort, 30000)) {
+        DaemonLog("[ERROR] Model server failed to start within 30s");
+        DaemonUnloadModel();
+        return -1;
+    }
+    
+    DWORD elapsed = GetTickCount() - startTime;
+    DaemonLog("[INFO] Model loaded: %s (%lums)", modelName, elapsed);
+    
+    return 0;
+}
+
+static int DaemonSwapModel(const char *modelName)
+{
+    int result;
+    SafetyDecision safety;
+    char ctx[32], gpu[32], threads[32];
+    ULONGLONG startTime;
+    
+    WaitForSingleObject(sDaemonModelMutex, INFINITE);
+    
+    if (sCurrentDaemonModel[0] && lstrcmpiA(sCurrentDaemonModel, modelName) == 0) {
+        ReleaseMutex(sDaemonModelMutex);
+        return 0;
+    }
+    
+    if (sCurrentDaemonModel[0]) {
+        DaemonLog("[INFO] Unloading model: %s", sCurrentDaemonModel);
+        DaemonUnloadModel();
+    }
+    
+    GetModelConfig(modelName, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+    
+    safety = CheckLoadSafety(modelName, NULL, atoi(ctx), atoi(gpu));
+    
+    if (safety == SAFETY_REFUSE) {
+        DaemonLog("[ERROR] Safety check failed for %s: %s", modelName, sLastSafetyReason);
+        ReleaseMutex(sDaemonModelMutex);
+        return -1;
+    }
+    
+    startTime = GetTickCount();
+    result = DaemonLaunchModel(modelName);
+    
+    ReleaseMutex(sDaemonModelMutex);
+    
+    return result;
+}
+
+static char* ExtractJsonString(const char *json, const char *key, char *out, int outLen)
+{
+    char pattern[256];
+    const char *p;
+    
+    out[0] = '\0';
+    
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    p = strstr(json, pattern);
+    if (!p)
+        return NULL;
+    
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t') p++;
+    
+    if (*p == '"') {
+        p++;
+        const char *end = strchr(p, '"');
+        if (end && end > p) {
+            int len = (int)(end - p);
+            if (len >= outLen) len = outLen - 1;
+            memcpy(out, p, len);
+            out[len] = '\0';
+            return out;
+        }
+    } else if (*p == '{' || *p == '[') {
+        return NULL;
+    } else {
+        const char *end = p;
+        while (*end && *end != ',' && *end != '}' && *end != ']' && *end != '\n')
+            end++;
+        int len = (int)(end - p);
+        if (len > 0 && len < outLen) {
+            memcpy(out, p, len);
+            out[len] = '\0';
+            return out;
+        }
+    }
+    
+    return NULL;
+}
+
+static void ExtractOllamaGenerateRequest(const char *body, OllamaRequest *req)
+{
+    memset(req, 0, sizeof(OllamaRequest));
+    
+    ExtractJsonString(body, "model", req->model, sizeof(req->model));
+    ExtractJsonString(body, "prompt", req->prompt, sizeof(req->prompt));
+    
+    const char *streamStr = strstr(body, "\"stream\":");
+    if (streamStr) {
+        streamStr += 8;
+        while (*streamStr == ' ' || *streamStr == '\t') streamStr++;
+        req->stream = (strncmp(streamStr, "true", 4) == 0);
+    }
+}
+
+static void ExtractOllamaChatRequest(const char *body, OllamaRequest *req)
+{
+    const char *p, *contentStart, *contentEnd;
+    char roleBuf[64];
+    int msgIdx = 0;
+    
+    memset(req, 0, sizeof(OllamaRequest));
+    
+    ExtractJsonString(body, "model", req->model, sizeof(req->model));
+    
+    const char *streamStr = strstr(body, "\"stream\":");
+    if (streamStr) {
+        streamStr += 8;
+        while (*streamStr == ' ' || *streamStr == '\t') streamStr++;
+        req->stream = (strncmp(streamStr, "true", 4) == 0);
+    }
+    
+    p = body;
+    while ((p = strstr(p, "\"role\":")) && msgIdx < 50) {
+        p += 7;
+        while (*p == ' ' || *p == '\t' || *p == '"') p++;
+        
+        const char *roleEnd = strchr(p, '"');
+        if (!roleEnd) break;
+        
+        int roleLen = (int)(roleEnd - p);
+        if (roleLen >= sizeof(roleBuf)) roleLen = sizeof(roleBuf) - 1;
+        memcpy(roleBuf, p, roleLen);
+        roleBuf[roleLen] = '\0';
+        
+        contentStart = strstr(roleEnd, "\"content\":");
+        if (!contentStart) break;
+        contentStart += 11;
+        while (*contentStart == ' ' || *contentStart == '\t') contentStart++;
+        
+        if (*contentStart == '"') {
+            contentStart++;
+            contentEnd = contentStart;
+            while (*contentEnd && *contentEnd != '"' && contentEnd - contentStart < 2000) {
+                if (*contentEnd == '\\' && contentEnd[1])
+                    contentEnd++;
+                contentEnd++;
+            }
+        } else {
+            contentEnd = contentStart;
+            while (*contentEnd && *contentEnd != ',' && *contentEnd != '}' && contentEnd - contentStart < 2000)
+                contentEnd++;
+        }
+        
+        int contentLen = (int)(contentEnd - contentStart);
+        if (contentLen > 0 && contentLen < 2000) {
+            char contentBuf[2048];
+            memcpy(contentBuf, contentStart, contentLen);
+            contentBuf[contentLen] = '\0';
+            
+            snprintf(req->messages[msgIdx], sizeof(req->messages[0]),
+                "{\"role\":\"%s\",\"content\":\"%s\"}", roleBuf, contentBuf);
+            msgIdx++;
+        }
+        
+        p = contentEnd;
+    }
+    
+    req->messageCount = msgIdx;
+}
+
+static void BuildTagsResponse(SOCKET s)
+{
+    char *response;
+    int totalLen;
+    int capacity = 65536;
+    int offset = 0;
+    int i;
+    
+    response = malloc(capacity);
+    if (!response) {
+        SendErrorResponse(s, 500, "Out of memory");
+        return;
+    }
+    
+    offset = snprintf(response, capacity, "{\"models\":[");
+    
+    ScanModelsRecursively(sFolder, &nModels);
+    
+    for (i = 0; i < nModels && i < MAX_MODELS; i++) {
+        char fullPath[MAX_PATH * 2];
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        ULARGE_INTEGER fileSize;
+        const char *quant;
+        const char *typeLabel;
+        SYSTEMTIME st;
+        FILETIME ft;
+        char timeBuf[64];
+        
+        BuildModelPath(fullPath, sizeof(fullPath), sModels[i]);
+        
+        fileSize.QuadPart = 0;
+        if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
+            fileSize.LowPart = fad.nFileSizeLow;
+            fileSize.HighPart = fad.nFileSizeHigh;
+            ft = fad.ftLastWriteTime;
+            FileTimeToSystemTime(&ft, &st);
+            snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        } else {
+            timeBuf[0] = '\0';
+        }
+        
+        quant = DetectQuantizationType(sModels[i]);
+        typeLabel = GetModelTypeLabel(sModels[i]);
+        
+        char entry[2048];
+        int entryLen = snprintf(entry, sizeof(entry),
+            "%s{\"name\":\"%s\",\"model\":\"%s\",\"modified_at\":\"%s\",\"size\":%llu,"
+            "\"digest\":\"\",\"details\":{\"format\":\"gguf\",\"family\":\"llama\","
+            "\"parameter_size\":\"7B\",\"quantization_level\":\"%s\"}}",
+            i > 0 ? "," : "",
+            sModels[i], sModels[i], timeBuf, fileSize.QuadPart, quant);
+        
+        if (offset + entryLen >= capacity) {
+            capacity *= 2;
+            char *newResp = realloc(response, capacity);
+            if (!newResp) {
+                free(response);
+                SendErrorResponse(s, 500, "Out of memory");
+                return;
+            }
+            response = newResp;
+        }
+        
+        memcpy(response + offset, entry, entryLen);
+        offset += entryLen;
+    }
+    
+    offset += snprintf(response + offset, capacity - offset, "]}");
+    
+    SendHttpResponse(s, 200, "application/json", response, offset);
+    free(response);
+}
+
+static void BuildV1ModelsResponse(SOCKET s)
+{
+    char *response;
+    int capacity = 65536;
+    int offset = 0;
+    int i;
+    time_t now = time(NULL);
+    
+    response = malloc(capacity);
+    if (!response) {
+        SendErrorResponse(s, 500, "Out of memory");
+        return;
+    }
+    
+    offset = snprintf(response, capacity, "{\"object\":\"list\",\"data\":[");
+    
+    ScanModelsRecursively(sFolder, &nModels);
+    
+    for (i = 0; i < nModels && i < MAX_MODELS; i++) {
+        char entry[1024];
+        int entryLen = snprintf(entry, sizeof(entry),
+            "%s{\"id\":\"%s\",\"object\":\"model\",\"created\":%ld,\"owned_by\":\"valora\"}",
+            i > 0 ? "," : "",
+            sModels[i], (long)now);
+        
+        if (offset + entryLen >= capacity) {
+            capacity *= 2;
+            char *newResp = realloc(response, capacity);
+            if (!newResp) {
+                free(response);
+                SendErrorResponse(s, 500, "Out of memory");
+                return;
+            }
+            response = newResp;
+        }
+        
+        memcpy(response + offset, entry, entryLen);
+        offset += entryLen;
+    }
+    
+    offset += snprintf(response + offset, capacity - offset, "]}");
+    
+    SendHttpResponse(s, 200, "application/json", response, offset);
+    free(response);
+}
+
+static void HandleVersion(SOCKET s)
+{
+    char body[256];
+    int bodyLen = snprintf(body, sizeof(body), "{\"version\":\"0.1.0\"}");
+    SendHttpResponse(s, 200, "application/json", body, bodyLen);
+}
+
+static void HandleNotFound(SOCKET s)
+{
+    SendErrorResponse(s, 404, "Endpoint not found");
+}
+
+static void HandleGetTags(SOCKET s)
+{
+    BuildTagsResponse(s);
+}
+
+static void HandleGetV1Models(SOCKET s)
+{
+    BuildV1ModelsResponse(s);
+}
+
+static void HandleDeleteModel(SOCKET s)
+{
+    WaitForSingleObject(sDaemonModelMutex, INFINITE);
+    
+    if (sCurrentDaemonModel[0]) {
+        DaemonLog("[INFO] Deleting model: %s", sCurrentDaemonModel);
+        DaemonUnloadModel();
+    }
+    
+    ReleaseMutex(sDaemonModelMutex);
+    
+    char body[256];
+    int bodyLen = snprintf(body, sizeof(body), "{\"status\":\"success\"}");
+    SendHttpResponse(s, 200, "application/json", body, bodyLen);
+}
+
+static void HandleShutdown(SOCKET s)
+{
+    DaemonLog("[INFO] Shutdown request received");
+    
+    char body[256];
+    int bodyLen = snprintf(body, sizeof(body), "{\"status\":\"shutting_down\"}");
+    SendHttpResponse(s, 200, "application/json", body, bodyLen);
+    
+    sDaemonRunning = FALSE;
+}
+
+static void TranslateOpenAiChunkToOllamaGenerate(const char *chunk, const char *modelName, char *out, int outLen, BOOL *done)
+{
+    const char *content = strstr(chunk, "\"content\":\"");
+    const char *done_marker = strstr(chunk, "\"done\":true");
+    
+    *done = (done_marker != NULL);
+    
+    if (content) {
+        content += 11;
+        const char *end = content;
+        while (*end && *end != '"') {
+            if (*end == '\\' && end[1])
+                end++;
+            end++;
+        }
+        
+        int contentLen = (int)(end - content);
+        if (contentLen > 0 && contentLen < outLen - 100) {
+            char decoded[4096];
+            int decodedLen = 0;
+            
+            const char *src = content;
+            char *dst = decoded;
+            while (src < end && decodedLen < (int)sizeof(decoded) - 1) {
+                if (*src == '\\' && src[1]) {
+                    src++;
+                    if (*src == 'n') { *dst++ = '\n'; src++; decodedLen++; }
+                    else if (*src == 't') { *dst++ = '\t'; src++; decodedLen++; }
+                    else if (*src == '"') { *dst++ = '"'; src++; decodedLen++; }
+                    else if (*src == '\\') { *dst++ = '\\'; src++; decodedLen++; }
+                    else { *dst++ = *src++; decodedLen++; }
+                } else {
+                    *dst++ = *src++;
+                    decodedLen++;
+                }
+            }
+            *dst = '\0';
+            
+            SYSTEMTIME st;
+            FILETIME ft;
+            GetSystemTime(&st);
+            SystemTimeToFileTime(&st, &ft);
+            
+            snprintf(out, outLen,
+                "{\"model\":\"%s\",\"created_at\":\"%04d-%02d-%02dT%02d:%02d:%02dZ\","
+                "\"response\":\"%s\",\"done\":false}\n",
+                modelName, st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, decoded);
+            return;
+        }
+    }
+    
+    out[0] = '\0';
+}
+
+static void TranslateOpenAiChunkToOllamaChat(const char *chunk, const char *modelName, char *out, int outLen, BOOL *done)
+{
+    const char *content = strstr(chunk, "\"content\":\"");
+    const char *done_marker = strstr(chunk, "\"done\":true");
+    
+    *done = (done_marker != NULL);
+    
+    if (content) {
+        content += 11;
+        const char *end = content;
+        while (*end && *end != '"') {
+            if (*end == '\\' && end[1])
+                end++;
+            end++;
+        }
+        
+        int contentLen = (int)(end - content);
+        if (contentLen > 0 && contentLen < outLen - 150) {
+            char decoded[4096];
+            int decodedLen = 0;
+            
+            const char *src = content;
+            char *dst = decoded;
+            while (src < end && decodedLen < (int)sizeof(decoded) - 1) {
+                if (*src == '\\' && src[1]) {
+                    src++;
+                    if (*src == 'n') { *dst++ = '\n'; src++; decodedLen++; }
+                    else if (*src == 't') { *dst++ = '\t'; src++; decodedLen++; }
+                    else if (*src == '"') { *dst++ = '"'; src++; decodedLen++; }
+                    else if (*src == '\\') { *dst++ = '\\'; src++; decodedLen++; }
+                    else { *dst++ = *src++; decodedLen++; }
+                } else {
+                    *dst++ = *src++;
+                    decodedLen++;
+                }
+            }
+            *dst = '\0';
+            
+            SYSTEMTIME st;
+            FILETIME ft;
+            GetSystemTime(&st);
+            SystemTimeToFileTime(&st, &ft);
+            
+            snprintf(out, outLen,
+                "{\"model\":\"%s\",\"created_at\":\"%04d-%02d-%02dT%02d:%02d:%02dZ\","
+                "\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"done\":false}\n",
+                modelName, st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, decoded);
+            return;
+        }
+    }
+    
+    out[0] = '\0';
+}
+
+static void StreamProxyRequest(SOCKET clientSock, const char *llamaUrl, const char *requestBody, BOOL toOllamaFormat, BOOL isChat)
+{
+    SOCKET proxySock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    char buffer[8192];
+    char ollamaLine[8192];
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0)
+        return;
+    
+    proxySock = socket(AF_INET, SOCK_STREAM, 0);
+    if (proxySock == INVALID_SOCKET) {
+        WSACleanup();
+        return;
+    }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)sDaemonInternalPort);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(proxySock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(proxySock);
+        WSACleanup();
+        return;
+    }
+    
+    char httpRequest[32768 + 1024];
+    int reqLen = snprintf(httpRequest, sizeof(httpRequest),
+        "POST /v1/completions HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        sDaemonInternalPort, (int)strlen(requestBody), requestBody);
+    
+    send(proxySock, httpRequest, reqLen, 0);
+    
+    char header[4096];
+    int headerLen = 0;
+    int contentLength = -1;
+    int bodyReceived = 0;
+    BOOL inBody = FALSE;
+    
+    while (1) {
+        int bytes = recv(proxySock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes <= 0)
+            break;
+        
+        buffer[bytes] = '\0';
+        
+        if (!inBody) {
+            char *headerEnd = strstr(buffer, "\r\n\r\n");
+            if (headerEnd) {
+                inBody = TRUE;
+                
+                char *headerPortion = buffer;
+                int headerPortionLen = (int)(headerEnd - buffer);
+                char save = buffer[headerPortionLen];
+                buffer[headerPortionLen] = '\0';
+                
+                const char *cl = strstr(buffer, "Content-Length:");
+                if (cl) {
+                    cl += 15;
+                    while (*cl == ' ' || *cl == '\t') cl++;
+                    contentLength = atoi(cl);
+                }
+                
+                buffer[headerPortionLen] = save;
+                
+                int bodyStart = (int)(headerEnd - buffer) + 4;
+                int initialBody = bytes - bodyStart;
+                if (initialBody > 0) {
+                    bodyReceived += initialBody;
+                    
+                    if (toOllamaFormat) {
+                        TranslateOpenAiChunkToOllamaGenerate(headerEnd + 4, sCurrentDaemonModel, ollamaLine, sizeof(ollamaLine), &(BOOL){FALSE});
+                        if (ollamaLine[0])
+                            send(clientSock, ollamaLine, (int)strlen(ollamaLine), 0);
+                    } else {
+                        send(clientSock, headerEnd + 4, initialBody, 0);
+                    }
+                }
+            }
+        } else {
+            bodyReceived += bytes;
+            
+            if (toOllamaFormat) {
+                const char *lineStart = buffer;
+                for (int i = 0; i < bytes; i++) {
+                    if (buffer[i] == '\n') {
+                        int lineLen = (int)(lineStart - buffer);
+                        char line[4096];
+                        if (lineLen < sizeof(line)) {
+                            memcpy(line, lineStart, lineLen);
+                            line[lineLen] = '\0';
+                            
+                            BOOL done = FALSE;
+                            if (isChat)
+                                TranslateOpenAiChunkToOllamaChat(line, sCurrentDaemonModel, ollamaLine, sizeof(ollamaLine), &done);
+                            else
+                                TranslateOpenAiChunkToOllamaGenerate(line, sCurrentDaemonModel, ollamaLine, sizeof(ollamaLine), &done);
+                            
+                            if (ollamaLine[0])
+                                send(clientSock, ollamaLine, (int)strlen(ollamaLine), 0);
+                            
+                            if (done) {
+                                snprintf(ollamaLine, sizeof(ollamaLine),
+                                    "{\"model\":\"%s\",\"created_at\":\"\",\"response\":\"\",\"done\":true}\n",
+                                    sCurrentDaemonModel);
+                                send(clientSock, ollamaLine, (int)strlen(ollamaLine), 0);
+                            }
+                        }
+                        lineStart = buffer + i + 1;
+                    }
+                }
+            } else {
+                send(clientSock, buffer, bytes, 0);
+            }
+            
+            if (contentLength > 0 && bodyReceived >= contentLength)
+                break;
+        }
+    }
+    
+    closesocket(proxySock);
+    WSACleanup();
+}
+
+static void BuildLlamaCompletionRequest(const OllamaRequest *req, char *out, int outLen, BOOL isChat)
+{
+    if (isChat && req->messageCount > 0) {
+        int offset = snprintf(out, outLen,
+            "{\"model\":\"%s\",\"messages\":[", sCurrentDaemonModel);
+        
+        for (int i = 0; i < req->messageCount && offset < outLen - 100; i++) {
+            offset += snprintf(out + offset, outLen - offset, "%s%s",
+                i > 0 ? "," : "", req->messages[i]);
+        }
+        
+        snprintf(out + offset, outLen - offset,
+            "],\"stream\":false,\"max_tokens\":2048}");
+    } else {
+        snprintf(out, outLen,
+            "{\"model\":\"%s\",\"prompt\":\"%s\",\"stream\":false,\"max_tokens\":2048}",
+            sCurrentDaemonModel, req->prompt);
+    }
+}
+
+static void HandlePostGenerate(SOCKET s, HttpRequest *req)
+{
+    OllamaRequest ollamaReq;
+    char llamaRequest[32768];
+    
+    ExtractOllamaGenerateRequest(req->body, &ollamaReq);
+    
+    if (!ollamaReq.model[0]) {
+        SendErrorResponse(s, 400, "Missing model field");
+        return;
+    }
+    
+    if (strcmp(ollamaReq.model, sCurrentDaemonModel) != 0) {
+        int swapResult = DaemonSwapModel(ollamaReq.model);
+        if (swapResult != 0) {
+            SendErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
+            return;
+        }
+    }
+    
+    snprintf(llamaRequest, sizeof(llamaRequest),
+        "{\"model\":\"%s\",\"prompt\":\"%s\",\"stream\":false,\"max_tokens\":2048}",
+        sCurrentDaemonModel, ollamaReq.prompt);
+    
+    SOCKET proxySock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    char buffer[16384];
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0) {
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    proxySock = socket(AF_INET, SOCK_STREAM, 0);
+    if (proxySock == INVALID_SOCKET) {
+        WSACleanup();
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)sDaemonInternalPort);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(proxySock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(proxySock);
+        WSACleanup();
+        SendErrorResponse(s, 503, "Model server not responding");
+        return;
+    }
+    
+    char httpRequest[32768 + 1024];
+    int reqLen = snprintf(httpRequest, sizeof(httpRequest),
+        "POST /v1/completions HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        sDaemonInternalPort, (int)strlen(llamaRequest), llamaRequest);
+    
+    send(proxySock, httpRequest, reqLen, 0);
+    
+    char *response = NULL;
+    size_t responseLen = 0;
+    
+    while (1) {
+        int bytes = recv(proxySock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes <= 0)
+            break;
+        
+        buffer[bytes] = '\0';
+        
+        char *bodyStart = strstr(buffer, "\r\n\r\n");
+        if (bodyStart) {
+            bodyStart += 4;
+            int bodyLen = bytes - (int)(bodyStart - buffer);
+            
+            char *newResp = realloc(response, responseLen + bodyLen + 1);
+            if (newResp) {
+                response = newResp;
+                memcpy(response + responseLen, bodyStart, bodyLen);
+                responseLen += bodyLen;
+                response[responseLen] = '\0';
+            }
+            
+            const char *cl = strstr(buffer, "Content-Length:");
+            if (cl) {
+                cl += 15;
+                while (*cl == ' ' || *cl == '\t') cl++;
+                int contentLen = atoi(cl);
+                
+                char *headerEnd = strstr(buffer, "\r\n\r\n");
+                if (headerEnd) {
+                    int totalHeaderLen = (int)(headerEnd - buffer) + 4;
+                    int receivedLen = bytes;
+                    
+                    if (receivedLen >= totalHeaderLen + contentLen)
+                        break;
+                }
+            }
+            
+            if (strstr(buffer, "data:") == NULL && bodyLen > 0)
+                break;
+        }
+    }
+    
+    closesocket(proxySock);
+    WSACleanup();
+    
+    if (response && responseLen > 0) {
+        SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
+        free(response);
+    } else {
+        SendErrorResponse(s, 500, "Failed to get response from model");
+    }
+}
+
+static void HandlePostChat(SOCKET s, HttpRequest *req)
+{
+    OllamaRequest ollamaReq;
+    char llamaRequest[32768];
+    
+    ExtractOllamaChatRequest(req->body, &ollamaReq);
+    
+    if (!ollamaReq.model[0]) {
+        SendErrorResponse(s, 400, "Missing model field");
+        return;
+    }
+    
+    if (strcmp(ollamaReq.model, sCurrentDaemonModel) != 0) {
+        int swapResult = DaemonSwapModel(ollamaReq.model);
+        if (swapResult != 0) {
+            SendErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
+            return;
+        }
+    }
+    
+    int offset = snprintf(llamaRequest, sizeof(llamaRequest),
+        "{\"model\":\"%s\",\"messages\":[", sCurrentDaemonModel);
+    
+    for (int i = 0; i < ollamaReq.messageCount && offset < (int)sizeof(llamaRequest) - 100; i++) {
+        offset += snprintf(llamaRequest + offset, sizeof(llamaRequest) - offset, "%s%s",
+            i > 0 ? "," : "", ollamaReq.messages[i]);
+    }
+    
+    snprintf(llamaRequest + offset, sizeof(llamaRequest) - offset,
+        "],\"stream\":false,\"max_tokens\":2048}");
+    
+    SOCKET proxySock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    char buffer[16384];
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0) {
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    proxySock = socket(AF_INET, SOCK_STREAM, 0);
+    if (proxySock == INVALID_SOCKET) {
+        WSACleanup();
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)sDaemonInternalPort);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(proxySock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(proxySock);
+        WSACleanup();
+        SendErrorResponse(s, 503, "Model server not responding");
+        return;
+    }
+    
+    char httpRequest[32768 + 1024];
+    int reqLen = snprintf(httpRequest, sizeof(httpRequest),
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        sDaemonInternalPort, (int)strlen(llamaRequest), llamaRequest);
+    
+    send(proxySock, httpRequest, reqLen, 0);
+    
+    char *response = NULL;
+    size_t responseLen = 0;
+    
+    while (1) {
+        int bytes = recv(proxySock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes <= 0)
+            break;
+        
+        buffer[bytes] = '\0';
+        
+        char *bodyStart = strstr(buffer, "\r\n\r\n");
+        if (bodyStart) {
+            bodyStart += 4;
+            int bodyLen = bytes - (int)(bodyStart - buffer);
+            
+            char *newResp = realloc(response, responseLen + bodyLen + 1);
+            if (newResp) {
+                response = newResp;
+                memcpy(response + responseLen, bodyStart, bodyLen);
+                responseLen += bodyLen;
+                response[responseLen] = '\0';
+            }
+            
+            const char *cl = strstr(buffer, "Content-Length:");
+            if (cl) {
+                cl += 15;
+                while (*cl == ' ' || *cl == '\t') cl++;
+                int contentLen = atoi(cl);
+                
+                char *headerEnd = strstr(buffer, "\r\n\r\n");
+                if (headerEnd) {
+                    int totalHeaderLen = (int)(headerEnd - buffer) + 4;
+                    int receivedLen = bytes;
+                    
+                    if (receivedLen >= totalHeaderLen + contentLen)
+                        break;
+                }
+            }
+            
+            if (strstr(buffer, "data:") == NULL && bodyLen > 0)
+                break;
+        }
+    }
+    
+    closesocket(proxySock);
+    WSACleanup();
+    
+    if (response && responseLen > 0) {
+        SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
+        free(response);
+    } else {
+        SendErrorResponse(s, 500, "Failed to get response from model");
+    }
+}
+
+static void HandlePostV1Chat(SOCKET s, HttpRequest *req)
+{
+    if (!sCurrentDaemonModel[0]) {
+        SendErrorResponse(s, 400, "No model loaded");
+        return;
+    }
+    
+    SOCKET proxySock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    char buffer[16384];
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0) {
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    proxySock = socket(AF_INET, SOCK_STREAM, 0);
+    if (proxySock == INVALID_SOCKET) {
+        WSACleanup();
+        SendErrorResponse(s, 500, "Internal error");
+        return;
+    }
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)sDaemonInternalPort);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(proxySock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(proxySock);
+        WSACleanup();
+        SendErrorResponse(s, 503, "Model server not responding");
+        return;
+    }
+    
+    char httpRequest[32768 + 1024];
+    int reqLen = snprintf(httpRequest, sizeof(httpRequest),
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        sDaemonInternalPort, req->bodyLen, req->body);
+    
+    send(proxySock, httpRequest, reqLen, 0);
+    
+    char *response = NULL;
+    size_t responseLen = 0;
+    
+    while (1) {
+        int bytes = recv(proxySock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes <= 0)
+            break;
+        
+        buffer[bytes] = '\0';
+        
+        char *bodyStart = strstr(buffer, "\r\n\r\n");
+        if (bodyStart) {
+            bodyStart += 4;
+            int bodyLen = bytes - (int)(bodyStart - buffer);
+            
+            char *newResp = realloc(response, responseLen + bodyLen + 1);
+            if (newResp) {
+                response = newResp;
+                memcpy(response + responseLen, bodyStart, bodyLen);
+                responseLen += bodyLen;
+                response[responseLen] = '\0';
+            }
+            
+            const char *cl = strstr(buffer, "Content-Length:");
+            if (cl) {
+                cl += 15;
+                while (*cl == ' ' || *cl == '\t') cl++;
+                int contentLen = atoi(cl);
+                
+                char *headerEnd = strstr(buffer, "\r\n\r\n");
+                if (headerEnd) {
+                    int totalHeaderLen = (int)(headerEnd - buffer) + 4;
+                    int receivedLen = bytes;
+                    
+                    if (receivedLen >= totalHeaderLen + contentLen)
+                        break;
+                }
+            }
+            
+            if (strstr(buffer, "data:") == NULL && bodyLen > 0)
+                break;
+        }
+    }
+    
+    closesocket(proxySock);
+    WSACleanup();
+    
+    if (response && responseLen > 0) {
+        SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
+        free(response);
+    } else {
+        SendErrorResponse(s, 500, "Failed to get response from model");
+    }
+}
+
+static int ParseHttpRequest(SOCKET s, HttpRequest *req)
+{
+    char buffer[16384];
+    int bytes;
+    
+    memset(req, 0, sizeof(HttpRequest));
+    
+    bytes = recv(s, buffer, sizeof(buffer) - 1, 0);
+    if (bytes <= 0)
+        return -1;
+    
+    buffer[bytes] = '\0';
+    
+    char *lineEnd = strstr(buffer, "\r\n");
+    if (!lineEnd)
+        return -1;
+    
+    int reqLineLen = (int)(lineEnd - buffer);
+    if (reqLineLen >= sizeof(req->method) + sizeof(req->path) + 4)
+        return -1;
+    
+    char reqLine[1024];
+    lstrcpynA(reqLine, buffer, sizeof(reqLine));
+    
+    char *method = reqLine;
+    char *path = strchr(method, ' ');
+    if (!path)
+        return -1;
+    *path = '\0';
+    path++;
+    
+    char *version = strchr(path, ' ');
+    if (version) {
+        *version = '\0';
+    }
+    
+    lstrcpynA(req->method, method, sizeof(req->method));
+    lstrcpynA(req->path, path, sizeof(req->path));
+    
+    char *query = strchr(req->path, '?');
+    if (query) {
+        *query = '\0';
+        query++;
+        lstrcpynA(req->query, query, sizeof(req->query));
+    }
+    
+    char *bodyStart = strstr(buffer, "\r\n\r\n");
+    if (bodyStart) {
+        bodyStart += 4;
+        int bodyLen = bytes - (int)(bodyStart - buffer);
+        if (bodyLen > 0 && bodyLen < (int)sizeof(req->body)) {
+            memcpy(req->body, bodyStart, bodyLen);
+            req->body[bodyLen] = '\0';
+            req->bodyLen = bodyLen;
+        }
+    }
+    
+    const char *cl = strstr(buffer, "Content-Length:");
+    if (cl) {
+        cl += 15;
+        while (*cl == ' ' || *cl == '\t') cl++;
+        const char *clEnd = strchr(cl, '\r');
+        if (clEnd) {
+            int len = (int)(clEnd - cl);
+            if (len < (int)sizeof(req->contentType)) {
+                memcpy(req->contentType, cl, len);
+                req->contentType[len] = '\0';
+            }
+        }
+    }
+    
+    return 0;
+}
+
+static void RouteRequest(SOCKET s, HttpRequest *req)
+{
+    if (strcmp(req->method, "GET") == 0) {
+        if (strcmp(req->path, "/api/tags") == 0)
+            HandleGetTags(s);
+        else if (strcmp(req->path, "/v1/models") == 0)
+            HandleGetV1Models(s);
+        else if (strcmp(req->path, "/api/version") == 0)
+            HandleVersion(s);
+        else if (strcmp(req->path, "/") == 0)
+            HandleVersion(s);
+        else if (strcmp(req->path, "/api/daemon/shutdown") == 0)
+            HandleShutdown(s);
+        else
+            HandleNotFound(s);
+    }
+    else if (strcmp(req->method, "POST") == 0) {
+        if (strcmp(req->path, "/api/generate") == 0)
+            HandlePostGenerate(s, req);
+        else if (strcmp(req->path, "/api/chat") == 0)
+            HandlePostChat(s, req);
+        else if (strcmp(req->path, "/v1/chat/completions") == 0)
+            HandlePostV1Chat(s, req);
+        else
+            HandleNotFound(s);
+    }
+    else if (strcmp(req->method, "DELETE") == 0) {
+        if (strcmp(req->path, "/api/delete") == 0)
+            HandleDeleteModel(s);
+        else
+            HandleNotFound(s);
+    }
+    else if (strcmp(req->method, "OPTIONS") == 0) {
+        char header[512];
+        int headerLen = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n");
+        send(s, header, headerLen, 0);
+    }
+    else {
+        HandleNotFound(s);
+    }
+}
+
+static DWORD WINAPI DaemonHttpWorkerThread(LPVOID param)
+{
+    SOCKET clientSock = (SOCKET)param;
+    HttpRequest req;
+    
+    if (ParseHttpRequest(clientSock, &req) == 0) {
+        DaemonLog("[REQUEST] %s %s", req.method, req.path);
+        RouteRequest(clientSock, &req);
+    }
+    
+    closesocket(clientSock);
+    return 0;
+}
+
+static DWORD WINAPI DaemonListenThread(LPVOID param)
+{
+    SOCKET listenSock = (SOCKET)param;
+    HANDLE threads[DAEMON_THREAD_POOL_SIZE];
+    int threadCount = 0;
+    
+    while (sDaemonRunning) {
+        struct sockaddr_in clientAddr;
+        int addrLen = sizeof(clientAddr);
+        
+        SOCKET clientSock = accept(listenSock, (struct sockaddr*)&clientAddr, &addrLen);
+        
+        if (clientSock == INVALID_SOCKET) {
+            if (sDaemonRunning)
+                Sleep(100);
+            continue;
+        }
+        
+        if (threadCount >= DAEMON_THREAD_POOL_SIZE) {
+            WaitForMultipleObjects(threadCount, threads, FALSE, 100);
+            threadCount = 0;
+        }
+        
+        HANDLE hThread = CreateThread(NULL, 0, DaemonHttpWorkerThread, (LPVOID)clientSock, 0, NULL);
+        if (hThread) {
+            threads[threadCount++] = hThread;
+            CloseHandle(hThread);
+        } else {
+            closesocket(clientSock);
+        }
+    }
+    
+    for (int i = 0; i < threadCount; i++) {
+        if (threads[i])
+            CloseHandle(threads[i]);
+    }
+    
+    return 0;
+}
+
+static int StartDaemonHttpServer(int port)
+{
+    WSADATA wsa;
+    struct sockaddr_in addr;
+    int reuse = 1;
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0)
+        return -1;
+    
+    sDaemonListenSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (sDaemonListenSocket == INVALID_SOCKET) {
+        WSACleanup();
+        return -1;
+    }
+    
+    setsockopt(sDaemonListenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(sDaemonListenSocket, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        closesocket(sDaemonListenSocket);
+        WSACleanup();
+        return -1;
+    }
+    
+    if (listen(sDaemonListenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        closesocket(sDaemonListenSocket);
+        WSACleanup();
+        return -1;
+    }
+    
+    sDaemonRunning = TRUE;
+    
+    HANDLE hListenThread = CreateThread(NULL, 0, DaemonListenThread, (LPVOID)sDaemonListenSocket, 0, NULL);
+    if (!hListenThread) {
+        closesocket(sDaemonListenSocket);
+        WSACleanup();
+        return -1;
+    }
+    
+    CloseHandle(hListenThread);
+    
+    DaemonLog("[INFO] HTTP server started on port %d", port);
+    
+    return 0;
+}
+
+static void StopDaemonHttpServer(void)
+{
+    sDaemonRunning = FALSE;
+    
+    if (sDaemonListenSocket != INVALID_SOCKET) {
+        shutdown(sDaemonListenSocket, SD_BOTH);
+        closesocket(sDaemonListenSocket);
+        sDaemonListenSocket = INVALID_SOCKET;
+    }
+    
+    WSACleanup();
+}
+
+static int DaemonStatus(void)
+{
+    if (!IsDaemonRunning()) {
+        printf("  Status  : Stopped\n");
+        printf("  (Start with: valora daemon start)\n\n");
+        fflush(stdout);
+        return 1;
+    }
+    
+    DWORD pid = ReadPidFile();
+    ULONGLONG uptime = 0;
+    
+    if (sDaemonStartTime > 0) {
+        uptime = (GetTickCount64() - sDaemonStartTime) / 1000;
+    }
+    
+    printf("\n");
+    printf("=== Valora Daemon ===\n");
+    printf("\n");
+    printf("  Status : Running\n");
+    printf("  Port   : %d\n", sDaemonPort);
+    printf("  PID    : %lu\n", pid);
+    
+    if (uptime > 0) {
+        int hours = (int)(uptime / 3600);
+        int mins = (int)((uptime % 3600) / 60);
+        int secs = (int)(uptime % 60);
+        printf("  Uptime : %dh %dm %ds\n", hours, mins, secs);
+    }
+    
+    printf("\n");
+    printf("  Current Model\n");
+    printf("  --------------\n");
+    
+    if (sCurrentDaemonModel[0]) {
+        int modelSizeMB = GetModelSizeMB(sCurrentDaemonModel);
+        const char *quant = DetectQuantizationType(sCurrentDaemonModel);
+        printf("  Name  : %s\n", sCurrentDaemonModel);
+        printf("  Type  : Chat (%s)\n", quant);
+        printf("  Size  : %d MB\n", modelSizeMB);
+    } else {
+        printf("  (No model loaded - will load on first request)\n");
+    }
+    
+    printf("\n");
+    printf("  System Resources\n");
+    printf("  ----------------\n");
+    ULONGLONG availRAM = GetAvailableRamMB();
+    ULONGLONG totalRAM = GetSystemRamMB();
+    ULONGLONG usedRAM = totalRAM - availRAM;
+    printf("  RAM   : %llu / %llu MB used\n", usedRAM, totalRAM);
+    
+    printf("\n\n");
+    fflush(stdout);
+    
+    return 0;
+}
+
+static int DaemonStart(int port, BOOL foreground)
+{
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD consoleMode = 0;
+    if (hConsole != INVALID_HANDLE_VALUE) {
+        GetConsoleMode(hConsole, &consoleMode);
+        consoleMode |= ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+        SetConsoleMode(hConsole, consoleMode);
+    }
+    
+    if (IsDaemonRunning()) {
+        printf("Valora daemon is already running on port %d\n\n", port);
+        fflush(stdout);
+        return 0;
+    }
+    
+    if (!foreground) {
+        char selfPath[MAX_PATH];
+        char args[256];
+        
+        GetModuleFileNameA(NULL, selfPath, sizeof(selfPath));
+        snprintf(args, sizeof(args), "daemon --fg --port %d", port);
+        
+        SHELLEXECUTEINFOA sei = {0};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpFile = selfPath;
+        sei.lpParameters = args;
+        sei.nShow = SW_HIDE;
+        
+        if (!ShellExecuteExA(&sei)) {
+            fprintf(stderr, "Failed to start daemon process\n\n");
+            fflush(stderr);
+            return 1;
+        }
+        
+        DWORD newPid = GetProcessId(sei.hProcess);
+        CloseHandle(sei.hProcess);
+        
+        WritePidFile(newPid);
+        
+        Sleep(1000);
+        
+        printf("\n[*] Valora daemon started\n");
+        printf("    Port : %d\n", port);
+        printf("    PID  : %lu\n", newPid);
+        printf("    Logs : %%APPDATA%%\\Valora\\daemon.log\n");
+        printf("\n\n");
+        fflush(stdout);
+        
+        return 0;
+    }
+    
+    return RunDaemonLoop(port);
+}
+
+static int DaemonStop(void)
+{
+    DWORD pid = ReadPidFile();
+    int port = sDaemonPort;
+    
+    if (pid == 0) {
+        printf("Daemon PID file not found. Is the daemon running?\n");
+        fflush(stdout);
+        return 1;
+    }
+    
+    printf("\n[*] Stopping daemon (PID: %lu)...\n", pid);
+    fflush(stdout);
+    
+    SOCKET stopSock;
+    struct sockaddr_in addr;
+    WSADATA wsd;
+    char buffer[1024];
+    
+    if (WSAStartup(MAKEWORD(2,2), &wsd) == 0) {
+        stopSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (stopSock != INVALID_SOCKET) {
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((u_short)port);
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            
+            if (connect(stopSock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                char req[256];
+                int reqLen = snprintf(req, sizeof(req),
+                    "GET /api/daemon/shutdown HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+                send(stopSock, req, reqLen, 0);
+                
+                recv(stopSock, buffer, sizeof(buffer), 0);
+            }
+            
+            closesocket(stopSock);
+        }
+        WSACleanup();
+    }
+    
+    Sleep(500);
+    
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        CloseHandle(hProc);
+        
+        printf("[*] Graceful stop failed, forcing termination...\n");
+        fflush(stdout);
+        KillProcessTree(pid);
+    }
+    
+    DeletePidFile();
+    
+    printf("[*] Daemon stopped.\n\n\n");
+    fflush(stdout);
+    
+    return 0;
+}
+
+static int DaemonRestart(int port)
+{
+    DaemonStop();
+    Sleep(1000);
+    return DaemonStart(port, FALSE);
+}
+
+static int RunDaemonLoop(int port)
+{
+    char ctx[32], gpu[32], threads[32];
+    
+    sDaemonPort = port;
+    sDaemonStartTime = GetTickCount64();
+    
+    DaemonLogOpen();
+    DaemonLog("[INFO] ===============================================");
+    DaemonLog("[INFO] Valora Daemon starting on port %d", port);
+    
+    if (!LoadConfigFromDisk()) {
+        DaemonLog("[ERROR] Failed to load config");
+        fprintf(stderr, "Valora is not configured. Run 'valora setup' first.\n\n");
+        fflush(stderr);
+        DaemonLogClose();
+        return 1;
+    }
+    
+    if (!sServer[0] || !sFolder[0]) {
+        DaemonLog("[ERROR] Server or models folder not configured");
+        fprintf(stderr, "Server or models folder not configured.\n\n");
+        fflush(stderr);
+        DaemonLogClose();
+        return 1;
+    }
+    
+    sDaemonModelMutex = CreateMutex(NULL, FALSE, NULL);
+    
+    GetConfiguredServerValues(ctx, sizeof(ctx), gpu, sizeof(gpu), NULL, 0, threads, sizeof(threads), NULL, 0);
+    
+    DaemonLog("[INFO] Config loaded - Server: %s", sServer);
+    DaemonLog("[INFO] Models folder: %s", sFolder);
+    
+    if (StartDaemonHttpServer(port) != 0) {
+        DaemonLog("[ERROR] Failed to start HTTP server on port %d", port);
+        fprintf(stderr, "Failed to start HTTP server on port %d\n\n", port);
+        fflush(stderr);
+        if (sDaemonModelMutex) CloseHandle(sDaemonModelMutex);
+        DaemonLogClose();
+        return 1;
+    }
+    
+    DaemonLog("[INFO] Daemon ready and listening on 0.0.0.0:%d", port);
+    
+    printf("\n=== Valora Daemon ===\n");
+    printf("\n");
+    printf("  Port : %d\n", port);
+    printf("  APIs :\n");
+    printf("         GET  /api/tags            List models\n");
+    printf("         POST /api/chat            Chat\n");
+    printf("         POST /v1/chat/completions OpenAI compat\n");
+    printf("\n");
+    printf("  Logs : %%APPDATA%%\\Valora\\daemon.log\n");
+    printf("\n");
+    printf("Press Ctrl+C to stop.\n");
+    printf("\n");
+    fflush(stdout);
+    
+    while (sDaemonRunning) {
+        Sleep(100);
+    }
+    
+    DaemonLog("[INFO] Shutting down...");
+    
+    StopDaemonHttpServer();
+    
+    WaitForSingleObject(sDaemonModelMutex, INFINITE);
+    DaemonUnloadModel();
+    ReleaseMutex(sDaemonModelMutex);
+    
+    if (sDaemonModelMutex) CloseHandle(sDaemonModelMutex);
+    
+    DaemonLog("[INFO] Daemon stopped");
+    DaemonLogClose();
+    
+    return 0;
+}
+
+static int RunDaemonCommand(int argc, char **argv)
+{
+    int i;
+    int port = DAEMON_DEFAULT_PORT;
+    BOOL foreground = FALSE;
+    BOOL showStatus = FALSE;
+    BOOL showLog = FALSE;
+    int logLines = 50;
+    
+    AttachConsoleStreams(TRUE);
+    
+    for (i = 2; i < argc; i++) {
+        if (lstrcmpiA(argv[i], "start") == 0) {
+        }
+        else if (lstrcmpiA(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        }
+        else if (lstrcmpiA(argv[i], "--fg") == 0) {
+            foreground = TRUE;
+        }
+        else if (lstrcmpiA(argv[i], "--foreground") == 0) {
+            foreground = TRUE;
+        }
+        else if (lstrcmpiA(argv[i], "stop") == 0) {
+            return DaemonStop();
+        }
+        else if (lstrcmpiA(argv[i], "status") == 0) {
+            return DaemonStatus();
+        }
+        else if (lstrcmpiA(argv[i], "restart") == 0) {
+            return DaemonRestart(port);
+        }
+        else if (lstrcmpiA(argv[i], "log") == 0) {
+            showLog = TRUE;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                logLines = atoi(argv[++i]);
+                if (logLines <= 0) logLines = 50;
+            }
+        }
+        else if (lstrcmpiA(argv[i], "--log-lines") == 0 && i + 1 < argc) {
+            logLines = atoi(argv[++i]);
+            showLog = TRUE;
+        }
+        else {
+            fprintf(stderr, "Unknown daemon command: %s\n", argv[i]);
+            fprintf(stderr, "Usage: valora daemon [start|stop|status|restart|log]\n");
+            fflush(stderr);
+            return 1;
+        }
+    }
+    
+    if (showLog) {
+        return DaemonLogPrint(logLines);
+    }
+    
+    if (showStatus) {
+        return DaemonStatus();
+    }
+    
+    return DaemonStart(port, foreground);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    AttachConsoleStreams(argc > 1);
     
-    if (argc > 1) {
-        AttachConsoleStreams();
+    if (argc > 1 && lstrcmpiA(argv[1], "daemon") == 0) {
+        return RunDaemonCommand(argc, argv);
+    }
+    
+    if (argc > 2 && lstrcmpiA(argv[1], "serve") == 0 && lstrcmpiA(argv[2], "--daemon") == 0) {
+        return RunDaemonCommand(argc, argv);
     }
     
     return RunCli(argc, argv);
@@ -6012,5 +7977,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     argv = __argv;
     argc = __argc;
+    AttachConsoleStreams(argc > 1);
     return RunCli(argc, argv);
 }
