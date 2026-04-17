@@ -8,6 +8,7 @@
 #include <wininet.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wincrypt.h>
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -20,6 +21,7 @@
 
 static int RunDaemonCommand(int argc, char **argv);
 static int RunDaemonLoop(int port);
+static BOOL IsDaemonPortOpen(int port);
 
 #define IDI_ICON1 101
 #define VALORA_APP_DIR "Valora"
@@ -1511,7 +1513,7 @@ static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen
     }
 }
 
-static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int customGpu, BOOL includeLocalIp)
+static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int customGpu, BOOL includeLocalIp, int customPort)
 {
     char modelPath[MAX_PATH * 2];
     char ctx[32], gpu[32], port[32], threads[32], kvCacheK[16], kvCacheV[16];
@@ -1525,6 +1527,8 @@ static void BuildServeCommand(char *dst, int dstLen, const char *customCtx, int 
         lstrcpynA(ctx, customCtx, sizeof(ctx));
     if (customGpu >= 0)
         snprintf(gpu, sizeof(gpu), "%d", customGpu);
+    if (customPort > 0)
+        snprintf(port, sizeof(port), "%d", customPort);
 
     if (includeLocalIp) {
         lstrcpynA(host, "0.0.0.0", sizeof(host));
@@ -1611,6 +1615,70 @@ static int RunChildProcess(const char *commandLine)
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return (int)exitCode;
+}
+
+static int RunDetachedChildProcess(const char *commandLine, int waitPort)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char mutableCmd[MAX_CMD];
+    DWORD exitCode = STILL_ACTIVE;
+    int waited = 0;
+
+    if (!commandLine || !*commandLine)
+        return 1;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    lstrcpynA(mutableCmd, commandLine, sizeof(mutableCmd));
+
+    if (!CreateProcessA(NULL, mutableCmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                        NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "Failed to start command in background.\n");
+        return 1;
+    }
+
+    CloseHandle(pi.hThread);
+
+    if (waitPort > 0) {
+        printf("Starting server in background");
+        fflush(stdout);
+
+        while (waited < 30000) {
+            if (IsDaemonPortOpen(waitPort)) {
+                printf("\n\n\x1b[32mServer is running in background.\x1b[0m\n");
+                printf("PID: %lu\n", pi.dwProcessId);
+                printf("URL: http://127.0.0.1:%d\n\n", waitPort);
+                CloseHandle(pi.hProcess);
+                return 0;
+            }
+
+            if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+                printf("\n");
+                fprintf(stderr, "\x1b[31mServer process exited early (code %lu).\x1b[0m\n", exitCode);
+                CloseHandle(pi.hProcess);
+                return 1;
+            }
+
+            printf(".");
+            fflush(stdout);
+            Sleep(250);
+            waited += 250;
+        }
+
+        printf("\n");
+        fprintf(stderr, "\x1b[31mServer did not open port %d within 30 seconds.\x1b[0m\n", waitPort);
+        CloseHandle(pi.hProcess);
+        return 1;
+    }
+
+    printf("\n\x1b[32mProcess started in background.\x1b[0m PID: %lu\n\n", pi.dwProcessId);
+    CloseHandle(pi.hProcess);
+    return 0;
 }
 
 static BOOL NormalizeHuggingFaceRepo(const char *input, char *repo, int repoLen)
@@ -2981,6 +3049,7 @@ static int PrintUsage(void)
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
+    printf("      --foreground      Keep server attached to current terminal\n");
     printf("      --cache-type-k <t>  K cache type (default: f16)\n");
     printf("      --cache-type-v <t>  V cache type (default: f16)\n");
     printf("        Types: f16, q8_0, q4_0, q4_1\n");
@@ -2993,7 +3062,7 @@ static int PrintUsage(void)
     printf("  valora llama --dir <path>  Change llama.cpp folder path\n");
     
     printf("\n\x1b[33mServer:\x1b[0m\n");
-    printf("  valora serve [model]  Start model in llama-server\n");
+    printf("  valora serve [model]  Start model in llama-server (background by default)\n");
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
@@ -3019,6 +3088,8 @@ static int PrintUsage(void)
     printf("  valora daemon log [N]         Show last N lines of daemon log (default: 50)\n");
     printf("\n  Daemon API Endpoints:\n");
     printf("    GET  /api/tags              List available models (Ollama-compatible)\n");
+    printf("    GET  /api/ps                List loaded models (Ollama-compatible)\n");
+    printf("    POST /api/show             Show model metadata (Ollama-compatible)\n");
     printf("    GET  /v1/models             List models (OpenAI-compatible)\n");
     printf("    POST /api/generate           Generate completion\n");
     printf("    POST /api/chat              Chat completion\n");
@@ -4160,7 +4231,9 @@ static int RunCli(int argc, char **argv)
         int i;
         int customGpu = -1;
         char customCtx[32] = "";
+        char configuredPort[32] = "8000";
         BOOL includeLocalIp = FALSE;
+        BOOL foreground = FALSE;
         BOOL modelProvidedAsArg = FALSE;
         int customPort = 0;
         SafetyDecision safety;
@@ -4169,6 +4242,8 @@ static int RunCli(int argc, char **argv)
 
         if (EnsureCliConfigReady(FALSE) != 0)
             return 1;
+
+        GetConfiguredServerValues(NULL, 0, NULL, 0, configuredPort, sizeof(configuredPort), NULL, 0, NULL, 0);
 
         for (i = 2; i < argc; i++) {
             if (lstrcmpiA(argv[i], "--context") == 0 && i + 1 < argc) {
@@ -4182,6 +4257,8 @@ static int RunCli(int argc, char **argv)
             } else if (lstrcmpiA(argv[i], "--port") == 0 && i + 1 < argc) {
                 customPort = atoi(argv[i + 1]);
                 i++;
+            } else if (lstrcmpiA(argv[i], "--fg") == 0 || lstrcmpiA(argv[i], "--foreground") == 0) {
+                foreground = TRUE;
             } else if (argv[i][0] != '-') {
                 lstrcpynA(sSelectedModel, argv[i], sizeof(sSelectedModel));
                 modelProvidedAsArg = TRUE;
@@ -4227,11 +4304,13 @@ static int RunCli(int argc, char **argv)
             }
         }
 
-        BuildServeCommand(sCommand, sizeof(sCommand), customCtx[0] ? customCtx : NULL, customGpu, includeLocalIp);
+        BuildServeCommand(sCommand, sizeof(sCommand), customCtx[0] ? customCtx : NULL, customGpu, includeLocalIp, customPort);
         if (customCtx[0])
             printf("Using custom context length: %s\n", customCtx);
         if (includeLocalIp)
             printf("Server will listen on localhost and local IP\n");
+        if (customPort > 0)
+            printf("Using custom port: %d\n", customPort);
 
         {
             ULONGLONG availRAM = GetAvailableRamMB();
@@ -4242,7 +4321,13 @@ static int RunCli(int argc, char **argv)
         }
 
         sModelLoaded = TRUE;
-        return RunChildProcess(sCommand);
+        if (foreground) {
+            printf("\x1b[90mForeground mode enabled. Closing the terminal will stop the server.\x1b[0m\n\n");
+            return RunChildProcess(sCommand);
+        }
+
+        printf("\x1b[90mBackground mode enabled. The server will keep running after this terminal closes.\x1b[0m\n\n");
+        return RunDetachedChildProcess(sCommand, customPort > 0 ? customPort : atoi(configuredPort));
     }
 
     if (lstrcmpiA(argv[1], "chat") == 0 || lstrcmpiA(argv[1], "cli") == 0) {
@@ -4347,6 +4432,7 @@ static int RunCli(int argc, char **argv)
 
 typedef struct {
     char role[32];
+    char name[64];
     char content[MAX_MESSAGE_LEN];
 } ChatMessage;
 
@@ -4415,6 +4501,7 @@ static int sOllamaModelCount = 0;
 
 static char* HttpPost(const char *url, const char *json_data);
 static char* HttpGetUrl(const char *full_url);
+static void ResetScannedModels(void);
 
 static void FreeOllamaModels(void) {
     if (sOllamaModels) {
@@ -4647,7 +4734,7 @@ static void PrintWebSearchReport(const char *query, int resultCount) {
     printf("\x1b[90m+========================================+\x1b[0m\n\n");
 }
 
-static void ChatAddMessage(const char *role, const char *content) {
+static void ChatAddMessageEx(const char *role, const char *name, const char *content) {
     if (sChatHistory.count >= MAX_HISTORY) {
         int i;
         for (i = 0; i < sChatHistory.count - 1; i++) {
@@ -4658,8 +4745,24 @@ static void ChatAddMessage(const char *role, const char *content) {
     
     ChatMessage *msg = &sChatHistory.messages[sChatHistory.count];
     strncpy(msg->role, role, sizeof(msg->role) - 1);
+    msg->role[sizeof(msg->role) - 1] = '\0';
+    if (name) {
+        strncpy(msg->name, name, sizeof(msg->name) - 1);
+        msg->name[sizeof(msg->name) - 1] = '\0';
+    } else {
+        msg->name[0] = '\0';
+    }
     strncpy(msg->content, content, sizeof(msg->content) - 1);
+    msg->content[sizeof(msg->content) - 1] = '\0';
     sChatHistory.count++;
+}
+
+static void ChatAddMessage(const char *role, const char *content) {
+    ChatAddMessageEx(role, NULL, content);
+}
+
+static void ChatAddToolMessage(const char *name, const char *content) {
+    ChatAddMessageEx("tool", name, content);
 }
 
 static void ChatClear(void) {
@@ -4669,8 +4772,9 @@ static void ChatClear(void) {
 
 static const char* GetSystemPrompt(void) {
     return "You are Valora, a helpful AI assistant running locally. "
-           "Keep responses short and helpful. "
-           "You can use web search when needed for current information.";
+           "Be concise, practical, and organized. "
+           "When tools are available, use them deliberately and explain the result clearly. "
+           "For technical tasks, prefer precise step-by-step guidance over vague advice.";
 }
 
 static size_t HttpWriteCallback(void *contents, size_t size, size_t nmemb, char **output) {
@@ -4716,15 +4820,16 @@ static char* ReadInternetResponse(HINTERNET hRequest, int bufferSize)
 
 static DWORD WINAPI ThinkingAnimationThread(LPVOID param) {
     int *running = (int*)param;
-    const char *frames = "|/-\\";
+    const char *frames[] = {"[    ]", "[=   ]", "[==  ]", "[=== ]", "[ ===]", "[  ==]", "[   =]"};
+    const char *labels[] = {"Thinking", "Planning", "Checking context", "Writing reply"};
     int frame = 0;
     while (*running) {
-        printf("\r\x1b[36m[%c]\x1b[0m \x1b[33mProcessing...\x1b[0m ", frames[frame % 4]);
+        printf("\r\x1b[36m%s\x1b[0m \x1b[33m%s...\x1b[0m ", frames[frame % 7], labels[(frame / 6) % 4]);
         fflush(stdout);
-        Sleep(100);
+        Sleep(110);
         frame++;
     }
-    printf("\r                                 \r");
+    printf("\r                                                         \r");
     fflush(stdout);
     return 0;
 }
@@ -4800,6 +4905,7 @@ static BOOL sToolsForcedDisabled = FALSE;
 static BOOL ShouldUseTools(void) {
     /* Disable tools for small models that don't support function calling */
     /* Models below 1B parameters typically can't handle tool calls */
+    if (sOllamaMode) return FALSE;
     if (sToolsForcedDisabled) return FALSE;
     return sToolsEnabled;
 }
@@ -4813,16 +4919,66 @@ static const char* GetToolsDefinition(void) {
         "\"type\": \"function\","
         "\"function\": {"
         "\"name\": \"wikipedia\","
-        "\"description\": \"Get a summary from Wikipedia for a given topic. Use when you need factual information about people, places, events, or topics.\","
+        "\"description\": \"Get a concise Wikipedia summary for factual background on a topic.\","
         "\"parameters\": {"
         "\"type\": \"object\","
         "\"properties\": {"
         "\"topic\": {"
         "\"type\": \"string\","
         "\"description\": \"The Wikipedia article topic to look up (e.g., 'World_War_II', 'Artificial_intelligence')\""
+        "}"
         "},"
         "\"required\": [\"topic\"]"
         "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"web_search\","
+        "\"description\": \"Search the web for recent or broad public information and short result summaries.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"query\": {"
+        "\"type\": \"string\","
+        "\"description\": \"The search query\""
+        "}"
+        "},"
+        "\"required\": [\"query\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"current_time\","
+        "\"description\": \"Get the current local time and date on this machine.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {}"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"system_info\","
+        "\"description\": \"Get local system information including RAM, GPU, and server status.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {}"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"list_models\","
+        "\"description\": \"List available local models from the configured models folder.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {}"
         "}"
         "}"
         "}"
@@ -4837,7 +4993,7 @@ static char* BuildChatPayload(const char *user_message) {
     
     offset = snprintf(payload, sizeof(payload),
         "{\"model\":\"auto\",\"messages\":["
-        "{\"role\":\"system\",\"content\":\"%s. Available tools: wikipedia(topic) - lookup Wikipedia articles.\"},",
+        "{\"role\":\"system\",\"content\":\"%s. Available tools: wikipedia(topic), web_search(query), current_time(), system_info(), list_models(). Use tools only when they improve the answer.\"},",
         GetSystemPrompt());
     
     for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
@@ -4847,10 +5003,19 @@ static char* BuildChatPayload(const char *user_message) {
         char escaped[8192] = "";
         JsonEscapeTextEx(sChatHistory.messages[i].content, escaped, sizeof(escaped), TRUE, TRUE);
         
-        offset += snprintf(payload + offset, sizeof(payload) - offset,
-            "{\"role\":\"%s\",\"content\":\"%s\"}",
-            sChatHistory.messages[i].role,
-            escaped);
+        if (strcmp(sChatHistory.messages[i].role, "tool") == 0 && sChatHistory.messages[i].name[0]) {
+            char escapedName[256] = "";
+            JsonEscapeTextEx(sChatHistory.messages[i].name, escapedName, sizeof(escapedName), TRUE, TRUE);
+            offset += snprintf(payload + offset, sizeof(payload) - offset,
+                "{\"role\":\"tool\",\"name\":\"%s\",\"content\":\"%s\"}",
+                escapedName,
+                escaped);
+        } else {
+            offset += snprintf(payload + offset, sizeof(payload) - offset,
+                "{\"role\":\"%s\",\"content\":\"%s\"}",
+                sChatHistory.messages[i].role,
+                escaped);
+        }
     }
     
     if (user_message) {
@@ -4964,7 +5129,11 @@ static char* ParseChatResponse(const char *json_response) {
 static BOOL HasToolCall(const char *json_response) {
     if (!json_response) return FALSE;
     return (strstr(json_response, "\"tool_calls\":") != NULL || 
-            strstr(json_response, "wikipedia") != NULL);
+            strstr(json_response, "\"name\":\"wikipedia\"") != NULL ||
+            strstr(json_response, "\"name\":\"web_search\"") != NULL ||
+            strstr(json_response, "\"name\":\"current_time\"") != NULL ||
+            strstr(json_response, "\"name\":\"system_info\"") != NULL ||
+            strstr(json_response, "\"name\":\"list_models\"") != NULL);
 }
 
 static char* ExtractToolCall(const char *json_response) {
@@ -4991,6 +5160,8 @@ static char* ExtractToolCall(const char *json_response) {
 static char* ExtractToolArgs(const char *json_response) {
     static char args[4096];
     const char *start, *end;
+    char *dst;
+    const char *src;
     
     args[0] = '\0';
     if (!json_response) return args;
@@ -5004,19 +5175,164 @@ static char* ExtractToolArgs(const char *json_response) {
         start += 14;
     }
     
-    end = strstr(start, "\"");
-    if (!end) return args;
+    end = start;
+    while (*end) {
+        if (*end == '\\' && end[1]) {
+            end += 2;
+            continue;
+        }
+        if (*end == '"') break;
+        end++;
+    }
+    if (!end || *end != '"') return args;
     
     int len = (int)(end - start);
     if (len >= (int)sizeof(args)) len = sizeof(args) - 1;
     
     strncpy(args, start, len);
     args[len] = '\0';
+
+    src = args;
+    dst = args;
+    while (*src) {
+        if (*src == '\\' && src[1]) {
+            src++;
+            if (*src == 'n') *dst++ = '\n';
+            else if (*src == 't') *dst++ = '\t';
+            else if (*src == 'r') *dst++ = '\r';
+            else *dst++ = *src;
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
     
     return args;
 }
 
 static char* DoWikiSearch(const char *searchQuery);
+static char* DoWebSearch(const char *searchQuery);
+
+static BOOL ExtractToolStringArg(const char *tool_args, const char *key, char *out, int outLen) {
+    char pattern[64];
+    const char *start;
+    const char *end;
+    char *dst;
+    const char *src;
+
+    if (!out || outLen <= 0) return FALSE;
+    out[0] = '\0';
+    if (!tool_args || !key) return FALSE;
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    start = strstr(tool_args, pattern);
+    if (!start) {
+        snprintf(pattern, sizeof(pattern), "%s:", key);
+        start = strstr(tool_args, pattern);
+        if (!start) return FALSE;
+        start += strlen(pattern);
+        while (*start == ' ' || *start == '"' || *start == '\'') start++;
+    } else {
+        start += strlen(pattern);
+    }
+
+    end = start;
+    while (*end) {
+        if (*end == '\\' && end[1]) {
+            end += 2;
+            continue;
+        }
+        if (*end == '"' || *end == '\n' || *end == '\r' || *end == '}')
+            break;
+        end++;
+    }
+
+    if (end <= start) return FALSE;
+    if (end - start >= outLen) end = start + outLen - 1;
+
+    strncpy(out, start, end - start);
+    out[end - start] = '\0';
+
+    src = out;
+    dst = out;
+    while (*src) {
+        if (*src == '\\' && src[1]) {
+            src++;
+            if (*src == 'n') *dst++ = '\n';
+            else if (*src == 't') *dst++ = '\t';
+            else if (*src == 'r') *dst++ = '\r';
+            else *dst++ = *src;
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return TRUE;
+}
+
+static void BuildSystemInfoReport(char *result, int resultLen) {
+    ULONGLONG availRAM = GetAvailableRamMB();
+    ULONGLONG totalRAM = GetSystemRamMB();
+    int vramMB = GetTotalVRAM();
+    char gpuName[256] = "";
+    char serverModel[MAX_PATH] = "";
+
+    if (!result || resultLen <= 0) return;
+
+    GetGpuName(gpuName, sizeof(gpuName));
+    if (sSelectedModel[0])
+        lstrcpynA(serverModel, sSelectedModel, sizeof(serverModel));
+    else if (sSelectedOllamaModel[0])
+        lstrcpynA(serverModel, sSelectedOllamaModel, sizeof(serverModel));
+    else
+        lstrcpynA(serverModel, "(none)", sizeof(serverModel));
+
+    snprintf(result, resultLen,
+        "System info:\n"
+        "- RAM: %llu MB available / %llu MB total\n"
+        "- GPU: %s\n"
+        "- VRAM: %d MB\n"
+        "- Server URL: %s\n"
+        "- Active model: %s\n"
+        "- Tools: %s\n"
+        "- Mode: %s",
+        availRAM, totalRAM,
+        gpuName[0] ? gpuName : "Unknown",
+        vramMB,
+        sOllamaMode ? sOllamaUrl : sServerUrl,
+        serverModel,
+        ShouldUseTools() ? "enabled" : "disabled",
+        sOllamaMode ? "ollama" : "local");
+}
+
+static void BuildModelListReport(char *result, int resultLen) {
+    int i;
+    int count = 0;
+
+    if (!result || resultLen <= 0) return;
+    result[0] = '\0';
+
+    ResetScannedModels();
+    ScanModelsRecursively(sFolder, &nModels);
+    count = nModels;
+
+    if (count <= 0) {
+        lstrcpynA(result, "No local models found.", resultLen);
+        return;
+    }
+
+    snprintf(result, resultLen, "Available local models (%d):", count);
+    for (i = 0; i < count && i < 12; i++) {
+        char line[512];
+        snprintf(line, sizeof(line), "\n- %s [%s]", sModels[i], DetectQuantizationType(sModels[i]));
+        if ((int)strlen(result) + (int)strlen(line) < resultLen - 1)
+            strcat(result, line);
+    }
+    if (count > 12 && (int)strlen(result) < resultLen - 32)
+        strcat(result, "\n- ...");
+}
 
 static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *result, int resultLen) {
     if (!tool_name || !result || resultLen <= 0) return FALSE;
@@ -5025,23 +5341,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
     
     if (strcmp(tool_name, "wikipedia") == 0) {
         char topic[512] = "";
-        const char *topic_start = strstr(tool_args, "\"topic\":\"");
-        if (!topic_start) topic_start = strstr(tool_args, "topic:");
-        if (topic_start) {
-            if (strstr(tool_args, "\"topic\":\"")) {
-                topic_start += 9;
-            } else {
-                topic_start += 7;
-            }
-            const char *topic_end = strstr(topic_start, "\"");
-            if (!topic_end) topic_end = topic_start + strlen(topic_start);
-            int len = (int)(topic_end - topic_start);
-            if (len > 500) len = 500;
-            strncpy(topic, topic_start, len);
-            topic[len] = '\0';
-        }
-        
-        if (topic[0]) {
+        if (ExtractToolStringArg(tool_args, "topic", topic, sizeof(topic)) && topic[0]) {
             char *wiki_result = DoWikiSearch(topic);
             if (wiki_result && wiki_result[0]) {
                 strncpy(result, wiki_result, resultLen - 1);
@@ -5049,6 +5349,28 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
                 return TRUE;
             }
         }
+    } else if (strcmp(tool_name, "web_search") == 0) {
+        char query[512] = "";
+        if (ExtractToolStringArg(tool_args, "query", query, sizeof(query)) && query[0]) {
+            char *search_result = DoWebSearch(query);
+            if (search_result && search_result[0]) {
+                snprintf(result, resultLen, "Web search results for '%s':\n%s", query, search_result);
+                return TRUE;
+            }
+        }
+    } else if (strcmp(tool_name, "current_time") == 0) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        snprintf(result, resultLen,
+            "Current local time: %04d-%02d-%02d %02d:%02d:%02d",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        return TRUE;
+    } else if (strcmp(tool_name, "system_info") == 0) {
+        BuildSystemInfoReport(result, resultLen);
+        return TRUE;
+    } else if (strcmp(tool_name, "list_models") == 0) {
+        BuildModelListReport(result, resultLen);
+        return TRUE;
     }
     
     return FALSE;
@@ -5057,23 +5379,108 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
 static void PrintWrapped(const char *text, int width) {
     if (!text || !*text) return;
     
-    const char *p = text;
-    while (*p) {
-        if (*p == '\\' && *(p+1) == 'n') {
-            putchar('\n');
-            p += 2;
-            if (*p == '\n') putchar('\n');
-            continue;
+    if (width < 20) width = 80;
+
+    {
+        char line[8192];
+        int lineLen = 0;
+        const char *p = text;
+
+        while (*p) {
+            char ch = *p++;
+            if (ch == '\\' && *p == 'n') {
+                ch = '\n';
+                p++;
+            }
+
+            if (ch == '\r')
+                continue;
+
+            if (ch == '\n') {
+                line[lineLen] = '\0';
+                printf("%s\n", lineLen > 0 ? line : "");
+                lineLen = 0;
+                continue;
+            }
+
+            if (lineLen >= width && ch == ' ') {
+                line[lineLen] = '\0';
+                printf("%s\n", line);
+                lineLen = 0;
+                continue;
+            }
+
+            line[lineLen++] = ch;
+            if (lineLen >= width) {
+                line[lineLen] = '\0';
+                printf("%s\n", line);
+                lineLen = 0;
+            }
         }
-        if (*p == '\n') {
-            putchar('\n');
-            p++;
-            continue;
+
+        if (lineLen > 0) {
+            line[lineLen] = '\0';
+            printf("%s", line);
         }
-        putchar(*p);
-        p++;
     }
     fflush(stdout);
+}
+
+typedef struct {
+    volatile int running;
+    char title[64];
+} ToolAnimationState;
+
+static void PrintChatBanner(void) {
+    const char *model = sOllamaMode ? sSelectedOllamaModel : sSelectedModel;
+    const char *server = sOllamaMode ? sOllamaUrl : sServerUrl;
+
+    printf("\x1b[36m\x1b[1m==============================================\x1b[0m\n");
+    printf("\x1b[36m\x1b[1m                 VALORA CHAT                  \x1b[0m\n");
+    if (sOllamaMode)
+        printf("\x1b[36m\x1b[1m                OLLAMA BRIDGE                 \x1b[0m\n");
+    printf("\x1b[36m\x1b[1m==============================================\x1b[0m\n\n");
+    printf("\x1b[32mModel:\x1b[0m %s\n", model && model[0] ? model : "(auto)");
+    printf("\x1b[32mServer:\x1b[0m %s\n", server && server[0] ? server : "(unset)");
+    printf("\x1b[32mTools:\x1b[0m %s", ShouldUseTools() ? "on" : "off");
+    if (sToolsForcedDisabled)
+        printf(" \x1b[90m(auto-disabled for small model)\x1b[0m");
+    printf("\n");
+    printf("\x1b[32mHistory:\x1b[0m %d message(s)\n\n", sChatHistory.count);
+}
+
+static void PrintChatCommandHint(void) {
+    printf("\x1b[90mCommands: /exit  /clear  /cls  /status  /tools on|off  /history  /websearch  /wiki  /\x1b[0m\n\n");
+}
+
+static void PrintAssistantHeader(void) {
+    printf("\n\x1b[36mValora\x1b[0m ");
+    printf("\x1b[90m>\x1b[0m ");
+}
+
+static void PrintToolEvent(const char *phase, const char *tool_name, const char *detail) {
+    printf("\n\x1b[35m[%s]\x1b[0m \x1b[1m%s\x1b[0m", phase ? phase : "tool", tool_name ? tool_name : "tool");
+    if (detail && detail[0])
+        printf(" \x1b[90m%s\x1b[0m", detail);
+    printf("\n");
+}
+
+static DWORD WINAPI ToolAnimationThread(LPVOID param) {
+    ToolAnimationState *state = (ToolAnimationState*)param;
+    const char *frames[] = {"[=   ]", "[==  ]", "[=== ]", "[ ===]", "[  ==]", "[   =]"};
+    int frame = 0;
+
+    if (!state) return 0;
+
+    while (state->running) {
+        printf("\r\x1b[35m%s\x1b[0m \x1b[90m%s...\x1b[0m", frames[frame % 6], state->title);
+        fflush(stdout);
+        Sleep(120);
+        frame++;
+    }
+    printf("\r                                                  \r");
+    fflush(stdout);
+    return 0;
 }
 
 static void EnsureServerRunning(void) {
@@ -5596,13 +6003,11 @@ static int RunChatMode(void) {
     int exitCode = 0;
     
     ChatInit();
+    sToolsEnabled = TRUE;
+    sServerStartedByUs = FALSE;
     
     if (sOllamaMode) {
         ClearConsole();
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
         
         if (SelectOllamaModel(sSelectedOllamaModel, sizeof(sSelectedOllamaModel)) != 0) {
             printf("\x1b[90mModel selection cancelled.\x1b[0m\n");
@@ -5610,37 +6015,23 @@ static int RunChatMode(void) {
         }
         
         ClearConsole();
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
-        printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedOllamaModel);
-        printf("\x1b[32mServer:\x1b[0m %s\n\n", sOllamaUrl);
-        
         snprintf(url, sizeof(url), "%s/api/chat", sOllamaUrl);
     } else if (IsServerRunning()) {
         ClearConsole();
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
-        printf("\x1b[90mUsing existing server.\x1b[0m\n\n");
         snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     } else {
         if (StartServerForChat(NULL) != 0) {
             return 1;
         }
+        serverStartedByUs = TRUE;
         sServerStartedByUs = TRUE;
         SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
         ClearConsole();
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
-        printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
-        printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
-        printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
         snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     }
     
-    printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen | '\x1b[33m/\x1b[90m' for commands\n\n");
+    PrintChatBanner();
+    PrintChatCommandHint();
     
     while (1) {
         printf("\x1b[32mYou \x1b[0m> ");
@@ -5660,6 +6051,9 @@ input[strcspn(input, "\n")] = '\0';
             printf("  /exit              Exit and stop server\n");
             printf("  /clear             Clear chat history\n");
             printf("  /cls               Clear terminal\n");
+            printf("  /status            Show chat + system status\n");
+            printf("  /history           Show recent messages\n");
+            printf("  /tools on|off      Toggle tool calling\n");
             printf("  /model             Change model\n");
             printf("  /restart           Restart llama server\n");
             printf("  /restart --context N  Restart with context N\n");
@@ -5680,26 +6074,56 @@ input[strcspn(input, "\n")] = '\0';
         
         if (strcmp(input, "/cls") == 0) {
             ClearConsole();
-            printf("\x1b[36m\x1b[1m========================================\x1b[0m\n");
-            printf("\x1b[36m\x1b[1m         VALORA CHAT\x1b[0m\n");
-            if (sOllamaMode) {
-                printf("\x1b[36m\x1b[1m        (Ollama Mode)\x1b[0m\n");
-            }
-            printf("\x1b[36m\x1b[1m========================================\x1b[0m\n\n");
-            if (sOllamaMode) {
-                printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedOllamaModel);
-                printf("\x1b[32mServer:\x1b[0m %s\n\n", sOllamaUrl);
-            } else {
-                printf("\x1b[32mModel:\x1b[0m %s\n", sSelectedModel);
-                printf("\x1b[32mServer:\x1b[0m http://127.0.0.1:8000\n\n");
-            }
-            printf("\x1b[90mType '\x1b[33m/exit\x1b[90m' to quit | '\x1b[33m/clear\x1b[90m' for history | '\x1b[33m/cls\x1b[90m' for screen\n\n");
+            PrintChatBanner();
+            PrintChatCommandHint();
             continue;
         }
         
         if (strcmp(input, "/clear") == 0 || strcmp(input, "clear") == 0) {
             ChatClear();
             printf("\x1b[90mChat history cleared.\x1b[0m\n");
+            continue;
+        }
+
+        if (strcmp(input, "/status") == 0) {
+            char status[4096];
+            BuildSystemInfoReport(status, sizeof(status));
+            printf("\n\x1b[36m=== Status ===\x1b[0m\n");
+            PrintWrapped(status, 88);
+            printf("\n\n");
+            continue;
+        }
+
+        if (strcmp(input, "/history") == 0) {
+            printf("\n\x1b[36m=== Recent History ===\x1b[0m\n");
+            if (sChatHistory.count == 0) {
+                printf("\x1b[90mNo messages yet.\x1b[0m\n\n");
+            } else {
+                int startIdx = sChatHistory.count > 8 ? sChatHistory.count - 8 : 0;
+                for (int i = startIdx; i < sChatHistory.count; i++) {
+                    printf("\x1b[90m[%s", sChatHistory.messages[i].role);
+                    if (sChatHistory.messages[i].name[0])
+                        printf(":%s", sChatHistory.messages[i].name);
+                    printf("]\x1b[0m %.120s\n", sChatHistory.messages[i].content);
+                }
+                printf("\n");
+            }
+            continue;
+        }
+
+        if (strncmp(input, "/tools", 6) == 0) {
+            char *mode = input + 6;
+            while (*mode == ' ') mode++;
+            if (strcmp(mode, "on") == 0) {
+                sToolsEnabled = TRUE;
+                printf("\x1b[32mTool calling enabled.\x1b[0m\n");
+            } else if (strcmp(mode, "off") == 0) {
+                sToolsEnabled = FALSE;
+                printf("\x1b[33mTool calling disabled.\x1b[0m\n");
+            } else {
+                printf("\x1b[90mTools are currently %s.\x1b[0m Use /tools on or /tools off\n",
+                       ShouldUseTools() ? "on" : "off");
+            }
             continue;
         }
         
@@ -5850,6 +6274,9 @@ input[strcspn(input, "\n")] = '\0';
             printf("  /exit     - Exit chat and stop server\n");
             printf("  /clear    - Clear chat history\n");
             printf("  /cls      - Clear terminal screen\n");
+            printf("  /status   - Show local system + chat status\n");
+            printf("  /history  - Show recent messages\n");
+            printf("  /tools    - Toggle tool calling\n");
             printf("  /model    - Change model (requires restart)\n");
             printf("  /restart  - Restart llama server\n");
             printf("  /websearch <query> - Search web and get AI response\n");
@@ -5918,20 +6345,27 @@ input[strcspn(input, "\n")] = '\0';
             char tool_name[256] = "";
             char tool_args[4096] = "";
             char tool_result[8192] = "";
+            ToolAnimationState toolState;
+            HANDLE hToolThread = NULL;
             
             strncpy(tool_name, ExtractToolCall(response), sizeof(tool_name) - 1);
             tool_name[sizeof(tool_name) - 1] = '\0';
             strncpy(tool_args, ExtractToolArgs(response), sizeof(tool_args) - 1);
             tool_args[sizeof(tool_args) - 1] = '\0';
             
+            ZeroMemory(&toolState, sizeof(toolState));
+            if (tool_name[0]) {
+                toolState.running = 1;
+                strncpy(toolState.title, tool_name, sizeof(toolState.title) - 1);
+                PrintToolEvent("tool", tool_name, tool_args[0] ? tool_args : NULL);
+                hToolThread = CreateThread(NULL, 0, ToolAnimationThread, &toolState, 0, NULL);
+            }
+            
             if (tool_name[0] && ExecuteToolCall(tool_name, tool_args, tool_result, sizeof(tool_result))) {
-                printf("\x1b[90m[Tool] Executed %s: %.100s...\x1b[0m\n", tool_name, tool_result);
-                
-                char tool_msg[16384];
-                snprintf(tool_msg, sizeof(tool_msg),
-                    "{\"role\":\"tool\",\"content\":\"%s\",\"name\":\"%s\"}",
-                    tool_result, tool_name);
-                ChatAddMessage("user", tool_msg);
+                toolState.running = 0;
+                if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
+                PrintToolEvent("done", tool_name, "result captured");
+                ChatAddToolMessage(tool_name, tool_result);
                 
                 free(response);
                 if (sOllamaMode) {
@@ -5944,6 +6378,10 @@ input[strcspn(input, "\n")] = '\0';
                     printf("\x1b[31mFailed to get follow-up response\x1b[0m\n");
                     continue;
                 }
+            } else if (tool_name[0]) {
+                toolState.running = 0;
+                if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
+                PrintToolEvent("error", tool_name, "tool execution failed");
             }
         }
         
@@ -5975,8 +6413,8 @@ input[strcspn(input, "\n")] = '\0';
         
         ChatAddMessage("assistant", assistant_msg);
         
-        printf("\n\x1b[35mAI >\x1b[0m ");
-        PrintWrapped(assistant_msg, 80);
+        PrintAssistantHeader();
+        PrintWrapped(assistant_msg, 88);
         printf("\n\n");
         fflush(stdout);
         
@@ -6028,6 +6466,7 @@ static HANDLE  sDaemonLogFile = INVALID_HANDLE_VALUE;
 static ULONGLONG sDaemonStartTime = 0;
 static char    sDaemonLogPath[MAX_PATH] = "";
 static SOCKET  sDaemonListenSocket = INVALID_SOCKET;
+static BOOL    sDaemonQuietStartup = FALSE;
 
 static CRITICAL_SECTION sDaemonLogCS;
 
@@ -6037,6 +6476,274 @@ static BOOL BuildPidFilePath(char *path, int len);
 static void ResetScannedModels(void)
 {
     nModels = 0;
+}
+
+static void NormalizeModelNameForApi(const char *src, char *dst, int dstLen)
+{
+    int i;
+
+    if (!dst || dstLen <= 0)
+        return;
+
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    for (i = 0; i < dstLen - 1 && src[i]; ++i) {
+        dst[i] = (src[i] == '\\') ? '/' : src[i];
+    }
+    dst[i] = '\0';
+}
+
+static void NormalizeModelNameFromApi(const char *src, char *dst, int dstLen)
+{
+    int i;
+
+    if (!dst || dstLen <= 0)
+        return;
+
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    for (i = 0; i < dstLen - 1 && src[i]; ++i) {
+        dst[i] = (src[i] == '/') ? '\\' : src[i];
+    }
+    dst[i] = '\0';
+}
+
+static void BuildUtcTimestamp(char *out, int outLen)
+{
+    SYSTEMTIME st;
+
+    if (!out || outLen <= 0)
+        return;
+
+    GetSystemTime(&st);
+    snprintf(out, outLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+}
+
+static const char *GuessOllamaFamily(const char *modelName)
+{
+    if (!modelName || !*modelName)
+        return "";
+
+    if (StringContainsI(modelName, "qwen3.5")) return "qwen35";
+    if (StringContainsI(modelName, "qwen2.5")) return "qwen25";
+    if (StringContainsI(modelName, "llama")) return "llama";
+    if (StringContainsI(modelName, "gemma")) return "gemma";
+    if (StringContainsI(modelName, "qwen")) return "qwen";
+    if (StringContainsI(modelName, "mistral")) return "mistral";
+    if (StringContainsI(modelName, "phi")) return "phi";
+    if (StringContainsI(modelName, "deepseek")) return "deepseek";
+    if (StringContainsI(modelName, "bge") || StringContainsI(modelName, "embed")) return "embedding";
+
+    return "";
+}
+
+static const char *GuessOllamaParameterSize(const char *modelName)
+{
+    if (!modelName || !*modelName)
+        return "";
+
+    if (StringContainsI(modelName, "0.5b")) return "0.5B";
+    if (StringContainsI(modelName, "0.8b")) return "0.8B";
+    if (StringContainsI(modelName, "1.5b")) return "1.5B";
+    if (StringContainsI(modelName, "1b")) return "1B";
+    if (StringContainsI(modelName, "2b")) return "2B";
+    if (StringContainsI(modelName, "3b")) return "3B";
+    if (StringContainsI(modelName, "4b")) return "4B";
+    if (StringContainsI(modelName, "7b")) return "7B";
+    if (StringContainsI(modelName, "8b")) return "8B";
+    if (StringContainsI(modelName, "9b")) return "9B";
+    if (StringContainsI(modelName, "11b")) return "11B";
+    if (StringContainsI(modelName, "12b")) return "12B";
+    if (StringContainsI(modelName, "14b")) return "14B";
+    if (StringContainsI(modelName, "27b")) return "27B";
+    if (StringContainsI(modelName, "32b")) return "32B";
+    if (StringContainsI(modelName, "70b")) return "70B";
+
+    return "";
+}
+
+static BOOL ComputeFileSha256Hex(const char *filePath, char *digest, int digestLen)
+{
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    BYTE buffer[8192];
+    BYTE hash[32];
+    DWORD bytesRead = 0;
+    DWORD hashLen = sizeof(hash);
+    BOOL success = FALSE;
+
+    if (!digest || digestLen < 65 || !filePath || !*filePath)
+        return FALSE;
+
+    digest[0] = '\0';
+    hFile = CreateFileA(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    if (!CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        goto cleanup;
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash))
+        goto cleanup;
+
+    while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
+        if (!CryptHashData(hHash, buffer, bytesRead, 0))
+            goto cleanup;
+    }
+
+    if (!CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0) || hashLen != 32)
+        goto cleanup;
+
+    for (DWORD i = 0; i < hashLen && (int)(i * 2 + 1) < digestLen; ++i)
+        snprintf(digest + i * 2, digestLen - (int)(i * 2), "%02x", hash[i]);
+
+    success = TRUE;
+
+cleanup:
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    return success;
+}
+
+static void FormatFileTimeForOllama(const FILETIME *utcFileTime, char *modifiedAt, int modifiedAtLen)
+{
+    FILETIME localFileTime;
+    SYSTEMTIME localSystemTime;
+    ULARGE_INTEGER utcTicks;
+    ULARGE_INTEGER localTicks;
+    LONGLONG diffTicks;
+    int offsetMinutes;
+    int absOffsetMinutes;
+    int fracTicks;
+    char sign;
+
+    if (!modifiedAt || modifiedAtLen <= 0) return;
+    modifiedAt[0] = '\0';
+    if (!utcFileTime) return;
+
+    if (!FileTimeToLocalFileTime(utcFileTime, &localFileTime))
+        return;
+    if (!FileTimeToSystemTime(&localFileTime, &localSystemTime))
+        return;
+
+    utcTicks.LowPart = utcFileTime->dwLowDateTime;
+    utcTicks.HighPart = utcFileTime->dwHighDateTime;
+    localTicks.LowPart = localFileTime.dwLowDateTime;
+    localTicks.HighPart = localFileTime.dwHighDateTime;
+
+    diffTicks = (LONGLONG)localTicks.QuadPart - (LONGLONG)utcTicks.QuadPart;
+    offsetMinutes = (int)(diffTicks / 600000000LL);
+    absOffsetMinutes = offsetMinutes < 0 ? -offsetMinutes : offsetMinutes;
+    fracTicks = (int)(localTicks.QuadPart % 10000000ULL);
+    sign = offsetMinutes >= 0 ? '+' : '-';
+
+    snprintf(modifiedAt, modifiedAtLen,
+             "%04d-%02d-%02dT%02d:%02d:%02d.%07d%c%02d:%02d",
+             localSystemTime.wYear, localSystemTime.wMonth, localSystemTime.wDay,
+             localSystemTime.wHour, localSystemTime.wMinute, localSystemTime.wSecond,
+             fracTicks, sign, absOffsetMinutes / 60, absOffsetMinutes % 60);
+}
+
+static BOOL GetModelFileMetadata(const char *modelName, ULONGLONG *fileSizeOut, char *modifiedAt, int modifiedAtLen, char *digest, int digestLen)
+{
+    char fullPath[MAX_PATH * 2];
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    ULARGE_INTEGER fileSize;
+
+    if (fileSizeOut)
+        *fileSizeOut = 0;
+    if (modifiedAt && modifiedAtLen > 0)
+        modifiedAt[0] = '\0';
+    if (digest && digestLen > 0)
+        digest[0] = '\0';
+
+    if (!modelName || !*modelName)
+        return FALSE;
+
+    BuildModelPath(fullPath, sizeof(fullPath), modelName);
+    if (!GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad))
+        return FALSE;
+
+    fileSize.LowPart = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+    if (fileSizeOut)
+        *fileSizeOut = fileSize.QuadPart;
+
+    if (modifiedAt && modifiedAtLen > 0)
+        FormatFileTimeForOllama(&fad.ftLastWriteTime, modifiedAt, modifiedAtLen);
+    if (digest && digestLen > 0)
+        ComputeFileSha256Hex(fullPath, digest, digestLen);
+
+    return TRUE;
+}
+
+static BOOL FindJsonStringSpan(const char *json, const char *pattern, const char **valueStart, int *valueLen)
+{
+    const char *p;
+    const char *end;
+
+    if (valueStart)
+        *valueStart = NULL;
+    if (valueLen)
+        *valueLen = 0;
+
+    if (!json || !pattern)
+        return FALSE;
+
+    p = strstr(json, pattern);
+    if (!p)
+        return FALSE;
+
+    p += strlen(pattern);
+    end = p;
+    while (*end) {
+        if (*end == '\\' && end[1]) {
+            end += 2;
+            continue;
+        }
+        if (*end == '"')
+            break;
+        end++;
+    }
+
+    if (*end != '"')
+        return FALSE;
+
+    if (valueStart)
+        *valueStart = p;
+    if (valueLen)
+        *valueLen = (int)(end - p);
+    return TRUE;
+}
+
+static void BuildOllamaDetailsJson(const char *modelName, char *out, int outLen)
+{
+    const char *family = GuessOllamaFamily(modelName);
+    const char *parameterSize = GuessOllamaParameterSize(modelName);
+    const char *quant = DetectQuantizationType(modelName);
+    char familiesJson[128];
+
+    if (!out || outLen <= 0)
+        return;
+
+    if (family[0])
+        snprintf(familiesJson, sizeof(familiesJson), "[\"%s\"]", family);
+    else
+        lstrcpynA(familiesJson, "null", sizeof(familiesJson));
+
+    snprintf(out, outLen,
+             "\"details\":{\"parent_model\":\"\",\"format\":\"gguf\","
+             "\"family\":\"%s\",\"families\":%s,"
+             "\"parameter_size\":\"%s\",\"quantization_level\":\"%s\"}",
+             family, familiesJson, parameterSize, quant);
 }
 
 static BOOL BuildDaemonLogPath(char *path, int len)
@@ -6215,6 +6922,8 @@ static void PrintDaemonEndpoints(int port)
     printf("  Endpoints\n");
     printf("  ---------\n");
     printf("  GET    %s/api/tags\n", baseUrl);
+    printf("  GET    %s/api/ps\n", baseUrl);
+    printf("  POST   %s/api/show\n", baseUrl);
     printf("  GET    %s/v1/models\n", baseUrl);
     printf("  POST   %s/api/generate\n", baseUrl);
     printf("  POST   %s/api/chat\n", baseUrl);
@@ -6538,6 +7247,112 @@ static void SendErrorResponse(SOCKET s, int status, const char *message)
     SendHttpResponse(s, status, "application/json", body, bodyLen);
 }
 
+static void SendOllamaErrorResponse(SOCKET s, int status, const char *message)
+{
+    char escaped[768];
+    char body[1024];
+    int bodyLen;
+
+    JsonEscapeTextEx(message ? message : "Unknown error", escaped, sizeof(escaped), FALSE, FALSE);
+    bodyLen = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", escaped);
+    SendHttpResponse(s, status, "application/json", body, bodyLen);
+}
+
+static char* BuildOllamaTranslatedResponse(const char *openAiJson, const char *modelName, BOOL isChat, BOOL stream, size_t *outLen)
+{
+    const char *contentStart = NULL;
+    const char *finishStart = NULL;
+    int contentLen = 0;
+    int finishLen = 0;
+    char apiModel[512];
+    char escapedModel[1024];
+    char timestamp[64];
+    char *body;
+    size_t capacity;
+    int bodyLen;
+
+    if (outLen)
+        *outLen = 0;
+
+    if (!openAiJson || !modelName)
+        return NULL;
+
+    if (isChat) {
+        FindJsonStringSpan(openAiJson, "\"content\":\"", &contentStart, &contentLen);
+    } else {
+        FindJsonStringSpan(openAiJson, "\"text\":\"", &contentStart, &contentLen);
+    }
+    FindJsonStringSpan(openAiJson, "\"finish_reason\":\"", &finishStart, &finishLen);
+    if (finishLen <= 0) {
+        finishStart = "stop";
+        finishLen = 4;
+    }
+
+    NormalizeModelNameForApi(modelName, apiModel, sizeof(apiModel));
+    JsonEscapeTextEx(apiModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+    BuildUtcTimestamp(timestamp, sizeof(timestamp));
+
+    capacity = strlen(openAiJson) + strlen(escapedModel) + 1024;
+    body = malloc(capacity);
+    if (!body)
+        return NULL;
+
+    if (stream) {
+        if (isChat) {
+            bodyLen = snprintf(body, capacity,
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"message\":{\"role\":\"assistant\",\"content\":\"%.*s\"},\"done\":false}\n"
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"%.*s\","
+                "\"total_duration\":0,\"load_duration\":0,\"prompt_eval_count\":0,\"prompt_eval_duration\":0,\"eval_count\":0,\"eval_duration\":0}\n",
+                escapedModel, timestamp, contentLen, contentStart ? contentStart : "",
+                escapedModel, timestamp, finishLen, finishStart);
+        } else {
+            bodyLen = snprintf(body, capacity,
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"response\":\"%.*s\",\"done\":false}\n"
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"response\":\"\",\"done\":true,\"done_reason\":\"%.*s\","
+                "\"total_duration\":0,\"load_duration\":0,\"prompt_eval_count\":0,\"prompt_eval_duration\":0,\"eval_count\":0,\"eval_duration\":0}\n",
+                escapedModel, timestamp, contentLen, contentStart ? contentStart : "",
+                escapedModel, timestamp, finishLen, finishStart);
+        }
+    } else {
+        if (isChat) {
+            bodyLen = snprintf(body, capacity,
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"message\":{\"role\":\"assistant\",\"content\":\"%.*s\"},"
+                "\"done\":true,\"done_reason\":\"%.*s\",\"total_duration\":0,\"load_duration\":0,"
+                "\"prompt_eval_count\":0,\"prompt_eval_duration\":0,\"eval_count\":0,\"eval_duration\":0}",
+                escapedModel, timestamp, contentLen, contentStart ? contentStart : "", finishLen, finishStart);
+        } else {
+            bodyLen = snprintf(body, capacity,
+                "{\"model\":\"%s\",\"created_at\":\"%s\",\"response\":\"%.*s\","
+                "\"done\":true,\"done_reason\":\"%.*s\",\"total_duration\":0,\"load_duration\":0,"
+                "\"prompt_eval_count\":0,\"prompt_eval_duration\":0,\"eval_count\":0,\"eval_duration\":0}",
+                escapedModel, timestamp, contentLen, contentStart ? contentStart : "", finishLen, finishStart);
+        }
+    }
+
+    if (bodyLen < 0) {
+        free(body);
+        return NULL;
+    }
+
+    if (outLen)
+        *outLen = (size_t)bodyLen;
+    return body;
+}
+
+static void SendTranslatedOllamaResponse(SOCKET s, const char *openAiJson, const char *modelName, BOOL isChat, BOOL stream)
+{
+    size_t bodyLen = 0;
+    char *body = BuildOllamaTranslatedResponse(openAiJson, modelName, isChat, stream, &bodyLen);
+
+    if (!body) {
+        SendOllamaErrorResponse(s, 500, "Failed to translate upstream response");
+        return;
+    }
+
+    SendHttpResponse(s, 200, stream ? "application/x-ndjson" : "application/json", body, (int)bodyLen);
+    free(body);
+}
+
 static void BuildServeCommandForDaemon(char *dst, int dstLen, const char *modelName, int port)
 {
     char modelPath[MAX_PATH * 2];
@@ -6654,7 +7469,9 @@ static int DaemonLaunchModel(const char *modelName)
     DaemonLog("[INFO] Launching model: %s", modelName);
     DaemonLog("[DEBUG] Command: %s", command);
     
-    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                        NULL, NULL, &si, &pi)) {
         DaemonLog("[ERROR] Failed to launch model: %lu", GetLastError());
         return -1;
     }
@@ -6758,10 +7575,24 @@ static char* ExtractJsonString(const char *json, const char *key, char *out, int
 
 static void ExtractOllamaGenerateRequest(const char *body, OllamaRequest *req)
 {
+    const char *valueStart = NULL;
+    int valueLen = 0;
+
     memset(req, 0, sizeof(OllamaRequest));
     
-    ExtractJsonString(body, "model", req->model, sizeof(req->model));
-    ExtractJsonString(body, "prompt", req->prompt, sizeof(req->prompt));
+    if (FindJsonStringSpan(body, "\"model\":\"", &valueStart, &valueLen) &&
+        valueLen > 0 && valueLen < (int)sizeof(req->model)) {
+        char apiModel[256];
+        memcpy(apiModel, valueStart, valueLen);
+        apiModel[valueLen] = '\0';
+        NormalizeModelNameFromApi(apiModel, req->model, sizeof(req->model));
+    }
+
+    if (FindJsonStringSpan(body, "\"prompt\":\"", &valueStart, &valueLen) &&
+        valueLen >= 0 && valueLen < (int)sizeof(req->prompt)) {
+        memcpy(req->prompt, valueStart, valueLen);
+        req->prompt[valueLen] = '\0';
+    }
     
     const char *streamStr = strstr(body, "\"stream\":");
     if (streamStr) {
@@ -6779,7 +7610,17 @@ static void ExtractOllamaChatRequest(const char *body, OllamaRequest *req)
     
     memset(req, 0, sizeof(OllamaRequest));
     
-    ExtractJsonString(body, "model", req->model, sizeof(req->model));
+    {
+        const char *valueStart = NULL;
+        int valueLen = 0;
+        if (FindJsonStringSpan(body, "\"model\":\"", &valueStart, &valueLen) &&
+            valueLen > 0 && valueLen < (int)sizeof(req->model)) {
+            char apiModel[256];
+            memcpy(apiModel, valueStart, valueLen);
+            apiModel[valueLen] = '\0';
+            NormalizeModelNameFromApi(apiModel, req->model, sizeof(req->model));
+        }
+    }
     
     const char *streamStr = strstr(body, "\"stream\":");
     if (streamStr) {
@@ -6840,7 +7681,6 @@ static void ExtractOllamaChatRequest(const char *body, OllamaRequest *req)
 static void BuildTagsResponse(SOCKET s)
 {
     char *response;
-    int totalLen;
     int capacity = 65536;
     int offset = 0;
     int i;
@@ -6857,39 +7697,27 @@ static void BuildTagsResponse(SOCKET s)
     ScanModelsRecursively(sFolder, &nModels);
     
     for (i = 0; i < nModels && i < MAX_MODELS; i++) {
-        char fullPath[MAX_PATH * 2];
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        ULARGE_INTEGER fileSize;
-        const char *quant;
-        const char *typeLabel;
-        SYSTEMTIME st;
-        FILETIME ft;
+        ULONGLONG fileSize = 0;
         char timeBuf[64];
+        char digest[80];
+        char apiModel[512];
+        char escapedModel[1024];
+        char escapedDigest[160];
+        char detailsJson[512];
+        char entry[3072];
+        int entryLen;
         
-        BuildModelPath(fullPath, sizeof(fullPath), sModels[i]);
-        
-        fileSize.QuadPart = 0;
-        if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad)) {
-            fileSize.LowPart = fad.nFileSizeLow;
-            fileSize.HighPart = fad.nFileSizeHigh;
-            ft = fad.ftLastWriteTime;
-            FileTimeToSystemTime(&ft, &st);
-            snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-        } else {
-            timeBuf[0] = '\0';
-        }
-        
-        quant = DetectQuantizationType(sModels[i]);
-        typeLabel = GetModelTypeLabel(sModels[i]);
-        
-        char entry[2048];
-        int entryLen = snprintf(entry, sizeof(entry),
+        GetModelFileMetadata(sModels[i], &fileSize, timeBuf, sizeof(timeBuf), digest, sizeof(digest));
+        NormalizeModelNameForApi(sModels[i], apiModel, sizeof(apiModel));
+        JsonEscapeTextEx(apiModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+        JsonEscapeTextEx(digest, escapedDigest, sizeof(escapedDigest), FALSE, FALSE);
+        BuildOllamaDetailsJson(sModels[i], detailsJson, sizeof(detailsJson));
+
+        entryLen = snprintf(entry, sizeof(entry),
             "%s{\"name\":\"%s\",\"model\":\"%s\",\"modified_at\":\"%s\",\"size\":%llu,"
-            "\"digest\":\"\",\"details\":{\"format\":\"gguf\",\"family\":\"llama\","
-            "\"parameter_size\":\"7B\",\"quantization_level\":\"%s\"}}",
+            "\"digest\":\"%s\",%s}",
             i > 0 ? "," : "",
-            sModels[i], sModels[i], timeBuf, fileSize.QuadPart, quant);
+            escapedModel, escapedModel, timeBuf, fileSize, escapedDigest, detailsJson);
         
         if (offset + entryLen >= capacity) {
             capacity *= 2;
@@ -6932,11 +7760,17 @@ static void BuildV1ModelsResponse(SOCKET s)
     ScanModelsRecursively(sFolder, &nModels);
     
     for (i = 0; i < nModels && i < MAX_MODELS; i++) {
+        char apiModel[512];
+        char escapedModel[1024];
         char entry[1024];
-        int entryLen = snprintf(entry, sizeof(entry),
+        int entryLen;
+
+        NormalizeModelNameForApi(sModels[i], apiModel, sizeof(apiModel));
+        JsonEscapeTextEx(apiModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+        entryLen = snprintf(entry, sizeof(entry),
             "%s{\"id\":\"%s\",\"object\":\"model\",\"created\":%ld,\"owned_by\":\"valora\"}",
             i > 0 ? "," : "",
-            sModels[i], (long)now);
+            escapedModel, (long)now);
         
         if (offset + entryLen >= capacity) {
             capacity *= 2;
@@ -6962,7 +7796,7 @@ static void BuildV1ModelsResponse(SOCKET s)
 static void HandleVersion(SOCKET s)
 {
     char body[256];
-    int bodyLen = snprintf(body, sizeof(body), "{\"version\":\"0.1.0\"}");
+    int bodyLen = snprintf(body, sizeof(body), "{\"version\":\"0.6.4\"}");
     SendHttpResponse(s, 200, "application/json", body, bodyLen);
 }
 
@@ -6995,6 +7829,95 @@ static void HandleDeleteModel(SOCKET s)
     char body[256];
     int bodyLen = snprintf(body, sizeof(body), "{\"status\":\"success\"}");
     SendHttpResponse(s, 200, "application/json", body, bodyLen);
+}
+
+static void HandleShowModel(SOCKET s, HttpRequest *req)
+{
+    char requestedModel[MAX_PATH];
+    char apiModel[512];
+    char escapedModel[1024];
+    char modelfile[1024];
+    char escapedModelfile[2048];
+    char parameters[512];
+    char escapedParameters[1024];
+    char capabilities[128];
+    char detailsJson[512];
+    char ctx[32], gpu[32], threads[32];
+    char body[8192];
+    const char *typeLabel;
+    int bodyLen;
+
+    requestedModel[0] = '\0';
+    ExtractJsonString(req->body, "name", requestedModel, sizeof(requestedModel));
+    if (!requestedModel[0])
+        ExtractJsonString(req->body, "model", requestedModel, sizeof(requestedModel));
+    NormalizeModelNameFromApi(requestedModel, requestedModel, sizeof(requestedModel));
+
+    if (!requestedModel[0]) {
+        SendOllamaErrorResponse(s, 400, "Missing model name");
+        return;
+    }
+
+    NormalizeModelNameForApi(requestedModel, apiModel, sizeof(apiModel));
+    JsonEscapeTextEx(apiModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+    snprintf(modelfile, sizeof(modelfile), "FROM %s", apiModel);
+    JsonEscapeTextEx(modelfile, escapedModelfile, sizeof(escapedModelfile), TRUE, TRUE);
+
+    GetModelConfig(requestedModel, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
+    snprintf(parameters, sizeof(parameters), "num_ctx %s\nnum_gpu %s\nnum_thread %s", ctx, gpu, threads);
+    JsonEscapeTextEx(parameters, escapedParameters, sizeof(escapedParameters), TRUE, TRUE);
+
+    typeLabel = GetModelTypeLabel(requestedModel);
+    if (_stricmp(typeLabel, "Embedding") == 0)
+        lstrcpynA(capabilities, "[\"embedding\"]", sizeof(capabilities));
+    else if (_stricmp(typeLabel, "Vision") == 0)
+        lstrcpynA(capabilities, "[\"completion\",\"vision\"]", sizeof(capabilities));
+    else
+        lstrcpynA(capabilities, "[\"completion\"]", sizeof(capabilities));
+
+    BuildOllamaDetailsJson(requestedModel, detailsJson, sizeof(detailsJson));
+    bodyLen = snprintf(body, sizeof(body),
+        "{\"license\":\"\",\"modelfile\":\"%s\",\"parameters\":\"%s\","
+        "\"template\":\"{{ .Prompt }}\",%s,"
+        "\"model_info\":{\"general.architecture\":\"%s\",\"valora.model_type\":\"%s\"},"
+        "\"capabilities\":%s,\"model\":\"%s\"}",
+        escapedModelfile, escapedParameters, detailsJson,
+        GuessOllamaFamily(requestedModel), typeLabel, capabilities, escapedModel);
+    SendHttpResponse(s, 200, "application/json", body, bodyLen);
+}
+
+static void HandleGetRunningModels(SOCKET s)
+{
+    char body[4096];
+    int bodyLen;
+
+    if (!sCurrentDaemonModel[0]) {
+        bodyLen = snprintf(body, sizeof(body), "{\"models\":[]}");
+        SendHttpResponse(s, 200, "application/json", body, bodyLen);
+        return;
+    }
+
+    {
+        ULONGLONG fileSize = 0;
+        char modifiedAt[64];
+        char digest[80];
+        char apiModel[512];
+        char escapedModel[1024];
+        char escapedDigest[160];
+        char detailsJson[512];
+
+        GetModelFileMetadata(sCurrentDaemonModel, &fileSize, modifiedAt, sizeof(modifiedAt), digest, sizeof(digest));
+        NormalizeModelNameForApi(sCurrentDaemonModel, apiModel, sizeof(apiModel));
+        JsonEscapeTextEx(apiModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+        JsonEscapeTextEx(digest, escapedDigest, sizeof(escapedDigest), FALSE, FALSE);
+        BuildOllamaDetailsJson(sCurrentDaemonModel, detailsJson, sizeof(detailsJson));
+
+        bodyLen = snprintf(body, sizeof(body),
+            "{\"models\":[{\"name\":\"%s\",\"model\":\"%s\",\"size\":%llu,"
+            "\"digest\":\"%s\",%s,\"expires_at\":\"0001-01-01T00:00:00Z\",\"size_vram\":0}]}",
+            escapedModel, escapedModel, fileSize, escapedDigest, detailsJson);
+        SendHttpResponse(s, 200, "application/json", body, bodyLen);
+    }
 }
 
 static void HandleShutdown(SOCKET s)
@@ -7267,9 +8190,13 @@ static void StreamProxyRequest(SOCKET clientSock, const char *llamaUrl, const ch
 
 static void BuildLlamaCompletionRequest(const OllamaRequest *req, char *out, int outLen, BOOL isChat)
 {
+    char escapedModel[1024];
+
+    JsonEscapeTextEx(sCurrentDaemonModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+
     if (isChat && req->messageCount > 0) {
         int offset = snprintf(out, outLen,
-            "{\"model\":\"%s\",\"messages\":[", sCurrentDaemonModel);
+            "{\"model\":\"%s\",\"messages\":[", escapedModel);
         
         for (int i = 0; i < req->messageCount && offset < outLen - 100; i++) {
             offset += snprintf(out + offset, outLen - offset, "%s%s",
@@ -7279,9 +8206,11 @@ static void BuildLlamaCompletionRequest(const OllamaRequest *req, char *out, int
         snprintf(out + offset, outLen - offset,
             "],\"stream\":false,\"max_tokens\":2048}");
     } else {
+        char escapedPrompt[65536];
+        JsonEscapeTextEx(req->prompt, escapedPrompt, sizeof(escapedPrompt), FALSE, FALSE);
         snprintf(out, outLen,
             "{\"model\":\"%s\",\"prompt\":\"%s\",\"stream\":false,\"max_tokens\":2048}",
-            sCurrentDaemonModel, req->prompt);
+            escapedModel, escapedPrompt);
     }
 }
 
@@ -7349,31 +8278,29 @@ static void HandlePostGenerate(SOCKET s, HttpRequest *req)
     ExtractOllamaGenerateRequest(req->body, &ollamaReq);
     
     if (!ollamaReq.model[0]) {
-        SendErrorResponse(s, 400, "Missing model field");
+        SendOllamaErrorResponse(s, 400, "Missing model field");
         return;
     }
     
     if (strcmp(ollamaReq.model, sCurrentDaemonModel) != 0) {
         int swapResult = DaemonSwapModel(ollamaReq.model);
         if (swapResult != 0) {
-            SendErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
+            SendOllamaErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
             return;
         }
     }
-    
-    snprintf(llamaRequest, sizeof(llamaRequest),
-        "{\"model\":\"%s\",\"prompt\":\"%s\",\"stream\":false,\"max_tokens\":2048}",
-        sCurrentDaemonModel, ollamaReq.prompt);
+
+    BuildLlamaCompletionRequest(&ollamaReq, llamaRequest, sizeof(llamaRequest), FALSE);
     
     size_t responseLen = 0;
     int errorStatus = 500;
     char *response = SendDaemonJsonRequest("/v1/completions", llamaRequest, (int)strlen(llamaRequest), &responseLen, &errorStatus);
     
     if (response && responseLen > 0) {
-        SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
+        SendTranslatedOllamaResponse(s, response, sCurrentDaemonModel, FALSE, ollamaReq.stream);
         free(response);
     } else {
-        SendErrorResponse(s, errorStatus, errorStatus == 503 ? "Model server not responding" : "Failed to get response from model");
+        SendOllamaErrorResponse(s, errorStatus, errorStatus == 503 ? "Model server not responding" : "Failed to get response from model");
     }
 }
 
@@ -7385,47 +8312,40 @@ static void HandlePostChat(SOCKET s, HttpRequest *req)
     ExtractOllamaChatRequest(req->body, &ollamaReq);
     
     if (!ollamaReq.model[0]) {
-        SendErrorResponse(s, 400, "Missing model field");
+        SendOllamaErrorResponse(s, 400, "Missing model field");
         return;
     }
     
     if (strcmp(ollamaReq.model, sCurrentDaemonModel) != 0) {
         int swapResult = DaemonSwapModel(ollamaReq.model);
         if (swapResult != 0) {
-            SendErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
+            SendOllamaErrorResponse(s, 503, "Failed to load model - safety check failed or model not found");
             return;
         }
     }
-    
-    int offset = snprintf(llamaRequest, sizeof(llamaRequest),
-        "{\"model\":\"%s\",\"messages\":[", sCurrentDaemonModel);
-    
-    for (int i = 0; i < ollamaReq.messageCount && offset < (int)sizeof(llamaRequest) - 100; i++) {
-        offset += snprintf(llamaRequest + offset, sizeof(llamaRequest) - offset, "%s%s",
-            i > 0 ? "," : "", ollamaReq.messages[i]);
-    }
-    
-    snprintf(llamaRequest + offset, sizeof(llamaRequest) - offset,
-        "],\"stream\":false,\"max_tokens\":2048}");
+
+    BuildLlamaCompletionRequest(&ollamaReq, llamaRequest, sizeof(llamaRequest), TRUE);
     
     size_t responseLen = 0;
     int errorStatus = 500;
     char *response = SendDaemonJsonRequest("/v1/chat/completions", llamaRequest, (int)strlen(llamaRequest), &responseLen, &errorStatus);
     
     if (response && responseLen > 0) {
-        SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
+        SendTranslatedOllamaResponse(s, response, sCurrentDaemonModel, TRUE, ollamaReq.stream);
         free(response);
     } else {
-        SendErrorResponse(s, errorStatus, errorStatus == 503 ? "Model server not responding" : "Failed to get response from model");
+        SendOllamaErrorResponse(s, errorStatus, errorStatus == 503 ? "Model server not responding" : "Failed to get response from model");
     }
 }
 
 static void HandlePostV1Chat(SOCKET s, HttpRequest *req)
 {
     char requestedModel[MAX_PATH];
+    char normalizedBody[65536];
 
     requestedModel[0] = '\0';
     ExtractJsonString(req->body, "model", requestedModel, sizeof(requestedModel));
+    NormalizeModelNameFromApi(requestedModel, requestedModel, sizeof(requestedModel));
 
     if (!requestedModel[0]) {
         SendErrorResponse(s, 400, "Missing model field");
@@ -7440,9 +8360,22 @@ static void HandlePostV1Chat(SOCKET s, HttpRequest *req)
         }
     }
     
+    lstrcpynA(normalizedBody, req->body, sizeof(normalizedBody));
+    if (strchr(req->body, '/')) {
+        const char *modelStart = NULL;
+        int modelLen = 0;
+        if (FindJsonStringSpan(req->body, "\"model\":\"", &modelStart, &modelLen)) {
+            char escapedModel[1024];
+            size_t prefixLen = (size_t)(modelStart - req->body);
+            JsonEscapeTextEx(requestedModel, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+            snprintf(normalizedBody, sizeof(normalizedBody), "%.*s%s%s",
+                     (int)prefixLen, req->body, escapedModel, modelStart + modelLen);
+        }
+    }
+
     size_t responseLen = 0;
     int errorStatus = 500;
-    char *response = SendDaemonJsonRequest("/v1/chat/completions", req->body, req->bodyLen, &responseLen, &errorStatus);
+    char *response = SendDaemonJsonRequest("/v1/chat/completions", normalizedBody, (int)strlen(normalizedBody), &responseLen, &errorStatus);
     
     if (response && responseLen > 0) {
         SendHttpResponse(s, 200, "application/json", response, (int)responseLen);
@@ -7597,6 +8530,8 @@ static void RouteRequest(SOCKET s, HttpRequest *req)
     if (strcmp(req->method, "GET") == 0) {
         if (strcmp(req->path, "/api/tags") == 0)
             HandleGetTags(s);
+        else if (strcmp(req->path, "/api/ps") == 0)
+            HandleGetRunningModels(s);
         else if (strcmp(req->path, "/v1/models") == 0)
             HandleGetV1Models(s);
         else if (strcmp(req->path, "/api/version") == 0)
@@ -7615,6 +8550,8 @@ static void RouteRequest(SOCKET s, HttpRequest *req)
             HandlePostGenerate(s, req);
         else if (strcmp(req->path, "/api/chat") == 0)
             HandlePostChat(s, req);
+        else if (strcmp(req->path, "/api/show") == 0)
+            HandleShowModel(s, req);
         else if (strcmp(req->path, "/v1/chat/completions") == 0)
             HandlePostV1Chat(s, req);
         else
@@ -7871,14 +8808,17 @@ static int DaemonStart(int port, BOOL foreground)
         char selfPath[MAX_PATH];
         char workDir[MAX_PATH];
         char commandLine[MAX_PATH * 2];
+        char parameters[256];
         STARTUPINFOA si;
         PROCESS_INFORMATION pi;
+        SHELLEXECUTEINFOA sei;
         DWORD exitCode = STILL_ACTIVE;
         int waitMs = 0;
 
         GetModuleFileNameA(NULL, selfPath, sizeof(selfPath));
         GetDirectoryFromPath(selfPath, workDir, sizeof(workDir));
-        snprintf(commandLine, sizeof(commandLine), "\"%s\" daemon --fg --port %d", selfPath, port);
+        snprintf(commandLine, sizeof(commandLine), "\"%s\" daemon --fg --quiet-startup --port %d", selfPath, port);
+        snprintf(parameters, sizeof(parameters), "daemon --fg --quiet-startup --port %d", port);
 
         ZeroMemory(&si, sizeof(si));
         ZeroMemory(&pi, sizeof(pi));
@@ -7886,15 +8826,30 @@ static int DaemonStart(int port, BOOL foreground)
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
 
-        if (!CreateProcessA(NULL, commandLine, NULL, NULL, FALSE,
-                            CREATE_NO_WINDOW | DETACHED_PROCESS,
-                            NULL, workDir, &si, &pi)) {
-            fprintf(stderr, "Failed to start daemon process\n\n");
-            fflush(stderr);
-            return 1;
+        ZeroMemory(&sei, sizeof(sei));
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpFile = selfPath;
+        sei.lpParameters = parameters;
+        sei.lpDirectory = workDir;
+        sei.nShow = SW_HIDE;
+
+        if (ShellExecuteExA(&sei) && sei.hProcess) {
+            pi.hProcess = sei.hProcess;
+            pi.dwProcessId = GetProcessId(sei.hProcess);
+            pi.hThread = NULL;
+        } else {
+            if (!CreateProcessA(NULL, commandLine, NULL, NULL, FALSE,
+                                CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                                NULL, workDir, &si, &pi)) {
+                fprintf(stderr, "Failed to start daemon process\n\n");
+                fflush(stderr);
+                return 1;
+            }
         }
 
-        CloseHandle(pi.hThread);
+        if (pi.hThread)
+            CloseHandle(pi.hThread);
         while (waitMs < 5000) {
             if (IsDaemonPortOpen(port))
                 break;
@@ -8065,9 +9020,11 @@ static int RunDaemonLoop(int port)
     
     DaemonLog("[INFO] Daemon ready and listening on 0.0.0.0:%d", port);
 
-    PrintDaemonEndpoints(port);
-    printf("Press Ctrl+C to stop.\n\n");
-    fflush(stdout);
+    if (!sDaemonQuietStartup) {
+        PrintDaemonEndpoints(port);
+        printf("Press Ctrl+C to stop.\n\n");
+        fflush(stdout);
+    }
     
     while (sDaemonRunning) {
         Sleep(100);
@@ -8100,6 +9057,7 @@ static int RunDaemonCommand(int argc, char **argv)
     
     AttachConsoleStreams(FALSE);
     sDaemonPort = port;
+    sDaemonQuietStartup = FALSE;
     
     for (i = 2; i < argc; i++) {
         if (lstrcmpiA(argv[i], "start") == 0) {
@@ -8112,6 +9070,9 @@ static int RunDaemonCommand(int argc, char **argv)
         }
         else if (lstrcmpiA(argv[i], "--foreground") == 0) {
             foreground = TRUE;
+        }
+        else if (lstrcmpiA(argv[i], "--quiet-startup") == 0) {
+            sDaemonQuietStartup = TRUE;
         }
         else if (lstrcmpiA(argv[i], "stop") == 0) {
             return DaemonStop();
