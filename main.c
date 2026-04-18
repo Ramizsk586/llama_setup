@@ -18,6 +18,7 @@
 #include <string.h>
 #include <conio.h>
 #include <time.h>
+#include <ctype.h>
 
 typedef enum {
     CLOUD_DISABLED = 0,
@@ -27,7 +28,18 @@ typedef enum {
     CLOUD_OPENROUTER
 } CloudProviderType;
 
-typedef struct { int running; char title[64]; } ToolAnimationState;
+typedef struct {
+    volatile LONG running;
+    HANDLE stop_event;
+    DWORD timeout_ms;
+    char title[64];
+} ToolAnimationState;
+
+typedef struct {
+    volatile LONG running;
+    HANDLE stop_event;
+    DWORD timeout_ms;
+} SearchAnimationState;
 
 static const char* GetCurrentTimeString(void) {
     static char buf[64];
@@ -41,8 +53,8 @@ static const char* GetSystemInfoString(void) {
     static char buf[256];
     SYSTEM_INFO si;
     GetNativeSystemInfo(&si);
-    snprintf(buf, sizeof(buf), "Processors: %u, Architecture: %u",
-        si.dwNumberOfProcessors, si.wProcessorLevel);
+    snprintf(buf, sizeof(buf), "Processors: %lu, Architecture: %u",
+        (unsigned long)si.dwNumberOfProcessors, (unsigned int)si.wProcessorArchitecture);
     return buf;
 }
 
@@ -50,25 +62,314 @@ static const char* ListModels(void) {
     return "";
 }
 
+/* Intentional minimal stub until config persistence wiring is implemented. */
 static BOOL SaveSearchConfig(void) {
     return TRUE;
 }
 
+/* Intentional no-op for builds where chat server lifecycle is external. */
 static void StopChatServer(void) {
 }
 
 static DWORD WINAPI SearchAnimationThread(LPVOID param) {
-    int *running = (int*)param;
-    while (*running) { Sleep(100); }
+    SearchAnimationState *state = (SearchAnimationState*)param;
+    DWORD start = GetTickCount();
+    while (InterlockedCompareExchange(&state->running, 0, 0) != 0) {
+        if (state->stop_event) {
+            if (WaitForSingleObject(state->stop_event, 100) == WAIT_OBJECT_0) break;
+        } else {
+            Sleep(100);
+        }
+        if (state->timeout_ms > 0 && (GetTickCount() - start) >= state->timeout_ms) break;
+    }
     return 0;
 }
 
+static int sTuiCols = 100;
+static int sTuiRows = 30;
+static int sConversationStartRow = 11;
+static int sConversationRows = 10;
+static int sInputRow = 24;
+static int sStatusRow = 23;
+static BOOL sChatTuiActive = FALSE;
+static char sStatusText[512] = "";
+static BOOL sStatusBusy = FALSE;
+
+#define TOOL_ARG_BUFFER_LEN 65536
+#define TOOL_RESULT_BUFFER_LEN 65536
+#define WORKFLOW_MAX_STEPS 8
+
+typedef struct {
+    char text[160];
+    int state; /* 0=pending/done, 1=active, 2=done */
+} WorkflowStep;
+
+static WorkflowStep sWorkflowSteps[WORKFLOW_MAX_STEPS];
+static int sWorkflowCount = 0;
+static int sWorkflowRow = 11;
+static int sWorkflowRows = 6;
+
+static void SetStatusLine(const char *text, BOOL busy) {
+    if (!text) text = "";
+    lstrcpynA(sStatusText, text, (int)sizeof(sStatusText));
+    sStatusBusy = busy;
+}
+
+static void WorkflowReset(void) {
+    ZeroMemory(sWorkflowSteps, sizeof(sWorkflowSteps));
+    sWorkflowCount = 0;
+}
+
+static void WorkflowAdvance(const char *text, BOOL completedImmediately) {
+    int i;
+    if (!text || !*text) return;
+
+    for (i = 0; i < sWorkflowCount; i++) {
+        if (sWorkflowSteps[i].state == 1)
+            sWorkflowSteps[i].state = 2;
+    }
+
+    if (sWorkflowCount >= WORKFLOW_MAX_STEPS) {
+        memmove(&sWorkflowSteps[0], &sWorkflowSteps[1], sizeof(WorkflowStep) * (WORKFLOW_MAX_STEPS - 1));
+        sWorkflowCount = WORKFLOW_MAX_STEPS - 1;
+    }
+
+    ZeroMemory(&sWorkflowSteps[sWorkflowCount], sizeof(WorkflowStep));
+    lstrcpynA(sWorkflowSteps[sWorkflowCount].text, text, (int)sizeof(sWorkflowSteps[sWorkflowCount].text));
+    sWorkflowSteps[sWorkflowCount].state = completedImmediately ? 2 : 1;
+    sWorkflowCount++;
+}
+
+static void WorkflowCompleteActive(const char *replacementText) {
+    int i;
+    for (i = sWorkflowCount - 1; i >= 0; --i) {
+        if (sWorkflowSteps[i].state == 1) {
+            if (replacementText && *replacementText)
+                lstrcpynA(sWorkflowSteps[i].text, replacementText, (int)sizeof(sWorkflowSteps[i].text));
+            sWorkflowSteps[i].state = 2;
+            return;
+        }
+    }
+    if (replacementText && *replacementText)
+        WorkflowAdvance(replacementText, TRUE);
+}
+
+static void MoveCursorTo(int row, int col) {
+    printf("\x1b[%d;%dH", row, col);
+}
+
+static void ClearScreenLine(int row) {
+    MoveCursorTo(row, 1);
+    printf("\x1b[2K");
+}
+
 static void PrintChatBanner(void) {
-    printf("\x1b[36m=== Valora Chat ===\x1b[0m\n");
+    int inner = sTuiCols - 2;
+    int i;
+    const char *title = "VALORA CHAT";
+    int titleLen = (int)strlen(title);
+    int pad;
+
+    if (inner < 20) inner = 20;
+    pad = (inner - titleLen) / 2;
+    if (pad < 1) pad = 1;
+
+    printf("\x1b[36m+");
+    for (i = 0; i < inner; i++) putchar('-');
+    printf("+\x1b[0m\n");
+
+    printf("\x1b[36m|\x1b[0m");
+    for (i = 0; i < pad; i++) putchar(' ');
+    printf("\x1b[36m%s\x1b[0m", title);
+    for (i = 0; i < inner - pad - titleLen; i++) putchar(' ');
+    printf("\x1b[36m|\x1b[0m\n");
+
+    printf("\x1b[36m+");
+    for (i = 0; i < inner; i++) putchar('=');
+    printf("+\x1b[0m\n");
 }
 
 static void PrintChatCommandHint(void) {
-    printf("Type /help for commands\n");
+    int inner = sTuiCols - 4;
+    const char *hint = "Press / for command palette  |  /workspace sandbox  |  /help full list";
+    if (inner < 20) inner = 20;
+    printf("\x1b[90m| %-*.*s |\x1b[0m\n", inner, inner, hint);
+}
+
+static void PrintChatFrameHeader(void) {
+    int inner = sTuiCols - 2;
+    int i;
+    if (inner < 20) inner = 20;
+    printf("\x1b[90m+");
+    for (i = 0; i < inner; i++) putchar('-');
+    printf("+\x1b[0m\n");
+}
+
+static BOOL ShowSlashCommandPalette(char *outCommand, int outLen) {
+    char choice[64];
+    int panelWidth;
+    int descWidth;
+    int i;
+    int left;
+    int top;
+    int height;
+    const char *cmds[][2] = {
+        {"/status", "System + chat status"},
+        {"/history", "Recent messages"},
+        {"/tools on", "Enable tools"},
+        {"/tools off", "Disable tools"},
+        {"/model", "Change model"},
+        {"/models", "List models"},
+        {"/wsearch", "Search engine settings"},
+        {"/cloud", "Switch cloud provider"},
+        {"/workspace", "Show sandbox root"},
+        {"/clear", "Clear chat history"},
+        {"/cls", "Clear screen"},
+        {"/exit", "Exit chat"}
+    };
+
+    if (!outCommand || outLen <= 0) return FALSE;
+    outCommand[0] = '\0';
+
+    panelWidth = sTuiCols - 8;
+    if (panelWidth > 96) panelWidth = 96;
+    if (panelWidth < 54) panelWidth = 54;
+    descWidth = panelWidth - 20;
+    if (descWidth < 20) descWidth = 20;
+    left = ((sTuiCols - (panelWidth + 2)) / 2) + 1;
+    if (left < 1) left = 1;
+    top = sConversationStartRow + 1;
+    height = 16;
+
+    MoveCursorTo(top, left);
+    printf("\x1b[36m+");
+    for (i = 0; i < panelWidth; i++) putchar('-');
+    printf("+\x1b[0m");
+    MoveCursorTo(top + 1, left);
+    printf("\x1b[36m|\x1b[0m \x1b[33m%-*.*s\x1b[0m \x1b[36m|\x1b[0m", panelWidth - 2, panelWidth - 2, "Command Palette");
+    MoveCursorTo(top + 2, left);
+    printf("\x1b[36m+");
+    for (i = 0; i < panelWidth; i++) putchar('-');
+    printf("+\x1b[0m");
+
+    for (i = 0; i < 12; i++) {
+        MoveCursorTo(top + 3 + i, left);
+        printf("\x1b[36m|\x1b[0m \x1b[33m%2d\x1b[0m %-12.12s \x1b[90m%-*.*s\x1b[0m \x1b[36m|\x1b[0m",
+               i + 1,
+               cmds[i][0],
+               descWidth,
+               descWidth,
+               cmds[i][1]);
+    }
+
+    MoveCursorTo(top + 15, left);
+    printf("\x1b[36m+");
+    for (i = 0; i < panelWidth; i++) putchar('-');
+    printf("+\x1b[0m");
+    MoveCursorTo(top + 16, left);
+    printf("\x1b[90m%-*.*s\x1b[0m", panelWidth + 2, panelWidth + 2, "Select number, or type a command directly (Enter to cancel)");
+    MoveCursorTo(top + 17, left);
+    printf("\x1b[32mPalette\x1b[0m \x1b[90m>\x1b[0m ");
+
+    if (!fgets(choice, sizeof(choice), stdin)) {
+        for (i = 0; i < height + 2; i++) {
+            ClearScreenLine(top + i);
+        }
+        return FALSE;
+    }
+    choice[strcspn(choice, "\n")] = '\0';
+    if (!choice[0]) {
+        for (i = 0; i < height + 2; i++) {
+            ClearScreenLine(top + i);
+        }
+        return FALSE;
+    }
+
+    if (strcmp(choice, "1") == 0) lstrcpynA(outCommand, "/status", outLen);
+    else if (strcmp(choice, "2") == 0) lstrcpynA(outCommand, "/history", outLen);
+    else if (strcmp(choice, "3") == 0) lstrcpynA(outCommand, "/tools on", outLen);
+    else if (strcmp(choice, "4") == 0) lstrcpynA(outCommand, "/tools off", outLen);
+    else if (strcmp(choice, "5") == 0) lstrcpynA(outCommand, "/model", outLen);
+    else if (strcmp(choice, "6") == 0) lstrcpynA(outCommand, "/models", outLen);
+    else if (strcmp(choice, "7") == 0) lstrcpynA(outCommand, "/wsearch", outLen);
+    else if (strcmp(choice, "8") == 0) lstrcpynA(outCommand, "/cloud", outLen);
+    else if (strcmp(choice, "9") == 0) lstrcpynA(outCommand, "/workspace", outLen);
+    else if (strcmp(choice, "10") == 0) lstrcpynA(outCommand, "/clear", outLen);
+    else if (strcmp(choice, "11") == 0) lstrcpynA(outCommand, "/cls", outLen);
+    else if (strcmp(choice, "12") == 0) lstrcpynA(outCommand, "/exit", outLen);
+    else if (choice[0] == '/') lstrcpynA(outCommand, choice, outLen);
+    else {
+        for (i = 0; i < height + 2; i++) {
+            ClearScreenLine(top + i);
+        }
+        return FALSE;
+    }
+
+    for (i = 0; i < height + 2; i++) {
+        ClearScreenLine(top + i);
+    }
+
+    return outCommand[0] != '\0';
+}
+
+static void RenderChatTui(const char *draftInput);
+static void RenderWorkflowPanel(void);
+static void RenderConversationArea(void);
+static void RenderStatusLine(void);
+static void RenderInputLine(const char *draftInput);
+static const char* DescribeToolAction(const char *tool_name);
+
+static BOOL ReadChatInput(char *out, int outLen) {
+    int pos = 0;
+    int ch;
+
+    if (!out || outLen <= 1) return FALSE;
+    out[0] = '\0';
+
+    while (1) {
+        ch = _getch();
+
+        if (ch == 3) { /* Ctrl+C */
+            return FALSE;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            out[pos] = '\0';
+            return TRUE;
+        }
+
+        if (ch == 8) { /* Backspace */
+            if (pos > 0) {
+                pos--;
+                out[pos] = '\0';
+                printf("\b \b");
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        if (ch == 0 || ch == 224) { /* arrows/function keys */
+            (void)_getch();
+            continue;
+        }
+
+        if (ch == '/' && pos == 0) {
+            if (ShowSlashCommandPalette(out, outLen)) {
+                return TRUE;
+            }
+            out[0] = '\0';
+            pos = 0;
+            RenderChatTui("");
+            continue;
+        }
+
+        if (isprint((unsigned char)ch) && pos < outLen - 1) {
+            out[pos++] = (char)ch;
+            out[pos] = '\0';
+            putchar(ch);
+            fflush(stdout);
+        }
+    }
 }
 
 static void BuildSystemInfoReport(char *out, int outLen) {
@@ -76,49 +377,128 @@ static void BuildSystemInfoReport(char *out, int outLen) {
 }
 
 static void PrintWrapped(const char *text, int width) {
-    printf("%s\n", text);
+    int lineLen = 0;
+    const char *p = text;
+    if (!text) {
+        printf("\n");
+        return;
+    }
+    if (width <= 0) width = 88;
+
+    while (*p) {
+        if (*p == '\n') {
+            putchar('\n');
+            lineLen = 0;
+            p++;
+            continue;
+        }
+
+        if (lineLen >= width && *p == ' ') {
+            putchar('\n');
+            lineLen = 0;
+            p++;
+            continue;
+        }
+
+        if (lineLen >= width && *p != ' ') {
+            putchar('\n');
+            lineLen = 0;
+        }
+
+        putchar(*p++);
+        lineLen++;
+    }
+    putchar('\n');
 }
 
 static void PrintToolEvent(const char *type, const char *name, const char *args) {
-    printf("\x1b[90m[%s] %s\x1b[0m\n", type, name);
+    char line[512];
+    if (sChatTuiActive) {
+        if (strcmp(type, "tool") == 0) {
+            snprintf(line, sizeof(line), "Using tool: %s", name ? name : "tool");
+            SetStatusLine(line, TRUE);
+            snprintf(line, sizeof(line), "%s", name ? DescribeToolAction(name) : "Running tool");
+            WorkflowAdvance(line, FALSE);
+        } else if (strcmp(type, "done") == 0) {
+            snprintf(line, sizeof(line), "Tool finished: %s", name ? name : "tool");
+            SetStatusLine(line, FALSE);
+            snprintf(line, sizeof(line), "%s complete", name ? DescribeToolAction(name) : "Tool");
+            WorkflowCompleteActive(line);
+        } else if (strcmp(type, "error") == 0) {
+            snprintf(line, sizeof(line), "Tool error: %s", name ? name : "tool");
+            SetStatusLine(line, FALSE);
+            WorkflowCompleteActive("Tool failed");
+        } else if (strcmp(type, "warn") == 0) {
+            snprintf(line, sizeof(line), "%s", args && args[0] ? args : "Tool warning");
+            SetStatusLine(line, FALSE);
+        }
+        RenderWorkflowPanel();
+        RenderStatusLine();
+        return;
+    }
+    if (args && args[0]) {
+        printf("\x1b[90m[%s]\x1b[0m \x1b[36m%s\x1b[0m \x1b[90m%s\x1b[0m\n", type, name, args);
+    } else {
+        printf("\x1b[90m[%s]\x1b[0m \x1b[36m%s\x1b[0m\n", type, name);
+    }
 }
 
 static DWORD WINAPI ToolAnimationThread(LPVOID param) {
     ToolAnimationState *s = (ToolAnimationState*)param;
-    while (s->running) { Sleep(100); }
+    DWORD start = GetTickCount();
+    int frame = 0;
+    const char *frames[] = {"-", "\\", "|", "/"};
+    while (InterlockedCompareExchange(&s->running, 0, 0) != 0) {
+        if (sChatTuiActive) {
+            char line[512];
+            snprintf(line, sizeof(line), "%s Running %s...", frames[frame % 4], s->title[0] ? s->title : "tool");
+            SetStatusLine(line, TRUE);
+            RenderStatusLine();
+            frame++;
+        }
+        if (s->stop_event) {
+            if (WaitForSingleObject(s->stop_event, 100) == WAIT_OBJECT_0) break;
+        } else {
+            Sleep(100);
+        }
+        if (s->timeout_ms > 0 && (GetTickCount() - start) >= s->timeout_ms) break;
+    }
     return 0;
 }
 
 static void PrintAssistantHeader(void) {
-    printf("\x1b[35mAssistant:\x1b[0m ");
+    printf("\x1b[35mAssistant\x1b[0m ");
+    printf("\x1b[90m>\x1b[0m ");
 }
+/* NOTE: The returned pointers are borrowed static buffers; callers must not free(). */
 static char* DoWebSearch(const char *query);
+/* NOTE: The returned pointers are borrowed static buffers; callers must not free(). */
 static char* DoWikiSearch(const char *query);
+/* NOTE: The returned pointers are borrowed static buffers; callers must not free(). */
 static char* DoWikiPage(const char *title);
 static BOOL ExtractToolStringArg(const char *tool_args, const char *key, char *out, int outLen);
+static const char* GetToolProtocolText(void);
+static BOOL ValidateToolArgsInWorkspace(const char *tool_name, const char *tool_args, char *err, int errLen);
+static BOOL ResolveFullPathA_(const char *inputPath, char *outPath, int outLen);
+static BOOL FileExistsA_(const char *path);
+static BOOL DirectoryExistsA_(const char *path);
+static BOOL ResolveToolPathArg(const char *tool_args, const char *key, BOOL allowEmpty, char *resolved, int resolvedLen);
+static const char* GetToolsDefinition(void);
+static BOOL ShouldUseTools(void);
+static const char* GetSystemPrompt(void);
 static const char* GetCloudProviderName(CloudProviderType provider);
 static BOOL LoadHfTokenConfig(void);
 static void ClearConsole(void);
-static BOOL SaveSearchConfig(void);
-static void StopChatServer(void);
-static DWORD WINAPI SearchAnimationThread(LPVOID param);
 static char* HttpGet(const char *query);
 static char* HttpGetSerpApi(const char *query, const char *apiKey);
 static char* HttpGetTavily(const char *query, const char *apiKey);
-static void PrintChatBanner(void);
-static void PrintChatCommandHint(void);
-static void BuildSystemInfoReport(char *out, int outLen);
-static void PrintWrapped(const char *text, int width);
-static void PrintToolEvent(const char *type, const char *name, const char *args);
-static DWORD WINAPI ToolAnimationThread(LPVOID param);
-static void PrintAssistantHeader(void);
+static void PrintChatDashboardCard(void);
 static HANDLE sChatServerProcess;
 static DWORD sChatServerProcessId;
 static BOOL sServerStartedByUs;
 static int RunChatMode(void);
-static void BuildSystemPrompt(char *out, int outLen);
-static int RunServer(int argc, char **argv);
 static int RunCli(int argc, char **argv);
+static int RunAppLikeMain(int argc, char **argv);
 static int RunDaemonCommand(int argc, char **argv);
 static int RunDaemonLoop(int port);
 static BOOL IsDaemonPortOpen(int port);
@@ -126,16 +506,69 @@ static int DaemonStart(int port, BOOL foreground);
 static int DaemonStop(void);
 static int DaemonRestart(int port);
 
+static BOOL ResolveToolPathArg(const char *tool_args, const char *key, BOOL allowEmpty, char *resolved, int resolvedLen)
+{
+    char raw[MAX_PATH * 2] = "";
+
+    if (!resolved || resolvedLen <= 0)
+        return FALSE;
+
+    resolved[0] = '\0';
+    if (tool_args && key)
+        ExtractToolStringArg(tool_args, key, raw, sizeof(raw));
+
+    if (!raw[0]) {
+        if (!allowEmpty)
+            return FALSE;
+        strcpy(raw, ".");
+    }
+
+    return ResolveFullPathA_(raw, resolved, resolvedLen);
+}
+
+static const char* GetToolProtocolText(void)
+{
+    static char protocol[16384];
+    const char *tools = GetToolsDefinition();
+
+    if (!ShouldUseTools() || !tools || !tools[0]) {
+        protocol[0] = '\0';
+        return protocol;
+    }
+
+    snprintf(protocol, sizeof(protocol),
+        "Tool calling is enabled. "
+        "If a tool is needed, respond with ONLY valid compact JSON and no markdown fences, no explanation, and no extra text. "
+        "Use exactly one of these formats: "
+        "{\"tool_calls\":[{\"function\":{\"name\":\"create_folder\",\"arguments\":{\"path\":\"project\"}}}]} "
+        "or "
+        "{\"function_call\":{\"name\":\"create_folder\",\"arguments\":{\"path\":\"project\"}}}. "
+        "The arguments field must be a JSON object, not a stringified object. "
+        "If no tool is needed, answer normally in plain text. "
+        "Available tool schema: %s",
+        tools);
+
+    return protocol;
+}
+
 static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *result, int result_size) {
     if (!tool_name || !*tool_name || !result || result_size <= 0) return FALSE;
     
     result[0] = '\0';
+    {
+        char sandboxErr[256];
+        sandboxErr[0] = '\0';
+        if (!ValidateToolArgsInWorkspace(tool_name, tool_args, sandboxErr, sizeof(sandboxErr))) {
+            snprintf(result, result_size, "%s", sandboxErr[0] ? sandboxErr : "Blocked by workspace sandbox");
+            return FALSE;
+        }
+    }
     
     if (strcmp(tool_name, "web_search") == 0) {
         char query[512] = "";
         ExtractToolStringArg(tool_args, "query", query, sizeof(query));
         if (!query[0]) {
-            strncpy(result, "Error: query parameter is required", result_size);
+            snprintf(result, result_size, "Error: query parameter is required");
             return FALSE;
         }
         char *search_result = DoWebSearch(query);
@@ -144,7 +577,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "Error: Web search failed", result_size);
+        snprintf(result, result_size, "Error: Web search failed");
         return FALSE;
     }
     
@@ -152,7 +585,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
         char query[512] = "";
         ExtractToolStringArg(tool_args, "query", query, sizeof(query));
         if (!query[0]) {
-            strncpy(result, "Error: query parameter is required", result_size);
+            snprintf(result, result_size, "Error: query parameter is required");
             return FALSE;
         }
         char *wiki_result = DoWikiSearch(query);
@@ -161,7 +594,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "Error: Wikipedia search failed", result_size);
+        snprintf(result, result_size, "Error: Wikipedia search failed");
         return FALSE;
     }
     
@@ -169,7 +602,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
         char title[512] = "";
         ExtractToolStringArg(tool_args, "title", title, sizeof(title));
         if (!title[0]) {
-            strncpy(result, "Error: title parameter is required", result_size);
+            snprintf(result, result_size, "Error: title parameter is required");
             return FALSE;
         }
         char *page_result = DoWikiPage(title);
@@ -178,7 +611,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "Error: Wikipedia page not found", result_size);
+        snprintf(result, result_size, "Error: Wikipedia page not found");
         return FALSE;
     }
     
@@ -189,7 +622,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "Error: Could not get time", result_size);
+        snprintf(result, result_size, "Error: Could not get time");
         return FALSE;
     }
     
@@ -200,7 +633,7 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "Error: Could not get system info", result_size);
+        snprintf(result, result_size, "Error: Could not get system info");
         return FALSE;
     }
     
@@ -211,8 +644,174 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
             result[result_size - 1] = '\0';
             return TRUE;
         }
-        strncpy(result, "No models found or folder not configured", result_size);
+        snprintf(result, result_size, "No models found or folder not configured");
         return FALSE;
+    }
+
+    if (strcmp(tool_name, "create_folder") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+
+        if (!ResolveToolPathArg(tool_args, "path", FALSE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: path parameter is required");
+            return FALSE;
+        }
+        if (DirectoryExistsA_(fullPath)) {
+            snprintf(result, result_size, "Folder already exists: %s", fullPath);
+            return TRUE;
+        }
+        if (CreateDirectoryA(fullPath, NULL)) {
+            snprintf(result, result_size, "Created folder: %s", fullPath);
+            return TRUE;
+        }
+        snprintf(result, result_size, "Error: could not create folder (%lu)", GetLastError());
+        return FALSE;
+    }
+
+    if (strcmp(tool_name, "file_exists") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+        DWORD attrs;
+
+        if (!ResolveToolPathArg(tool_args, "path", FALSE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: path parameter is required");
+            return FALSE;
+        }
+        attrs = GetFileAttributesA(fullPath);
+        snprintf(result, result_size, "%s", attrs != INVALID_FILE_ATTRIBUTES ? "true" : "false");
+        return TRUE;
+    }
+
+    if (strcmp(tool_name, "list_folder") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+        char pattern[MAX_PATH * 4] = "";
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind;
+        int used = 0;
+
+        if (!ResolveToolPathArg(tool_args, "path", TRUE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: invalid path");
+            return FALSE;
+        }
+        snprintf(pattern, sizeof(pattern), "%s\\*", fullPath);
+        hFind = FindFirstFileA(pattern, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            snprintf(result, result_size, "Error: folder not found");
+            return FALSE;
+        }
+
+        result[0] = '\0';
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+                continue;
+            used += snprintf(result + used, result_size - used, "%s%s\n",
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "[dir] " : "",
+                fd.cFileName);
+            if (used >= result_size - 8)
+                break;
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+
+        if (!result[0])
+            snprintf(result, result_size, "(empty folder)");
+        return TRUE;
+    }
+
+    if (strcmp(tool_name, "read_file") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+        FILE *fp;
+        long size;
+
+        if (!ResolveToolPathArg(tool_args, "path", FALSE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: path parameter is required");
+            return FALSE;
+        }
+        fp = fopen(fullPath, "rb");
+        if (!fp) {
+            snprintf(result, result_size, "Error: could not open file");
+            return FALSE;
+        }
+        if (fseek(fp, 0, SEEK_END) != 0) {
+            fclose(fp);
+            snprintf(result, result_size, "Error: could not read file");
+            return FALSE;
+        }
+        size = ftell(fp);
+        if (size < 0) {
+            fclose(fp);
+            snprintf(result, result_size, "Error: could not read file");
+            return FALSE;
+        }
+        if (fseek(fp, 0, SEEK_SET) != 0) {
+            fclose(fp);
+            snprintf(result, result_size, "Error: could not read file");
+            return FALSE;
+        }
+        if (size >= result_size)
+            size = result_size - 1;
+        if (size > 0)
+            fread(result, 1, (size_t)size, fp);
+        result[size] = '\0';
+        fclose(fp);
+        return TRUE;
+    }
+
+    if (strcmp(tool_name, "write_file") == 0 || strcmp(tool_name, "create_file") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+        char content[TOOL_RESULT_BUFFER_LEN] = "";
+        FILE *fp;
+
+        if (!ResolveToolPathArg(tool_args, "path", FALSE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: path parameter is required");
+            return FALSE;
+        }
+        ExtractToolStringArg(tool_args, "content", content, sizeof(content));
+        if (strcmp(tool_name, "create_file") == 0 && (FileExistsA_(fullPath) || DirectoryExistsA_(fullPath))) {
+            snprintf(result, result_size, "Error: file already exists");
+            return FALSE;
+        }
+        fp = fopen(fullPath, "wb");
+        if (!fp) {
+            snprintf(result, result_size, "Error: could not open file for writing");
+            return FALSE;
+        }
+        if (content[0])
+            fwrite(content, 1, strlen(content), fp);
+        fclose(fp);
+        snprintf(result, result_size, "%s: %s",
+            strcmp(tool_name, "create_file") == 0 ? "Created file" : "Wrote file",
+            fullPath);
+        return TRUE;
+    }
+
+    if (strcmp(tool_name, "rename_file") == 0) {
+        char oldPath[MAX_PATH * 4] = "";
+        char newPath[MAX_PATH * 4] = "";
+
+        if (!ResolveToolPathArg(tool_args, "old_path", FALSE, oldPath, sizeof(oldPath)) ||
+            !ResolveToolPathArg(tool_args, "new_path", FALSE, newPath, sizeof(newPath))) {
+            snprintf(result, result_size, "Error: old_path and new_path are required");
+            return FALSE;
+        }
+        if (!MoveFileExA(oldPath, newPath, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+            snprintf(result, result_size, "Error: could not rename path (%lu)", GetLastError());
+            return FALSE;
+        }
+        snprintf(result, result_size, "Renamed: %s -> %s", oldPath, newPath);
+        return TRUE;
+    }
+
+    if (strcmp(tool_name, "delete_file") == 0) {
+        char fullPath[MAX_PATH * 4] = "";
+
+        if (!ResolveToolPathArg(tool_args, "path", FALSE, fullPath, sizeof(fullPath))) {
+            snprintf(result, result_size, "Error: path parameter is required");
+            return FALSE;
+        }
+        if (!DeleteFileA(fullPath)) {
+            snprintf(result, result_size, "Error: could not delete file (%lu)", GetLastError());
+            return FALSE;
+        }
+        snprintf(result, result_size, "Deleted file: %s", fullPath);
+        return TRUE;
     }
     
     snprintf(result, result_size, "Unknown tool: %s", tool_name);
@@ -222,7 +821,6 @@ static BOOL ExecuteToolCall(const char *tool_name, const char *tool_args, char *
 static BOOL ExtractToolStringArg(const char *tool_args, const char *key, char *out, int outLen) {
     char pattern[64];
     const char *start;
-    const char *end;
     char *dst;
     
     if (!tool_args || !key || !out || outLen <= 0) return FALSE;
@@ -248,38 +846,79 @@ static BOOL ExtractToolStringArg(const char *tool_args, const char *key, char *o
     while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
     
     if (*start == '"') {
+        const char *src;
+        const char *end = out + outLen - 1;
         start++;
-        end = strchr(start, '"');
-        if (!end) return FALSE;
+        src = start;
+        dst = out;
+        while (*src && dst < (char*)end) {
+            if (*src == '\\' && *(src + 1)) {
+                src++;
+                if (*src == 'n') *dst++ = '\n';
+                else if (*src == 'r') *dst++ = '\r';
+                else if (*src == 't') *dst++ = '\t';
+                else *dst++ = *src;
+                src++;
+                continue;
+            }
+            if (*src == '"') break;
+            *dst++ = *src++;
+        }
+        *dst = '\0';
+        return out[0] != '\0';
     } else if (*start == '{') {
-        start++;
-        end = strchr(start, '}');
-        if (!end) return FALSE;
+        const char *src = start;
+        const char *end = out + outLen - 1;
+        int depth = 0;
+        int in_string = 0;
+        int escaped = 0;
+        dst = out;
+        while (*src && dst < (char*)end) {
+            char ch = *src++;
+            *dst++ = ch;
+            if (escaped) {
+                escaped = 0;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = 1;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (!in_string) {
+                if (ch == '{') depth++;
+                else if (ch == '}') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+            }
+        }
+        *dst = '\0';
+        return out[0] != '\0';
     } else {
-        end = start;
+        const char *end = start;
         while (*end && *end != ',' && *end != '}') end++;
+        if (end > start) {
+            int len = (int)(end - start);
+            if (len > outLen - 1) len = outLen - 1;
+            strncpy(out, start, len);
+            out[len] = '\0';
+        }
+        return out[0] != '\0';
     }
-    
-    if (end > start) {
-        int len = (int)(end - start);
-        if (len > outLen - 1) len = outLen - 1;
-        strncpy(out, start, len);
-        out[len] = '\0';
-    }
-    
-    dst = out;
-    while (*dst) {
-        if (*dst == '\\' && *(dst+1) == 'n') { *dst = ' '; memmove(dst+1, dst+2, strlen(dst+2)+1); }
-        else if (*dst == '\\' && *(dst+1) == 't') { *dst = '\t'; memmove(dst+1, dst+2, strlen(dst+2)+1); }
-        dst++;
-    }
-    
-    return out[0] != '\0';
 }
 
 static BOOL HasToolCall(const char *response) {
     if (!response) return FALSE;
-    return (strstr(response, "\"tool_calls\"") != NULL || strstr(response, "\"function_call\"") != NULL);
+    if (strstr(response, "\"tool_calls\"") != NULL) return TRUE;
+    if (strstr(response, "\"function_call\"") != NULL) return TRUE;
+    if (strstr(response, "\"tool_name\"") != NULL && strstr(response, "\"arguments\"") != NULL) return TRUE;
+    if (strstr(response, "\"name\"") != NULL && strstr(response, "\"arguments\"") != NULL &&
+        (strstr(response, "\"tool\"") != NULL || strstr(response, "\"action\":\"tool\"") != NULL)) return TRUE;
+    return FALSE;
 }
 
 static char* ExtractToolCall(const char *response) {
@@ -294,12 +933,27 @@ static char* ExtractToolCall(const char *response) {
     
     calls_start = strstr(response, "\"tool_calls\"");
     if (!calls_start) calls_start = strstr(response, "\"function_call\"");
-    if (!calls_start) return name;
+    if (!calls_start) calls_start = response;
     
-    func_start = strstr(calls_start, "\"name\":\"");
-    if (!func_start) return name;
-    
-    name_start = func_start + 8;
+    func_start = strstr(calls_start, "\"function\":{\"name\":\"");
+    if (func_start) {
+        name_start = func_start + (int)strlen("\"function\":{\"name\":\"");
+    } else {
+        func_start = strstr(calls_start, "\"function_call\":{\"name\":\"");
+        if (func_start) {
+            name_start = func_start + (int)strlen("\"function_call\":{\"name\":\"");
+        } else {
+            func_start = strstr(calls_start, "\"tool_name\":\"");
+            if (func_start) {
+                name_start = func_start + (int)strlen("\"tool_name\":\"");
+            } else {
+                func_start = strstr(calls_start, "\"name\":\"");
+                if (!func_start) return name;
+                name_start = func_start + 8;
+            }
+        }
+    }
+
     name_end = strchr(name_start, '"');
     if (name_end && name_end > name_start) {
         int len = (int)(name_end - name_start);
@@ -312,51 +966,88 @@ static char* ExtractToolCall(const char *response) {
 }
 
 static char* ExtractToolArgs(const char *response) {
-    static char args[4096] = "";
+    static char args[TOOL_ARG_BUFFER_LEN] = "";
     const char *calls_start;
     const char *args_start;
-    const char *args_end;
+    const char *p;
     
     args[0] = '\0';
     if (!response) return args;
     
     calls_start = strstr(response, "\"tool_calls\"");
     if (!calls_start) calls_start = strstr(response, "\"function_call\"");
-    if (!calls_start) return args;
+    if (!calls_start) calls_start = response;
     
-    args_start = strstr(calls_start, "\"arguments\":\"");
-    if (!args_start) args_start = strstr(calls_start, "\"arguments\":{");
+    args_start = strstr(calls_start, "\"arguments\"");
     if (!args_start) return args;
-    
-    if (args_start[strlen("\"arguments\":\"") - 1] == '"') {
-        args_start += 13;
-        args_end = strchr(args_start, '"');
-    } else {
-        args_start += 13;
-        args_end = strchr(args_start, '}');
-    }
-    
-    if (args_end && args_end > args_start) {
-        int len = (int)(args_end - args_start);
-        if (len > 4095) len = 4095;
-        strncpy(args, args_start, len);
-        args[len] = '\0';
+
+    p = strchr(args_start, ':');
+    if (!p) return args;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    if (*p == '"') {
+        char *dst = args;
+        const char *end = args + sizeof(args) - 1;
+        p++;
+        while (*p && dst < end) {
+            if (*p == '\\' && *(p + 1)) {
+                p++;
+                if (*p == 'n') *dst++ = '\n';
+                else if (*p == 'r') *dst++ = '\r';
+                else if (*p == 't') *dst++ = '\t';
+                else *dst++ = *p;
+                p++;
+                continue;
+            }
+            if (*p == '"') break;
+            *dst++ = *p++;
+        }
+        *dst = '\0';
+    } else if (*p == '{') {
+        int depth = 0;
+        int in_string = 0;
+        int escaped = 0;
+        char *dst = args;
+        const char *end = args + sizeof(args) - 1;
+        while (*p && dst < end) {
+            char ch = *p++;
+            *dst++ = ch;
+            if (escaped) {
+                escaped = 0;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = 1;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (!in_string) {
+                if (ch == '{') depth++;
+                else if (ch == '}') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+            }
+        }
+        *dst = '\0';
     }
     
     return args;
 }
 
-static int RunDaemonCommand(int argc, char **argv);
-static int RunDaemonLoop(int port);
-static BOOL IsDaemonPortOpen(int port);
-
 #define IDI_ICON1 101
 #define VALORA_APP_DIR "Valora"
 #define VALORA_CONFIG_NAME "config.yml"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 /* ──────────────────────────────────────────────
    Modern Dark Theme Colors (OpenWebUI Style)
@@ -377,12 +1068,6 @@ static BOOL IsDaemonPortOpen(int port);
 /* ──────────────────────────────────────────────
    Layout Constants (Compact Style)
    ────────────────────────────────────────────── */
-#define APP_W       700
-#define APP_H       500
-#define CARD_MAX_W  660
-#define HEADER_H    50
-#define FOOTER_H    20
-#define PAD         12
 
 #define MAX_MODELS  256
 #define MAX_CMD     4096
@@ -390,14 +1075,6 @@ static BOOL IsDaemonPortOpen(int port);
 /* ──────────────────────────────────────────────
    Control IDs
    ────────────────────────────────────────────── */
-enum {
-    ID_BTN_SERVER = 1001,
-    ID_BTN_FOLDER,
-    ID_BTN_PREV,
-    ID_BTN_NEXT,
-    ID_BTN_GENERATE,
-    ID_BTN_COPY
-};
 
 /* ──────────────────────────────────────────────
    App state
@@ -413,9 +1090,16 @@ static char sCommand[MAX_CMD] = "";
 static char sConfigPath[MAX_PATH] = "";
 static int  nServerType = 0;
 static char sCustomCtx[32] = "";
+static char sConfiguredContext[32] = "2048";
+static char sConfiguredGpuLayers[32] = "-1";
+static char sConfiguredPort[32] = "8000";
+static char sConfiguredThreads[32] = "4";
+static char sConfiguredKvCacheK[16] = "f16";
+static char sConfiguredKvCacheV[16] = "f16";
 
 /* llama.cpp setup state */
 static char sLlamaCppPath[MAX_PATH] = "";
+static char sCliPath[MAX_PATH] = "";
 
 /* GPU auto-detection state */
 static BOOL bGpuFieldEdited = FALSE;
@@ -437,25 +1121,18 @@ static BOOL sModelLoaded = FALSE;
 /* ──────────────────────────────────────────────
    Handles
    ────────────────────────────────────────────── */
-static HWND hServerEdit, hFolderEdit, hModelCombo;
-static HWND hCtxEdit, hGpuEdit, hPortEdit, hThreadsEdit;
-static HWND hKvCacheKCombo;
-static HWND hKvCacheVCombo;
-static HWND hServerTypeCombo;
-static HWND hOutputEdit;
-static HWND hBtnServer, hBtnFolder, hBtnPrev, hBtnNext, hBtnGenerate, hBtnCopy;
-// NEW: Static controls for labels so they align perfectly
-static HWND hLblServer, hLblFolder, hLblModel, hLblCtx, hLblGpu, hLblPort, hLblThreads, hLblServerType, hLblCommandType, hLblKvCacheK, hLblKvCacheV;
 
 /* ──────────────────────────────────────────────
    GDI resources
    ────────────────────────────────────────────── */
-static HBRUSH brBg, brPanel, brPanel2, brInput;
-static HFONT hFontTitle, hFontBody, hFontSmall, hFontBold, hFontLabel;
 
 static void ScanModels(void);
+static void ScanModelsRecursively(const char *basePath, int *count);
 static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int cliPathLen);
 static int RunInteractiveModelSelector(char *selectedModel, int selectedModelLen);
+static BOOL EnsureSelectedModelExists(void);
+static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen, char *kvCache, int kvCacheLen);
+static void GetConfiguredServerValuesBoth(char *kvCacheK, int kvCacheKLen, char *kvCacheV, int kvCacheVLen);
 static void GetModelConfig(const char *modelName, char *ctx, int ctxLen, char *gpu, int gpuLen, char *threads, int threadsLen);
 static BOOL HasModelConfig(const char *modelName);
 static const char *GetModelTypeLabel(const char *modelName);
@@ -463,12 +1140,11 @@ static BOOL FindMatchingProjector(const char *modelName, char *projectorName, in
 static BOOL NormalizeHuggingFaceRepo(const char *input, char *repo, int repoLen);
 static BOOL WriteHuggingFaceDownloaderScript(char *scriptPath, int scriptPathLen, const char *token);
 static int EnsureModelsFolderReady(void);
+static void CycleCacheTypeValue(char *value, int valueLen, int direction);
 
 /* HuggingFace model download */
 static int DownloadFromHuggingFace(const char *hfUrl);
 
-/* Chat Mode */
-static int RunChatMode(void);
 static BOOL sDebugMode = FALSE;
 static BOOL sOllamaMode = FALSE;
 static char sOllamaUrl[256] = "http://127.0.0.1:11434";
@@ -500,8 +1176,6 @@ static int RunSearchConfigMenu(void);
 
 /* HuggingFace Token for faster downloads */
 static char sHuggingFaceToken[256] = "";
-
-static BOOL VerifyApiKey(SearchEngineType engine, const char *apiKey);
 
 /* ──────────────────────────────────────────────
    llama.cpp Setup
@@ -578,47 +1252,67 @@ static void SafetyShutdown(void)
 
 static BOOL KillProcessTree(DWORD pid)
 {
-    HANDLE hSnapshot;
-    HANDLE hProcess = NULL;
-    PROCESSENTRY32 pe;
-    BOOL found;
+    enum { MAX_TREE_PIDS = 4096 };
+    DWORD queue[MAX_TREE_PIDS];
+    int count = 0;
+    int idx = 0;
+    BOOL ok = TRUE;
+    DWORD self = GetCurrentProcessId();
 
     if (pid == 0)
         return TRUE;
 
-    if (pid != GetCurrentProcessId())
-        hProcess = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    queue[count++] = pid;
 
-    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
+    while (idx < count) {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32 pe;
+        BOOL found;
+
+        if (hSnapshot == INVALID_HANDLE_VALUE) {
+            ok = FALSE;
+            break;
+        }
+
+        pe.dwSize = sizeof(pe);
+        found = Process32First(hSnapshot, &pe);
+        while (found) {
+            if (pe.th32ParentProcessID == queue[idx]) {
+                int seen = 0;
+                int j;
+                for (j = 0; j < count; j++) {
+                    if (queue[j] == pe.th32ProcessID) {
+                        seen = 1;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    if (count >= MAX_TREE_PIDS) {
+                        ok = FALSE;
+                        break;
+                    }
+                    queue[count++] = pe.th32ProcessID;
+                }
+            }
+            found = Process32Next(hSnapshot, &pe);
+        }
+        CloseHandle(hSnapshot);
+        idx++;
+    }
+
+    while (count-- > 0) {
+        DWORD target = queue[count];
+        HANDLE hProcess;
+        if (target == self)
+            continue;
+        hProcess = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target);
         if (hProcess) {
             TerminateProcess(hProcess, 1);
             CloseHandle(hProcess);
         }
-        return FALSE;
     }
 
-    pe.dwSize = sizeof(pe);
-    found = Process32First(hSnapshot, &pe);
-
-    while (found) {
-        if (pe.th32ParentProcessID == pid) {
-            KillProcessTree(pe.th32ProcessID);
-        }
-        found = Process32Next(hSnapshot, &pe);
-    }
-
-    CloseHandle(hSnapshot);
-
-    if (pid == GetCurrentProcessId())
-        return TRUE;
-
-    if (hProcess) {
-        TerminateProcess(hProcess, 1);
-        CloseHandle(hProcess);
-    }
-
-    return TRUE;
+    return ok;
 }
 
 static BOOL TerminateActiveProcess(void)
@@ -712,11 +1406,11 @@ struct IDXGIFactory {
 
 static ULONGLONG GetAvailableVRAMMB(void)
 {
-    static BOOL sVramCached = FALSE;
+    static BOOL sVramCachedFromDxgi = FALSE;
     static ULONGLONG sCachedVramMB = 0;
     ULONGLONG vramMB = 0;
 
-    if (sVramCached)
+    if (sVramCachedFromDxgi && sCachedVramMB > 0)
         return sCachedVramMB;
 
     HMODULE dxgi = LoadLibraryA("dxgi.dll");
@@ -740,7 +1434,13 @@ static ULONGLONG GetAvailableVRAMMB(void)
         FreeLibrary(dxgi);
     }
 
-    if (vramMB == 0) {
+    if (vramMB > 0) {
+        sCachedVramMB = vramMB;
+        sVramCachedFromDxgi = TRUE;
+        return sCachedVramMB;
+    }
+
+    {
         ULONGLONG avail = GetAvailableRamMB();
         if (avail > 8192) vramMB = 8192;
         else if (avail > 4096) vramMB = 4096;
@@ -748,9 +1448,7 @@ static ULONGLONG GetAvailableVRAMMB(void)
         else vramMB = 1024;
     }
 
-    sCachedVramMB = vramMB;
-    sVramCached = TRUE;
-    return sCachedVramMB;
+    return vramMB;
 }
 
 static int GetModelSizeMB(const char *modelName)
@@ -803,7 +1501,6 @@ static int EstimateContextMemoryMB(int ctxLen)
 static SafetyDecision CheckLoadSafety(const char *modelName, const char *projectorName, int ctxLen, int gpuLayers)
 {
     ULONGLONG totalRAM = GetSystemRamMB();
-    ULONGLONG availVRAM = GetAvailableVRAMMB();
 
     int modelSizeMB = GetModelSizeMB(modelName);
     int projectorSizeMB = projectorName && projectorName[0] ? GetProjectorSizeMB(projectorName) : 0;
@@ -945,6 +1642,178 @@ static BOOL DirectoryExistsA_(const char *path)
     return (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static void TrimTrailingWhitespace(char *text)
+{
+    int len;
+
+    if (!text)
+        return;
+
+    len = (int)strlen(text);
+    while (len > 0) {
+        char ch = text[len - 1];
+        if (ch != '\r' && ch != '\n' && ch != ' ' && ch != '\t')
+            break;
+        text[--len] = '\0';
+    }
+}
+
+static void PromptLineInput(const char *label, char *buffer, int bufferLen)
+{
+    char line[1024];
+
+    if (!buffer || bufferLen <= 0)
+        return;
+
+    printf("\x1b[2J\x1b[H");
+    printf("\x1b[36m+----------------------------------------------------------------------------+\x1b[0m\n");
+    printf("\x1b[36m|\x1b[0m \x1b[97mEdit Setup Value\x1b[0m                                                           \x1b[36m|\x1b[0m\n");
+    printf("\x1b[36m+----------------------------------------------------------------------------+\x1b[0m\n\n");
+    printf("\x1b[33m%s\x1b[0m\n", label);
+    printf("\x1b[90mCurrent:\x1b[0m %s\n", buffer[0] ? buffer : "(empty)");
+    printf("\x1b[90mLeave blank to keep the current value.\x1b[0m\n\n");
+    printf("\x1b[36m>\x1b[0m ");
+    fflush(stdout);
+
+    if (!fgets(line, sizeof(line), stdin))
+        return;
+
+    TrimTrailingWhitespace(line);
+    if (line[0]) {
+        lstrcpynA(buffer, line, bufferLen);
+    }
+}
+
+static int PromptChoiceMenu(const char *title, const char *const *options, int optionCount, int selectedIndex)
+{
+    int choice = selectedIndex;
+
+    if (optionCount <= 0)
+        return selectedIndex;
+
+    for (;;) {
+        int ch;
+        int i;
+
+        printf("\x1b[2J\x1b[H");
+        printf("=== %s ===\n\n", title);
+        printf("Use Up/Down or W/S to move. Enter or D to choose. Esc to cancel.\n\n");
+        for (i = 0; i < optionCount; ++i) {
+            printf("%s %s\n", i == choice ? "\x1b[46;30m>\x1b[0m" : " ", options[i]);
+        }
+
+        ch = _getch();
+        if (ch == 224 || ch == 0) {
+            ch = _getch();
+            if (ch == 72)
+                choice = (choice > 0) ? (choice - 1) : (optionCount - 1);
+            else if (ch == 80)
+                choice = (choice + 1) % optionCount;
+            continue;
+        }
+
+        if (ch == 'w' || ch == 'W')
+            choice = (choice > 0) ? (choice - 1) : (optionCount - 1);
+        else if (ch == 's' || ch == 'S')
+            choice = (choice + 1) % optionCount;
+        else if (ch == 'a' || ch == 'A' || ch == 27)
+            return selectedIndex;
+        else if (ch == 'd' || ch == 'D' || ch == 13)
+            return choice;
+    }
+}
+
+static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int cliPathLen)
+{
+    if (!serverPath || !cliPath || cliPathLen <= 0) {
+        if (cliPath && cliPathLen > 0)
+            cliPath[0] = '\0';
+        return;
+    }
+
+    lstrcpynA(cliPath, serverPath, cliPathLen);
+
+    {
+        char *lastSlash = strrchr(cliPath, '\\');
+        if (lastSlash)
+            lstrcpynA(lastSlash + 1, "llama-cli.exe", cliPathLen - (int)(lastSlash - cliPath + 1));
+        else
+            lstrcpynA(cliPath, "llama-cli.exe", cliPathLen);
+    }
+}
+
+static void ResolveConfiguredCliPath(char *cliPath, int cliPathLen)
+{
+    if (!cliPath || cliPathLen <= 0)
+        return;
+
+    cliPath[0] = '\0';
+
+    if (sCliPath[0]) {
+        lstrcpynA(cliPath, sCliPath, cliPathLen);
+        return;
+    }
+
+    GetCliPathFromServerPath(sServer, cliPath, cliPathLen);
+}
+
+static BOOL TryFindExecutableInFolder(const char *folderPath, const char *pattern, char *out, int outLen)
+{
+    char searchPath[MAX_PATH];
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind;
+
+    if (!folderPath || !folderPath[0] || !pattern || !out || outLen <= 0)
+        return FALSE;
+
+    snprintf(searchPath, sizeof(searchPath), "%s\\%s", folderPath, pattern);
+    hFind = FindFirstFileA(searchPath, &findData);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    do {
+        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(out, outLen, "%s\\%s", folderPath, findData.cFileName);
+            FindClose(hFind);
+            return TRUE;
+        }
+    } while (FindNextFileA(hFind, &findData));
+
+    FindClose(hFind);
+    return FALSE;
+}
+
+static BOOL SyncExecutablesFromLlamaCppPath(void)
+{
+    char detected[MAX_PATH];
+    BOOL foundServer = FALSE;
+    BOOL foundCli = FALSE;
+
+    if (!DirectoryExistsA_(sLlamaCppPath))
+        return FALSE;
+
+    if (TryFindExecutableInFolder(sLlamaCppPath, "llama-server*.exe", detected, sizeof(detected))) {
+        lstrcpynA(sServer, detected, sizeof(sServer));
+        foundServer = TRUE;
+    } else if (TryFindExecutableInFolder(sLlamaCppPath, "llama-server*", detected, sizeof(detected))) {
+        lstrcpynA(sServer, detected, sizeof(sServer));
+        foundServer = TRUE;
+    }
+
+    if (TryFindExecutableInFolder(sLlamaCppPath, "llama-cli*.exe", detected, sizeof(detected))) {
+        lstrcpynA(sCliPath, detected, sizeof(sCliPath));
+        foundCli = TRUE;
+    } else if (TryFindExecutableInFolder(sLlamaCppPath, "llama-cli*", detected, sizeof(detected))) {
+        lstrcpynA(sCliPath, detected, sizeof(sCliPath));
+        foundCli = TRUE;
+    } else if (sServer[0] && !sCliPath[0]) {
+        GetCliPathFromServerPath(sServer, sCliPath, sizeof(sCliPath));
+        foundCli = FileExistsA_(sCliPath);
+    }
+
+    return foundServer && foundCli;
+}
+
 static BOOL BuildConfigPath(char *configPath, int configPathLen)
 {
     char appData[MAX_PATH];
@@ -989,8 +1858,11 @@ static BOOL ReadYamlValue(const char *filePath, const char *key, char *out, int 
 {
     FILE *fp;
     char line[1024];
-    char searchKey[256];
-    size_t keyLen;
+    char keyCopy[256];
+    char *dot;
+    char section[128] = "";
+    char child[128] = "";
+    char currentSection[128] = "";
     
     if (!filePath || !key || !out || outLen <= 0) return FALSE;
     
@@ -998,30 +1870,77 @@ static BOOL ReadYamlValue(const char *filePath, const char *key, char *out, int 
     
     fp = fopen(filePath, "r");
     if (!fp) return FALSE;
-    
-    snprintf(searchKey, sizeof(searchKey), "%s:", key);
-    keyLen = strlen(searchKey);
-    
+
+    lstrcpynA(keyCopy, key, sizeof(keyCopy));
+    dot = strchr(keyCopy, '.');
+    if (dot) {
+        *dot = '\0';
+        lstrcpynA(section, keyCopy, sizeof(section));
+        lstrcpynA(child, dot + 1, sizeof(child));
+    } else {
+        lstrcpynA(child, keyCopy, sizeof(child));
+    }
+
     while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, searchKey, keyLen) == 0) {
-            char *value = line + keyLen;
-            while (*value == ' ' || *value == ':') value++;
-            
-            if (*value == '"') {
-                value++;
-                char *endQuote = strchr(value, '"');
-                if (endQuote) *endQuote = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n')
+            continue;
+
+        if (section[0]) {
+            size_t sectionLen = strlen(section);
+            if (strncmp(p, section, sectionLen) == 0 && p[sectionLen] == ':') {
+                lstrcpynA(currentSection, section, sizeof(currentSection));
+                continue;
             }
-            
-            if (*value) {
-                int len = strlen(value);
-                while (len > 0 && (value[len-1] == '\n' || value[len-1] == '\r')) {
-                    value[--len] = '\0';
+            if (currentSection[0] && (line[0] == ' ' || line[0] == '\t')) {
+                size_t childLen = strlen(child);
+                if (strncmp(p, child, childLen) == 0 && p[childLen] == ':') {
+                    char *value = p + childLen + 1;
+                    while (*value == ' ' || *value == '\t') value++;
+                    if (*value == '"') {
+                        value++;
+                        {
+                            char *endQuote = strchr(value, '"');
+                            if (endQuote) *endQuote = '\0';
+                        }
+                    }
+                    if (*value) {
+                        int len = (int)strlen(value);
+                        while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r')) {
+                            value[--len] = '\0';
+                        }
+                        strncpy(out, value, outLen - 1);
+                        out[outLen - 1] = '\0';
+                        fclose(fp);
+                        return TRUE;
+                    }
                 }
-                strncpy(out, value, outLen - 1);
-                out[outLen - 1] = '\0';
-                fclose(fp);
-                return TRUE;
+            } else if (!(line[0] == ' ' || line[0] == '\t')) {
+                currentSection[0] = '\0';
+            }
+        } else {
+            size_t childLen = strlen(child);
+            if (strncmp(p, child, childLen) == 0 && p[childLen] == ':') {
+                char *value = p + childLen + 1;
+                while (*value == ' ' || *value == '\t') value++;
+                if (*value == '"') {
+                    value++;
+                    {
+                        char *endQuote = strchr(value, '"');
+                        if (endQuote) *endQuote = '\0';
+                    }
+                }
+                if (*value) {
+                    int len = (int)strlen(value);
+                    while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r')) {
+                        value[--len] = '\0';
+                    }
+                    strncpy(out, value, outLen - 1);
+                    out[outLen - 1] = '\0';
+                    fclose(fp);
+                    return TRUE;
+                }
             }
         }
     }
@@ -1039,24 +1958,6 @@ static BOOL ReadYamlIntValue(const char *filePath, const char *key, int defaultV
     return defaultVal;
 }
 
-static void SaveUiStateToGlobals(void)
-{
-    int idx;
-
-    if (!hServerEdit || !hFolderEdit || !hModelCombo)
-        return;
-
-    GetWindowTextA(hServerEdit, sServer, sizeof(sServer));
-    GetWindowTextA(hFolderEdit, sFolder, sizeof(sFolder));
-
-    idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
-    if (idx != CB_ERR) {
-        SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
-    } else {
-        sSelectedModel[0] = '\0';
-    }
-}
-
 static BOOL SaveConfigToDisk(void)
 {
     char ctx[32] = "2048";
@@ -1068,42 +1969,28 @@ static BOOL SaveConfigToDisk(void)
     if (!BuildConfigPath(sConfigPath, sizeof(sConfigPath)))
         return FALSE;
 
-    SaveUiStateToGlobals();
-
-    if (hCtxEdit) GetWindowTextA(hCtxEdit, ctx, sizeof(ctx));
-    if (hGpuEdit) GetWindowTextA(hGpuEdit, gpu, sizeof(gpu));
-    if (hPortEdit) GetWindowTextA(hPortEdit, port, sizeof(port));
-    if (hThreadsEdit) GetWindowTextA(hThreadsEdit, threads, sizeof(threads));
-    if (hServerTypeCombo)
-        nServerType = (int)SendMessageA(hServerTypeCombo, CB_GETCURSEL, 0, 0);
+    lstrcpynA(ctx, sConfiguredContext, sizeof(ctx));
+    lstrcpynA(gpu, sConfiguredGpuLayers, sizeof(gpu));
+    lstrcpynA(port, sConfiguredPort, sizeof(port));
+    lstrcpynA(threads, sConfiguredThreads, sizeof(threads));
 
     /* Get KV cache K type from combo */
     char kvCacheK[16] = "f16";
-    if (hKvCacheKCombo) {
-        int sel = (int)SendMessageA(hKvCacheKCombo, CB_GETCURSEL, 0, 0);
-        switch (sel) {
-            case 0: lstrcpynA(kvCacheK, "f16", sizeof(kvCacheK)); break;
-            case 1: lstrcpynA(kvCacheK, "q8_0", sizeof(kvCacheK)); break;
-            case 2: lstrcpynA(kvCacheK, "q4_0", sizeof(kvCacheK)); break;
-            case 3: lstrcpynA(kvCacheK, "q4_1", sizeof(kvCacheK)); break;
-            default: lstrcpynA(kvCacheK, "f16", sizeof(kvCacheK)); break;
-        }
-    }
 
     /* Get KV cache V type from combo */
     char kvCacheV[16] = "f16";
-    if (hKvCacheVCombo) {
-        int sel = (int)SendMessageA(hKvCacheVCombo, CB_GETCURSEL, 0, 0);
-        switch (sel) {
-            case 0: lstrcpynA(kvCacheV, "f16", sizeof(kvCacheV)); break;
-            case 1: lstrcpynA(kvCacheV, "q8_0", sizeof(kvCacheV)); break;
-            case 2: lstrcpynA(kvCacheV, "q4_0", sizeof(kvCacheV)); break;
-            case 3: lstrcpynA(kvCacheV, "q4_1", sizeof(kvCacheV)); break;
-            default: lstrcpynA(kvCacheV, "f16", sizeof(kvCacheV)); break;
-        }
-    }
+
+    lstrcpynA(kvCacheK, sConfiguredKvCacheK, sizeof(kvCacheK));
+    lstrcpynA(kvCacheV, sConfiguredKvCacheV, sizeof(kvCacheV));
 
     snprintf(kvCacheBoth, sizeof(kvCacheBoth), "%s,%s", kvCacheK, kvCacheV);
+
+    lstrcpynA(sConfiguredContext, ctx, sizeof(sConfiguredContext));
+    lstrcpynA(sConfiguredGpuLayers, gpu, sizeof(sConfiguredGpuLayers));
+    lstrcpynA(sConfiguredPort, port, sizeof(sConfiguredPort));
+    lstrcpynA(sConfiguredThreads, threads, sizeof(sConfiguredThreads));
+    lstrcpynA(sConfiguredKvCacheK, kvCacheK, sizeof(sConfiguredKvCacheK));
+    lstrcpynA(sConfiguredKvCacheV, kvCacheV, sizeof(sConfiguredKvCacheV));
 
     {
         FILE *fp = fopen(sConfigPath, "w");
@@ -1117,6 +2004,7 @@ static BOOL SaveConfigToDisk(void)
             fprintf(fp, "  models_folder: \"%s\"\n", sFolder);
             fprintf(fp, "  default_model: \"%s\"\n", sSelectedModel);
             fprintf(fp, "  llama_cpp_path: \"%s\"\n", sLlamaCppPath);
+            fprintf(fp, "  cli_path: \"%s\"\n", sCliPath);
             fprintf(fp, "\nsettings:\n");
             fprintf(fp, "  context: %s\n", ctx);
             fprintf(fp, "  gpu_layers: %s\n", gpu);
@@ -1173,7 +2061,19 @@ static BOOL LoadConfigFromDisk(void)
     ReadYamlValue(sConfigPath, "paths.models_folder", sFolder, sizeof(sFolder));
     ReadYamlValue(sConfigPath, "paths.default_model", sSelectedModel, sizeof(sSelectedModel));
     ReadYamlValue(sConfigPath, "paths.llama_cpp_path", sLlamaCppPath, sizeof(sLlamaCppPath));
+    ReadYamlValue(sConfigPath, "paths.cli_path", sCliPath, sizeof(sCliPath));
     nServerType = ReadYamlIntValue(sConfigPath, "server.type", 0);
+
+    if (!sCliPath[0] && sServer[0])
+        GetCliPathFromServerPath(sServer, sCliPath, sizeof(sCliPath));
+
+    GetConfiguredServerValues(sConfiguredContext, sizeof(sConfiguredContext),
+        sConfiguredGpuLayers, sizeof(sConfiguredGpuLayers),
+        sConfiguredPort, sizeof(sConfiguredPort),
+        sConfiguredThreads, sizeof(sConfiguredThreads),
+        NULL, 0);
+    GetConfiguredServerValuesBoth(sConfiguredKvCacheK, sizeof(sConfiguredKvCacheK),
+        sConfiguredKvCacheV, sizeof(sConfiguredKvCacheV));
 
     /* Load cloud config */
     {
@@ -1402,13 +2302,10 @@ static int RunSearchConfigMenu(void)
                 printf("\n\x1b[90mVerifying API key...\x1b[0m ");
                 fflush(stdout);
                 
-                BOOL verified = FALSE;
-                int dots = 0;
                 for (int i = 0; i < 10; i++) {
                     printf(".");
                     fflush(stdout);
                     Sleep(200);
-                    dots++;
                 }
                 
                 if (newEngine == SEARCH_SERPAPI) {
@@ -1480,68 +2377,6 @@ static BOOL IsDaemonAutostartEnabled(void)
 
     GetPrivateProfileStringA("daemon", "autostart", "0", value, sizeof(value), sConfigPath);
     return atoi(value) != 0;
-}
-
-static void ApplyLoadedConfigToControls(void)
-{
-    char value[32];
-
-    if (!hServerEdit || !hFolderEdit)
-        return;
-
-    SetWindowTextA(hServerEdit, sServer);
-    SetWindowTextA(hFolderEdit, sFolder);
-
-    GetPrivateProfileStringA("settings", "ctx", "2048", value, sizeof(value), sConfigPath);
-    SetWindowTextA(hCtxEdit, value);
-
-    GetPrivateProfileStringA("settings", "gpu", "-1", value, sizeof(value), sConfigPath);
-    SetWindowTextA(hGpuEdit, value);
-
-    GetPrivateProfileStringA("settings", "port", "8000", value, sizeof(value), sConfigPath);
-    SetWindowTextA(hPortEdit, value);
-
-    GetPrivateProfileStringA("settings", "threads", "4", value, sizeof(value), sConfigPath);
-    SetWindowTextA(hThreadsEdit, value);
-    
-    /* Load KV cache type - format: "k_type,v_type" */
-    GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", value, sizeof(value), sConfigPath);
-    
-    char kvK[16] = "f16";
-    char kvV[16] = "f16";
-    char *comma = strchr(value, ',');
-    if (comma) {
-        *comma = '\0';
-        lstrcpynA(kvK, value, sizeof(kvK));
-        lstrcpynA(kvV, comma + 1, sizeof(kvV));
-    } else {
-        lstrcpynA(kvK, value, sizeof(kvK));
-        lstrcpynA(kvV, value, sizeof(kvV));
-    }
-    
-    /* Set KV cache K combo */
-    if (lstrcmpiA(kvK, "q8_0") == 0) {
-        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 1, 0);
-    } else if (lstrcmpiA(kvK, "q4_0") == 0) {
-        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 2, 0);
-    } else if (lstrcmpiA(kvK, "q4_1") == 0) {
-        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 3, 0);
-    } else {
-        SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 0, 0);
-    }
-    
-    /* Set KV cache V combo */
-    if (lstrcmpiA(kvV, "q8_0") == 0) {
-        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 1, 0);
-    } else if (lstrcmpiA(kvV, "q4_0") == 0) {
-        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 2, 0);
-    } else if (lstrcmpiA(kvV, "q4_1") == 0) {
-        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 3, 0);
-    } else {
-        SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 0, 0);
-    }
-
-    SendMessageA(hServerTypeCombo, CB_SETCURSEL, (WPARAM)nServerType, 0);
 }
 
 static BOOL EnsureSelectedModelExists(void)
@@ -1829,13 +2664,28 @@ static int FindModelIndexByName(const char *modelName)
 
 static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuLen, char *port, int portLen, char *threads, int threadsLen, char *kvCache, int kvCacheLen)
 {
-    if (ctx && ctxLen > 0) GetPrivateProfileStringA("settings", "ctx", "2048", ctx, ctxLen, sConfigPath);
-    if (gpu && gpuLen > 0) GetPrivateProfileStringA("settings", "gpu", "-1", gpu, gpuLen, sConfigPath);
-    if (port && portLen > 0) GetPrivateProfileStringA("settings", "port", "8000", port, portLen, sConfigPath);
-    if (threads && threadsLen > 0) GetPrivateProfileStringA("settings", "threads", "4", threads, threadsLen, sConfigPath);
+    if (ctx && ctxLen > 0) {
+        if (!ReadYamlValue(sConfigPath, "settings.context", ctx, ctxLen))
+            ReadYamlValue(sConfigPath, "settings.ctx", ctx, ctxLen);
+        if (!ctx[0]) lstrcpynA(ctx, "2048", ctxLen);
+    }
+    if (gpu && gpuLen > 0) {
+        if (!ReadYamlValue(sConfigPath, "settings.gpu_layers", gpu, gpuLen))
+            ReadYamlValue(sConfigPath, "settings.gpu", gpu, gpuLen);
+        if (!gpu[0]) lstrcpynA(gpu, "-1", gpuLen);
+    }
+    if (port && portLen > 0) {
+        ReadYamlValue(sConfigPath, "settings.port", port, portLen);
+        if (!port[0]) lstrcpynA(port, "8000", portLen);
+    }
+    if (threads && threadsLen > 0) {
+        ReadYamlValue(sConfigPath, "settings.threads", threads, threadsLen);
+        if (!threads[0]) lstrcpynA(threads, "4", threadsLen);
+    }
     if (kvCache && kvCacheLen > 0) {
         char stored[64];
-        GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", stored, sizeof(stored), sConfigPath);
+        if (!ReadYamlValue(sConfigPath, "settings.kv_cache_type", stored, sizeof(stored)))
+            lstrcpynA(stored, "f16,f16", sizeof(stored));
         char *comma = strchr(stored, ',');
         if (comma) {
             *comma = '\0';
@@ -1849,7 +2699,8 @@ static void GetConfiguredServerValues(char *ctx, int ctxLen, char *gpu, int gpuL
 static void GetConfiguredServerValuesBoth(char *kvCacheK, int kvCacheKLen, char *kvCacheV, int kvCacheVLen)
 {
     char stored[64];
-    GetPrivateProfileStringA("settings", "kv_cache_type", "f16,f16", stored, sizeof(stored), sConfigPath);
+    if (!ReadYamlValue(sConfigPath, "settings.kv_cache_type", stored, sizeof(stored)))
+        lstrcpynA(stored, "f16,f16", sizeof(stored));
     char *comma = strchr(stored, ',');
     if (comma) {
         *comma = '\0';
@@ -2292,7 +3143,7 @@ static void BuildRunCommand(char *dst, int dstLen, const char *modelName)
     int modelIndex;
     const char *targetModel;
 
-    GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
+    ResolveConfiguredCliPath(cliPath, sizeof(cliPath));
     targetModel = modelName ? modelName : sSelectedModel;
     BuildModelPath(modelPath, sizeof(modelPath), targetModel);
     GetModelConfig(targetModel, ctx, sizeof(ctx), gpu, sizeof(gpu), threads, sizeof(threads));
@@ -3274,7 +4125,6 @@ static int SelectBuildMenu(LlamaCppBuild *builds, int count)
     int previousIndex = 0;
     int ch;
     DWORD mode;
-    HANDLE hConsole;
     COORD menuOrigin;
     
     if (count <= 0) return -1;
@@ -3784,7 +4634,7 @@ static int PrintUsage(void)
     printf("\x1b[36mValora CLI - Local AI Model Manager\x1b[0m\n\n");
     
     printf("\x1b[33mGeneral:\x1b[0m\n");
-    printf("  valora setup           Open the GUI setup window\n");
+    printf("  valora setup           Open the terminal setup wizard\n");
     printf("  valora help           Show this help message\n");
     printf("  valora version        Show version information\n");
     
@@ -3829,6 +4679,8 @@ static int PrintUsage(void)
     printf("      --ollama          Use Ollama-compatible API\n");
     printf("      --cloud          Select and use cloud LLM provider\n");
     printf("      --cloud <name>     Quick switch to provider (groq, openai, deepseek, openrouter)\n");
+    printf("    Security:\n");
+    printf("      Chat locks tools to the startup folder as workspace sandbox\n");
 
     printf("\n\x1b[33mDaemon (Background Server):\x1b[0m\n");
     printf("  valora daemon start           Start daemon in background (default port: 11435)\n");
@@ -3840,6 +4692,7 @@ static int PrintUsage(void)
     printf("  valora daemon status          Show daemon status and current model\n");
     printf("  valora daemon restart         Restart the daemon\n");
     printf("  valora daemon log [N]         Show last N lines of daemon log (default: 50)\n");
+    printf("  valora daemon --log-lines <N> Show last N lines of daemon log\n");
     printf("\n  Daemon API Endpoints:\n");
     printf("    GET  /api/tags              List available models (Ollama-compatible)\n");
     printf("    GET  /api/ps                List loaded models (Ollama-compatible)\n");
@@ -3920,9 +4773,6 @@ static int EstimateGpuLayers(const char *folderPath, const char *modelName)
         /* Estimate actual size after context overhead (20% reserve for KV cache, etc) */
         int reservedMB = (int)(modelSizeMB * 0.20);
         
-        const char *quantType = DetectQuantizationType(modelName);
-        double scaleFactor = GetQuantizationScaleFactor(quantType);
-        
         /* Get VRAM */
         int vramMB = GetTotalVRAM();
         
@@ -3948,113 +4798,10 @@ static int EstimateGpuLayers(const char *folderPath, const char *modelName)
     return -1;  /* File not found */
 }
 
-/*
- * Auto-detect and populate GPU layers field when model is selected
- * Only updates if user hasn't manually edited the field
- */
-static void AutoDetectAndSetGpuLayers(void)
-{
-    int modelIdx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
-
-    if (bGpuFieldEdited)
-        return;
-    
-    /* If no model selected or folder not set, reset to defaults */
-    if (modelIdx == CB_ERR || !sFolder[0]) {
-        SetWindowTextA(hGpuEdit, "-1");
-        nLastDetectedGpu = -1;
-        bGpuFieldEdited = FALSE;
-        return;
-    }
-
-    /* Get selected model name */
-    char modelName[MAX_PATH] = {0};
-    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)modelIdx, (LPARAM)modelName);
-
-    /* Try auto-detection */
-    int detectedLayers = EstimateGpuLayers(sFolder, modelName);
-    
-    /* If detection succeeded, update the field */
-    if (detectedLayers > 0) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", detectedLayers);
-        SetWindowTextA(hGpuEdit, buf);
-        nLastDetectedGpu = detectedLayers;
-        bGpuFieldEdited = FALSE;
-    } else {
-        /* Detection failed; keep safe fallback (-1 = auto) */
-        SetWindowTextA(hGpuEdit, "-1");
-        nLastDetectedGpu = -1;
-        bGpuFieldEdited = FALSE;
-    }
-}
-
-static void CopyToClipboardA(HWND hwnd, const char *text)
-{
-    if (!text || !*text) return;
-    if (!OpenClipboard(hwnd)) return;
-
-    EmptyClipboard();
-
-    size_t len = strlen(text) + 1;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-    if (hMem) {
-        void *p = GlobalLock(hMem);
-        if (p) {
-            memcpy(p, text, len);
-            GlobalUnlock(hMem);
-            SetClipboardData(CF_TEXT, hMem);
-        } else {
-            GlobalFree(hMem);
-        }
-    }
-
-    CloseClipboard();
-}
-
-static void ShowOnlyOnPage(HWND hwnd)
-{
-    ShowWindow(hServerEdit,    SW_SHOW);
-    ShowWindow(hFolderEdit,    SW_SHOW);
-    ShowWindow(hModelCombo,    SW_SHOW);
-    ShowWindow(hBtnServer,     SW_SHOW);
-    ShowWindow(hBtnFolder,     SW_SHOW);
-    ShowWindow(hCtxEdit,       SW_SHOW);
-    ShowWindow(hGpuEdit,       SW_SHOW);
-    ShowWindow(hPortEdit,      SW_SHOW);
-    ShowWindow(hThreadsEdit,   SW_SHOW);
-    ShowWindow(hServerTypeCombo, SW_SHOW);
-    ShowWindow(hLblServer,     SW_SHOW);
-    ShowWindow(hLblFolder,     SW_SHOW);
-    ShowWindow(hLblModel,      SW_SHOW);
-    ShowWindow(hLblCtx,        SW_SHOW);
-    ShowWindow(hLblGpu,        SW_SHOW);
-    ShowWindow(hLblPort,       SW_SHOW);
-    ShowWindow(hLblThreads,    SW_SHOW);
-    ShowWindow(hLblServerType, SW_SHOW);
-    ShowWindow(hLblCommandType, SW_SHOW);
-    
-    ShowWindow(hOutputEdit,    SW_HIDE);
-    ShowWindow(hBtnGenerate,   SW_HIDE);
-    ShowWindow(hBtnCopy,       SW_HIDE);
-    ShowWindow(hBtnPrev,       SW_HIDE);
-    SetWindowTextA(hBtnNext, "Save Setup");
-    InvalidateRect(hwnd, NULL, TRUE);
-}
-
-/* ──────────────────────────────────────────────
-   Model scanning (with recursive subfolder support)
-   ────────────────────────────────────────────── */
-static void ScanModelsRecursively(const char *basePath, int *count);
 
 static void ScanModels(void)
 {
-    int selectedIndex = 0;
-    int i;
-
     nModels = 0;
-    if (hModelCombo)
-        SendMessageA(hModelCombo, CB_RESETCONTENT, 0, 0);
     
     /* Reset GPU auto-detection state when rescanning models */
     bGpuFieldEdited = FALSE;
@@ -4065,20 +4812,7 @@ static void ScanModels(void)
     /* Scan models recursively from all subfolders */
     ScanModelsRecursively(sFolder, &nModels);
 
-    if (!EnsureSelectedModelExists())
-        return;
-
-    for (i = 0; i < nModels; ++i) {
-        if (lstrcmpiA(sModels[i], sSelectedModel) == 0) {
-            selectedIndex = i;
-            break;
-        }
-    }
-
-    if (hModelCombo && nModels > 0) {
-        SendMessageA(hModelCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
-        AutoDetectAndSetGpuLayers();
-    }
+    EnsureSelectedModelExists();
 }
 
 /* Recursive function to scan for GGUF files in subfolders */
@@ -4115,8 +4849,6 @@ static void ScanModelsRecursively(const char *basePath, int *count)
                     } else {
                         sModelProjectors[*count][0] = '\0';
                     }
-                    if (hModelCombo)
-                        SendMessageA(hModelCombo, CB_ADDSTRING, 0, (LPARAM)sModels[*count]);
                     (*count)++;
                 }
             }
@@ -4141,599 +4873,484 @@ static void ScanModelsRecursively(const char *basePath, int *count)
     }
 }
 
-static void SelectServerFile(HWND hwnd)
+static void CycleCacheTypeValue(char *value, int valueLen, int direction)
 {
-    OPENFILENAMEA ofn;
-    char selectedFile[MAX_PATH] = "";
+    static const char *types[] = {"f16", "q8_0", "q4_0", "q4_1"};
+    int count = (int)(sizeof(types) / sizeof(types[0]));
+    int index = 0;
+    int i;
 
-    ZeroMemory(&ofn, sizeof(ofn));
+    if (!value || valueLen <= 0)
+        return;
 
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = selectedFile;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = "Executable (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrTitle = "Select Server Executable";
-
-    if (GetOpenFileNameA(&ofn)) {
-        lstrcpynA(sServer, selectedFile, sizeof(sServer));
-        SetWindowTextA(hServerEdit, sServer);
-    }
-}
-
-static void SelectFolder(HWND hwnd)
-{
-    BROWSEINFOA bi;
-    ZeroMemory(&bi, sizeof(bi));
-    bi.hwndOwner = hwnd;
-    bi.lpszTitle = "Select Model Folder";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (!pidl) return;
-
-    char path[MAX_PATH] = {0};
-    if (SHGetPathFromIDListA(pidl, path)) {
-        lstrcpynA(sFolder, path, MAX_PATH);
-        SetWindowTextA(hFolderEdit, sFolder);
-        ScanModels();
+    for (i = 0; i < count; ++i) {
+        if (_stricmp(types[i], value) == 0) {
+            index = i;
+            break;
+        }
     }
 
-    CoTaskMemFree(pidl);
+    index = (index + direction + count) % count;
+    lstrcpynA(value, types[index], valueLen);
 }
 
-/* Derive CLI executable path from server path */
-static void GetCliPathFromServerPath(const char *serverPath, char *cliPath, int cliPathLen)
+static int GetSetupConsoleWidth(void)
 {
-    if (!serverPath || !cliPath || cliPathLen <= 0) {
-        if (cliPath && cliPathLen > 0) cliPath[0] = '\0';
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (hOut != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        int width = (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+        if (width >= 80)
+            return width;
+    }
+    return 120;
+}
+
+static void TruncateDisplayText(const char *src, char *dst, int dstLen)
+{
+    int srcLen;
+    int copyLen;
+
+    if (!dst || dstLen <= 0)
+        return;
+
+    if (!src || !src[0]) {
+        lstrcpynA(dst, "(empty)", dstLen);
         return;
     }
 
-    /* Copy server path */
-    lstrcpynA(cliPath, serverPath, cliPathLen);
-    
-    /* Find the last backslash */
-    char *lastSlash = strrchr(cliPath, '\\');
-    if (lastSlash) {
-        /* Replace filename with llama-cli.exe */
-        lstrcpynA(lastSlash + 1, "llama-cli.exe", cliPathLen - (int)(lastSlash - cliPath + 1));
-    } else {
-        /* No path, just replace with llama-cli.exe */
-        lstrcpynA(cliPath, "llama-cli.exe", cliPathLen);
+    srcLen = (int)strlen(src);
+    if (srcLen < dstLen) {
+        lstrcpynA(dst, src, dstLen);
+        return;
+    }
+
+    if (dstLen <= 4) {
+        lstrcpynA(dst, src, dstLen);
+        return;
+    }
+
+    copyLen = dstLen - 4;
+    memcpy(dst, src, copyLen);
+    memcpy(dst + copyLen, "...", 3);
+    dst[copyLen + 3] = '\0';
+}
+
+static void PrintSetupBorder(int innerWidth)
+{
+    int i;
+    printf("\x1b[36m+\x1b[0m");
+    for (i = 0; i < innerWidth; ++i)
+        printf("\x1b[36m-\x1b[0m");
+    printf("\x1b[36m+\x1b[0m\n");
+}
+
+static void PrintSetupLine(int innerWidth, const char *text, BOOL selected)
+{
+    char line[1024];
+    TruncateDisplayText(text ? text : "", line, innerWidth);
+
+    printf("\x1b[36m|\x1b[0m");
+    if (selected)
+        printf("\x1b[46;30m %-*.*s \x1b[0m", innerWidth - 2, innerWidth - 2, line);
+    else
+        printf(" %-*.*s ", innerWidth - 2, innerWidth - 2, line);
+    printf("\x1b[36m|\x1b[0m\n");
+}
+
+static void PrintSetupFieldRow(int innerWidth, const char *label, const char *value, BOOL selected, BOOL action)
+{
+    char valueBuf[768];
+    char row[1024];
+
+    TruncateDisplayText(value, valueBuf, sizeof(valueBuf));
+    if (action)
+        snprintf(row, sizeof(row), "  %s", label);
+    else
+        snprintf(row, sizeof(row), "  %-17s : %s", label, valueBuf);
+    PrintSetupLine(innerWidth, row, selected);
+}
+
+static void GetSetupRenderWidth(int *width, int *innerWidth)
+{
+    int localWidth = GetSetupConsoleWidth();
+
+    if (localWidth > 140) localWidth = 140;
+    if (localWidth < 92) localWidth = 92;
+
+    if (width)
+        *width = localWidth;
+    if (innerWidth)
+        *innerWidth = localWidth - 2;
+}
+
+static int GetSetupCompletionCount(void)
+{
+    int completed = 0;
+
+    if (sServer[0]) completed++;
+    if (sCliPath[0]) completed++;
+    if (sFolder[0]) completed++;
+    if (sSelectedModel[0]) completed++;
+    if (sConfiguredContext[0]) completed++;
+
+    return completed;
+}
+
+static int GetSetupRowForIndex(int index)
+{
+    if (index >= 0 && index <= 5)
+        return 6 + index;
+    if (index >= 6 && index <= 11)
+        return 8 + index;
+    if (index >= 12 && index <= 14)
+        return 10 + index;
+    return -1;
+}
+
+static void RenderSetupLineAt(int row, int innerWidth, const char *text, BOOL selected)
+{
+    MoveCursorTo(row, 1);
+    PrintSetupLine(innerWidth, text, selected);
+}
+
+static void RenderSetupBorderAt(int row, int innerWidth)
+{
+    MoveCursorTo(row, 1);
+    PrintSetupBorder(innerWidth);
+}
+
+static void RenderSetupHeaderLine(int innerWidth)
+{
+    char info[1024];
+
+    snprintf(info, sizeof(info), "  Valora Setup TUI                                  Completion %d/5", GetSetupCompletionCount());
+    RenderSetupLineAt(2, innerWidth, info, FALSE);
+}
+
+static void RenderSetupStatusLine(int innerWidth, const char *status)
+{
+    char info[1024];
+
+    if (status && status[0])
+        snprintf(info, sizeof(info), "  Status: %s", status);
+    else
+        snprintf(info, sizeof(info), "  Status: Ready");
+
+    RenderSetupLineAt(28, innerWidth, info, FALSE);
+    fflush(stdout);
+}
+
+static void RenderSetupHeaderAndStatus(const char *status)
+{
+    int innerWidth;
+
+    GetSetupRenderWidth(NULL, &innerWidth);
+    RenderSetupHeaderLine(innerWidth);
+    RenderSetupStatusLine(innerWidth, status);
+}
+
+static void RenderSetupIndexLine(int innerWidth, int index, BOOL selected)
+{
+    switch (index) {
+    case 0:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Server type", nServerType == 1 ? "LAN" : "Local", selected, FALSE);
+        break;
+    case 1:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Server path", sServer, selected, FALSE);
+        break;
+    case 2:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "CLI path", sCliPath, selected, FALSE);
+        break;
+    case 3:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "llama.cpp folder", sLlamaCppPath, selected, FALSE);
+        break;
+    case 4:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Models folder", sFolder, selected, FALSE);
+        break;
+    case 5:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Default model", sSelectedModel, selected, FALSE);
+        break;
+    case 6:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Context", sConfiguredContext, selected, FALSE);
+        break;
+    case 7:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "GPU layers", sConfiguredGpuLayers, selected, FALSE);
+        break;
+    case 8:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Port", sConfiguredPort, selected, FALSE);
+        break;
+    case 9:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Threads", sConfiguredThreads, selected, FALSE);
+        break;
+    case 10:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "KV cache K", sConfiguredKvCacheK, selected, FALSE);
+        break;
+    case 11:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "KV cache V", sConfiguredKvCacheV, selected, FALSE);
+        break;
+    case 12:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Pick model from folder", "", selected, TRUE);
+        break;
+    case 13:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Save setup", "", selected, TRUE);
+        break;
+    case 14:
+        MoveCursorTo(GetSetupRowForIndex(index), 1);
+        PrintSetupFieldRow(innerWidth, "Cancel", "", selected, TRUE);
+        break;
     }
 }
 
-static void GenerateCommand(HWND hwnd)
+static void RenderSetupSelectionDelta(int previousIndex, int selectedIndex, const char *status)
 {
-    int idx = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
+    int innerWidth;
 
-    if (!sServer[0] && hServerEdit)
-        GetWindowTextA(hServerEdit, sServer, sizeof(sServer));
-    if (!sFolder[0] && hFolderEdit)
-        GetWindowTextA(hFolderEdit, sFolder, sizeof(sFolder));
+    GetSetupRenderWidth(NULL, &innerWidth);
+    if (previousIndex >= 0 && previousIndex != selectedIndex)
+        RenderSetupIndexLine(innerWidth, previousIndex, FALSE);
+    RenderSetupIndexLine(innerWidth, selectedIndex, TRUE);
+    RenderSetupStatusLine(innerWidth, status);
+}
 
-    if (!sServer[0]) {
-        MessageBoxA(hwnd, "Select the server executable first.", "Setup incomplete", MB_ICONERROR);
-        return;
+static void RenderSetupWizard(int selectedIndex, const char *status)
+{
+    char configPath[MAX_PATH];
+    char info[1024];
+    int width;
+    int innerWidth;
+
+    GetSetupRenderWidth(&width, &innerWidth);
+    BuildConfigPath(configPath, sizeof(configPath));
+
+    printf("\x1b[2J\x1b[H");
+    PrintSetupBorder(innerWidth);
+    snprintf(info, sizeof(info), "  Valora Setup TUI                                  Completion %d/5", GetSetupCompletionCount());
+    PrintSetupLine(innerWidth, info, FALSE);
+    PrintSetupLine(innerWidth, "  Clean terminal-first onboarding for local models and llama.cpp", FALSE);
+    PrintSetupBorder(innerWidth);
+
+    PrintSetupLine(innerWidth, "  Paths", FALSE);
+    RenderSetupIndexLine(innerWidth, 0, selectedIndex == 0);
+    RenderSetupIndexLine(innerWidth, 1, selectedIndex == 1);
+    RenderSetupIndexLine(innerWidth, 2, selectedIndex == 2);
+    RenderSetupIndexLine(innerWidth, 3, selectedIndex == 3);
+    RenderSetupIndexLine(innerWidth, 4, selectedIndex == 4);
+    RenderSetupIndexLine(innerWidth, 5, selectedIndex == 5);
+    PrintSetupBorder(innerWidth);
+
+    PrintSetupLine(innerWidth, "  Runtime", FALSE);
+    RenderSetupIndexLine(innerWidth, 6, selectedIndex == 6);
+    RenderSetupIndexLine(innerWidth, 7, selectedIndex == 7);
+    RenderSetupIndexLine(innerWidth, 8, selectedIndex == 8);
+    RenderSetupIndexLine(innerWidth, 9, selectedIndex == 9);
+    RenderSetupIndexLine(innerWidth, 10, selectedIndex == 10);
+    RenderSetupIndexLine(innerWidth, 11, selectedIndex == 11);
+    PrintSetupBorder(innerWidth);
+
+    PrintSetupLine(innerWidth, "  Actions", FALSE);
+    RenderSetupIndexLine(innerWidth, 12, selectedIndex == 12);
+    RenderSetupIndexLine(innerWidth, 13, selectedIndex == 13);
+    RenderSetupIndexLine(innerWidth, 14, selectedIndex == 14);
+    PrintSetupBorder(innerWidth);
+
+    snprintf(info, sizeof(info), "  Config: %s", configPath);
+    PrintSetupLine(innerWidth, info, FALSE);
+    PrintSetupLine(innerWidth, "  Controls: Up/Down or W/S move | Left/Right or A/D change | Enter edits", FALSE);
+    if (status && status[0])
+        snprintf(info, sizeof(info), "  Status: %s", status);
+    else
+        snprintf(info, sizeof(info), "  Status: Ready");
+    PrintSetupLine(innerWidth, info, FALSE);
+    PrintSetupBorder(innerWidth);
+}
+
+static int ValidateAndSaveTerminalSetup(char *status, int statusLen)
+{
+    if (!sServer[0] || !FileExistsA_(sServer)) {
+        snprintf(status, statusLen, "\x1b[31mServer executable is missing or invalid.\x1b[0m");
+        return 1;
+    }
+    if (!sCliPath[0] || !FileExistsA_(sCliPath)) {
+        snprintf(status, statusLen, "\x1b[31mCLI executable is missing or invalid.\x1b[0m");
+        return 1;
+    }
+    if (!sFolder[0] || !DirectoryExistsA_(sFolder)) {
+        snprintf(status, statusLen, "\x1b[31mModels folder is missing or invalid.\x1b[0m");
+        return 1;
     }
 
-    if (!sFolder[0]) {
-        MessageBoxA(hwnd, "Select the model folder first.", "Setup incomplete", MB_ICONERROR);
-        return;
-    }
-
-    /* Allow saving even with no models - user may add models later */
-    if (idx != CB_ERR) {
-        SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)idx, (LPARAM)sSelectedModel);
-    } else {
-        sSelectedModel[0] = '\0';  /* No model selected - that's okay for empty folder */
-    }
+    ScanModels();
+    EnsureSelectedModelExists();
 
     if (!SaveConfigToDisk()) {
-        MessageBoxA(hwnd, "Could not save the Valora configuration.", "Save failed", MB_ICONERROR);
-        return;
-    }
-
-    snprintf(
-        sCommand, sizeof(sCommand),
-        "valora models\r\nvalora run\r\nvalora serve\r\n\r\nCurrent quick command: %s",
-        "valora serve"
-    );
-    CopyToClipboardA(hwnd, sCommand);
-    MessageBoxA(
-        hwnd,
-        "Setup saved.\n\nYou can now use:\nvalora models\nvalora run\nvalora serve\n\nThe command list has been copied to your clipboard.",
-        "Valora ready",
-        MB_OK | MB_ICONINFORMATION
-    );
-}
-
-/* ──────────────────────────────────────────────
-   Drawing helpers
-   ────────────────────────────────────────────── */
-static void DrawLabel(HDC hdc, const char *text, int x, int y, int w, int h, HFONT font, COLORREF color, UINT fmt)
-{
-    RECT r = {x, y, x + w, y + h};
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, color);
-    DrawTextA(hdc, text, -1, &r, fmt);
-    SelectObject(hdc, old);
-}
-
-static void DrawHeader(HDC hdc, RECT rc)
-{
-    RECT accent = {0, 0, rc.right, 4};
-    HBRUSH accentBrush = CreateSolidBrush(C_ACCENT);
-
-    FillRect(hdc, &accent, accentBrush);
-    DeleteObject(accentBrush);
-
-    SetBkMode(hdc, TRANSPARENT);
-    DrawLabel(hdc, "Valora Setup", 0, 22, rc.right, 40, hFontTitle, C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    DrawLabel(hdc, "Set your paths once, then launch models from the terminal without reopening setup.", 0, 58, rc.right, 20, hFontSmall, C_MUTED, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-}
-
-static void DrawCardFrame(HDC hdc, RECT rc)
-{
-    int cardW = (CARD_MAX_W < (rc.right - 2 * PAD)) ? CARD_MAX_W : (rc.right - 2 * PAD);
-    if (cardW < 440) cardW = rc.right - 2 * PAD;
-    int cardH = rc.bottom - HEADER_H - FOOTER_H - 12;
-    if (cardH < 300) cardH = 300;
-
-    int cardX = (rc.right - cardW) / 2;
-    int cardY = HEADER_H + 12;
-
-    RECT glow;
-    HBRUSH glowBrush = CreateSolidBrush(C_ACCENT_SOFT);
-    HBRUSH b = CreateSolidBrush(C_PANEL);
-    HPEN p = CreatePen(PS_SOLID, 1, C_BORDER);
-    
-    glow.left = cardX - 2;
-    glow.top = cardY - 2;
-    glow.right = cardX + cardW + 2;
-    glow.bottom = cardY + cardH + 2;
-    FillRect(hdc, &glow, glowBrush);
-
-    HBRUSH oldB = (HBRUSH)SelectObject(hdc, b);
-    HPEN oldP = (HPEN)SelectObject(hdc, p);
-
-    RoundRect(hdc, cardX, cardY, cardX + cardW, cardY + cardH, 10, 10);
-
-    SelectObject(hdc, oldP);
-    SelectObject(hdc, oldB);
-
-    DeleteObject(p);
-    DeleteObject(b);
-    DeleteObject(glowBrush);
-}
-
-/* ──────────────────────────────────────────────
-   Layout
-   ────────────────────────────────────────────── */
-static void LayoutControls(HWND hwnd)
-{
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-
-    int W = rc.right;
-    int H = rc.bottom;
-    int padding = 16;
-    int rowH = 26;
-    int labelH = 14;
-    int gapY = 8;
-    int colGap = 12;
-    int y = padding + 10;
-
-    int labelW = 90;
-    int editW = 140;
-    int btnW = 70;
-    int editH = 24;
-    int comboH = 100;
-
-    // Server Type
-    MoveWindow(hLblServerType, padding, y, 100, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hServerTypeCombo, padding, y, 180, comboH, TRUE);
-    y += rowH + gapY;
-
-    // Server Path
-    MoveWindow(hLblServer, padding, y, 80, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hServerEdit, padding, y, W - padding * 2 - btnW - 8, editH, TRUE);
-    MoveWindow(hBtnServer, W - padding - btnW, y - 1, btnW, editH + 2, TRUE);
-    y += rowH + gapY;
-
-    // Model Folder
-    MoveWindow(hLblFolder, padding, y, 80, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hFolderEdit, padding, y, W - padding * 2 - btnW - 8, editH, TRUE);
-    MoveWindow(hBtnFolder, W - padding - btnW, y - 1, btnW, editH + 2, TRUE);
-    y += rowH + gapY;
-
-    // Model Combo
-    MoveWindow(hLblModel, padding, y, 80, labelH, TRUE);
-    y += labelH + 2;
-    MoveWindow(hModelCombo, padding, y, W - padding * 2, comboH, TRUE);
-    y += rowH + gapY;
-
-    // Context & GPU in same row
-    MoveWindow(hLblCtx, padding, y, labelW, labelH, TRUE);
-    MoveWindow(hCtxEdit, padding + labelW + 4, y, 100, editH, TRUE);
-    
-    MoveWindow(hLblGpu, padding + labelW + 110, y, 70, labelH, TRUE);
-    MoveWindow(hGpuEdit, padding + labelW + 110 + 75, y, 80, editH, TRUE);
-    y += rowH + gapY;
-
-    // Port & Threads in same row
-    MoveWindow(hLblPort, padding, y, labelW, labelH, TRUE);
-    MoveWindow(hPortEdit, padding + labelW + 4, y, 80, editH, TRUE);
-    
-    MoveWindow(hLblThreads, padding + labelW + 110, y, 70, labelH, TRUE);
-    MoveWindow(hThreadsEdit, padding + labelW + 110 + 75, y, 80, editH, TRUE);
-    y += rowH + gapY;
-
-    // KV Cache K and V (side by side)
-    MoveWindow(hLblKvCacheK, padding, y, 80, labelH, TRUE);
-    MoveWindow(hKvCacheKCombo, padding + 85, y, 130, comboH, TRUE);
-    MoveWindow(hLblKvCacheV, padding + 225, y, 80, labelH, TRUE);
-    MoveWindow(hKvCacheVCombo, padding + 225 + 85, y, 130, comboH, TRUE);
-    y += rowH + gapY + 20;
-
-    // Buttons
-    MoveWindow(hBtnPrev, padding, y, 100, 32, TRUE);
-    MoveWindow(hBtnNext, W - padding - 100, y, 100, 32, TRUE);
-}
-
-/* ──────────────────────────────────────────────
-   Painting
-   ────────────────────────────────────────────── */
-static void OnPaint(HWND hwnd)
-{
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-
-    FillRect(hdc, &rc, brBg);
-
-    EndPaint(hwnd, &ps);
-}
-
-/* ──────────────────────────────────────────────
-   Control creation
-   ────────────────────────────────────────────── */
-static void CreateControls(HWND hwnd)
-{
-    HINSTANCE hi = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
-
-    // Labels - short and compact
-    hLblServerType = CreateWindowA("STATIC", "Server Type", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblServer = CreateWindowA("STATIC", "Server", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblFolder = CreateWindowA("STATIC", "Models Folder", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblModel  = CreateWindowA("STATIC", "Model", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblCtx    = CreateWindowA("STATIC", "Context", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblGpu    = CreateWindowA("STATIC", "GPU Layers", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblPort   = CreateWindowA("STATIC", "Port", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblThreads = CreateWindowA("STATIC", "Threads", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    // KV Cache K and V (side by side)
-    hLblKvCacheK = CreateWindowA("STATIC", "KV Cache K", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    hLblKvCacheV = CreateWindowA("STATIC", "KV Cache V", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    // Server Type Combo
-    hServerTypeCombo = CreateWindowA("COMBOBOX", "",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Local");
-    SendMessageA(hServerTypeCombo, CB_ADDSTRING, 0, (LPARAM)"LAN");
-    SendMessageA(hServerTypeCombo, CB_SETCURSEL, 0, 0);
-
-    // Inputs
-    hServerEdit = CreateWindowA("EDIT", "",
-        WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hBtnServer = CreateWindowA("BUTTON", "Browse",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_SERVER, hi, NULL);
-
-    hBtnFolder = CreateWindowA("BUTTON", "Browse",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_FOLDER, hi, NULL);
-
-    hModelCombo = CreateWindowA("COMBOBOX", "",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hCtxEdit = CreateWindowA("EDIT", "2048",
-        WS_CHILD | WS_VISIBLE | ES_NUMBER | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hGpuEdit = CreateWindowA("EDIT", "-1",
-        WS_CHILD | WS_VISIBLE | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hPortEdit = CreateWindowA("EDIT", "8000",
-        WS_CHILD | WS_VISIBLE | ES_NUMBER | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hThreadsEdit = CreateWindowA("EDIT", "4",
-        WS_CHILD | WS_VISIBLE | ES_NUMBER | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    /* KV Cache K Type Combo */
-    hKvCacheKCombo = CreateWindowA("COMBOBOX", "",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"F16");
-    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q8_0");
-    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_0");
-    SendMessageA(hKvCacheKCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_1");
-    SendMessageA(hKvCacheKCombo, CB_SETCURSEL, 0, 0);
-
-    /* KV Cache V Type Combo */
-    hKvCacheVCombo = CreateWindowA("COMBOBOX", "",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_BORDER,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"F16");
-    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q8_0");
-    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_0");
-    SendMessageA(hKvCacheVCombo, CB_ADDSTRING, 0, (LPARAM)"Q4_1");
-    SendMessageA(hKvCacheVCombo, CB_SETCURSEL, 0, 0);
-
-    /* Output controls */
-    hOutputEdit = CreateWindowA("EDIT", "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_HSCROLL,
-        0, 0, 0, 0, hwnd, NULL, hi, NULL);
-
-    hBtnPrev = CreateWindowA("BUTTON", "Prev",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PREV, hi, NULL);
-
-    hBtnNext = CreateWindowA("BUTTON", "Next",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hi, NULL);
-}
-
-/* ──────────────────────────────────────────────
-   Owner-draw button rendering
-   ────────────────────────────────────────────── */
-static BOOL OnDrawItem(LPARAM lp)
-{
-    DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
-    if (!di || di->CtlType != ODT_BUTTON) return FALSE;
-
-    int id = di->CtlID;
-    BOOL pressed = (di->itemState & ODS_SELECTED) ? TRUE : FALSE;
-    BOOL primary = (id == ID_BTN_NEXT);
-
-    RECT r = di->rcItem;
-    HDC hdc = di->hDC;
-
-    COLORREF bg, border, txt;
-
-    if (primary) {
-        // Teal Primary Button
-        bg = pressed ? C_ACCENT2 : C_ACCENT;
-        border = bg;
-        txt = RGB(255, 255, 255);
-    } else {
-        // Secondary Buttons - more compact
-        bg = pressed ? RGB(55, 55, 55) : RGB(50, 50, 50);
-        border = C_INPUT_BORDER;
-        txt = C_TEXT;
-    }
-
-    HBRUSH b = CreateSolidBrush(bg);
-    FillRect(hdc, &r, b);
-    DeleteObject(b);
-
-    HPEN p = CreatePen(PS_SOLID, 1, border);
-    HPEN oldP = (HPEN)SelectObject(hdc, p);
-    HBRUSH oldB = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    
-    RoundRect(hdc, r.left, r.top, r.right, r.bottom, 5, 5);
-    
-    SelectObject(hdc, oldP);
-    SelectObject(hdc, oldB);
-    DeleteObject(p);
-
-    char label[64] = {0};
-    GetWindowTextA(di->hwndItem, label, sizeof(label));
-
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, txt);
-    HFONT oldF = (HFONT)SelectObject(hdc, primary ? hFontBold : hFontBody);
-    DrawTextA(hdc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, oldF);
-
-    return TRUE;
-}
-
-/* ──────────────────────────────────────────────
-   Window procedure
-   ────────────────────────────────────────────── */
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_CREATE:
-        {
-            brBg     = CreateSolidBrush(C_BG);
-            brPanel  = CreateSolidBrush(C_PANEL);
-            brPanel2 = CreateSolidBrush(C_PANEL2);
-            brInput  = CreateSolidBrush(C_INPUT);
-
-            hFontTitle = CreateFontA(30, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
-            hFontBody  = CreateFontA(17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontSmall = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            hFontBold  = CreateFontA(17, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
-            hFontLabel = CreateFontA(15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI Semibold");
-
-            CreateControls(hwnd);
-            if (LoadConfigFromDisk()) {
-                ApplyLoadedConfigToControls();
-                ScanModels();
-                ApplyLoadedConfigToControls();
-            }
-        }
-        return 0;
-
-    case WM_SIZE:
-        LayoutControls(hwnd);
-        ShowOnlyOnPage(hwnd);
-        return 0;
-
-    case WM_ERASEBKGND:
+        snprintf(status, statusLen, "\x1b[31mCould not save config.yml.\x1b[0m");
         return 1;
-
-    case WM_PAINT:
-        OnPaint(hwnd);
-        return 0;
-
-    case WM_COMMAND:
-        {
-            int cmdId = LOWORD(wp);
-            int notifyCode = HIWORD(wp);
-            HWND hCtl = (HWND)lp;
-            
-            switch (cmdId) {
-            case ID_BTN_SERVER:   SelectServerFile(hwnd); break;
-            case ID_BTN_FOLDER:   SelectFolder(hwnd); break;
-            case ID_BTN_NEXT:     GenerateCommand(hwnd); break;
-            }
-            
-            /* Handle combo box model selection change */
-            if (hCtl == hModelCombo && notifyCode == CBN_SELCHANGE) {
-                int sel = (int)SendMessageA(hModelCombo, CB_GETCURSEL, 0, 0);
-                if (sel != CB_ERR)
-                    SendMessageA(hModelCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)sSelectedModel);
-                AutoDetectAndSetGpuLayers();
-            }
-            
-            /* Track if user manually edits GPU layers field */
-            if (hCtl == hGpuEdit && (notifyCode == EN_CHANGE || notifyCode == EN_UPDATE)) {
-                char buf[32] = {0};
-                GetWindowTextA(hGpuEdit, buf, sizeof(buf));
-                
-                /* User is editing - track that this is a manual edit */
-                /* unless the value matches our last auto-detected value */
-                if (buf[0]) {
-                    int currentVal = atoi(buf);
-                    if (currentVal != nLastDetectedGpu) {
-                        bGpuFieldEdited = TRUE;  /* User is manually editing */
-                    }
-                }
-            }
-        }
-        return 0;
-
-    case WM_DRAWITEM:
-        return OnDrawItem(lp);
-
-    case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORLISTBOX:
-        {
-            HDC hdc = (HDC)wp;
-            SetTextColor(hdc, C_TEXT);
-            SetBkColor(hdc, C_INPUT);
-            
-            // Draw a subtle accent border effect for inputs
-            HWND hCtl = (HWND)lp;
-            if (hCtl == hServerEdit || hCtl == hFolderEdit || hCtl == hCtxEdit || hCtl == hModelCombo) {
-                // Input field border hint
-            }
-            return (LRESULT)brInput;
-        }
-
-    case WM_CTLCOLORSTATIC:
-        {
-            HDC hdc = (HDC)wp;
-            HWND hCtl = (HWND)lp;
-
-            // Labels inside the card get the Panel background color
-            if (hCtl == hLblServerType || hCtl == hLblCommandType || hCtl == hLblServer || hCtl == hLblFolder || hCtl == hLblModel || hCtl == hLblCtx || 
-                hCtl == hLblGpu || hCtl == hLblPort || hCtl == hLblThreads) {
-                SetTextColor(hdc, C_MUTED);
-                SetBkColor(hdc, C_PANEL);
-                return (LRESULT)brPanel;
-            }
-
-            // Other generic statics get the App background
-            SetTextColor(hdc, C_MUTED);
-            SetBkColor(hdc, C_BG);
-            return (LRESULT)brBg;
-        }
-
-    case WM_DESTROY:
-        if (brBg) DeleteObject(brBg);
-        if (brPanel) DeleteObject(brPanel);
-        if (brPanel2) DeleteObject(brPanel2);
-        if (brInput) DeleteObject(brInput);
-
-        if (hFontTitle) DeleteObject(hFontTitle);
-        if (hFontBody) DeleteObject(hFontBody);
-        if (hFontSmall) DeleteObject(hFontSmall);
-        if (hFontBold) DeleteObject(hFontBold);
-        if (hFontLabel) DeleteObject(hFontLabel);
-
-        PostQuitMessage(0);
-        return 0;
     }
 
-    return DefWindowProcA(hwnd, msg, wp, lp);
+    snprintf(status, statusLen,
+        "\x1b[32mSetup saved.\x1b[0m Use `valora models`, `valora run`, or `valora serve`.");
+    return 0;
 }
 
-/* ──────────────────────────────────────────────
-   Entry point
-   ────────────────────────────────────────────── */
-static int RunGui(HINSTANCE hInst, int nShow)
+static int RunTerminalSetupWizard(void)
 {
-    WNDCLASSEXA wc;
-    ZeroMemory(&wc, sizeof(wc));
+    int selectedIndex = 0;
+    char status[256] = "";
 
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconA(hInst, MAKEINTRESOURCEA(IDI_ICON1));
-    wc.hIconSm = LoadIconA(hInst, MAKEINTRESOURCEA(IDI_ICON1));
-    wc.lpszClassName = "LlamaSetupRedesign";
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    LoadConfigFromDisk();
+    if (!sCliPath[0] && sServer[0])
+        GetCliPathFromServerPath(sServer, sCliPath, sizeof(sCliPath));
+    if (sFolder[0] && DirectoryExistsA_(sFolder))
+        ScanModels();
 
-    if (!RegisterClassExA(&wc))
-        return 0;
+    RenderSetupWizard(selectedIndex, status);
 
-    RECT wr = {0, 0, APP_W, APP_H};
-    AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    for (;;) {
+        int ch;
+        int previousIndex = selectedIndex;
 
-    int winW = wr.right - wr.left;
-    int winH = wr.bottom - wr.top;
+        ch = _getch();
 
-    int sx = GetSystemMetrics(SM_CXSCREEN);
-    int sy = GetSystemMetrics(SM_CYSCREEN);
+        if (ch == 224 || ch == 0) {
+            ch = _getch();
+            if (ch == 72) {
+                selectedIndex = (selectedIndex > 0) ? (selectedIndex - 1) : 14;
+                RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+                continue;
+            } else if (ch == 80) {
+                selectedIndex = (selectedIndex + 1) % 15;
+                RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+                continue;
+            } else if (ch == 75 && (selectedIndex == 0 || selectedIndex == 10 || selectedIndex == 11))
+                ch = 'A';
+            else if (ch == 77 && (selectedIndex == 0 || selectedIndex == 10 || selectedIndex == 11))
+                ch = 'D';
+            else
+                continue;
+        }
 
-    HWND hwnd = CreateWindowExA(
-        0, "LlamaSetupRedesign", "Valora Setup",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        (sx - winW) / 2, (sy - winH) / 2, winW, winH,
-        NULL, NULL, hInst, NULL
-    );
+        if (ch == 'w' || ch == 'W') {
+            selectedIndex = (selectedIndex > 0) ? (selectedIndex - 1) : 14;
+            RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+            continue;
+        }
+        if (ch == 's' || ch == 'S') {
+            selectedIndex = (selectedIndex + 1) % 15;
+            RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+            continue;
+        }
+        if (ch == 'a' || ch == 'A') {
+            if (selectedIndex == 0)
+                nServerType = (nServerType == 0) ? 1 : 0;
+            else if (selectedIndex == 10)
+                CycleCacheTypeValue(sConfiguredKvCacheK, sizeof(sConfiguredKvCacheK), -1);
+            else if (selectedIndex == 11)
+                CycleCacheTypeValue(sConfiguredKvCacheV, sizeof(sConfiguredKvCacheV), -1);
+            RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+            RenderSetupHeaderAndStatus(status);
+            continue;
+        }
+        if (ch == 'd' || ch == 'D') {
+            if (selectedIndex == 0)
+                nServerType = (nServerType == 0) ? 1 : 0;
+            else if (selectedIndex == 10)
+                CycleCacheTypeValue(sConfiguredKvCacheK, sizeof(sConfiguredKvCacheK), 1);
+            else if (selectedIndex == 11)
+                CycleCacheTypeValue(sConfiguredKvCacheV, sizeof(sConfiguredKvCacheV), 1);
+            RenderSetupSelectionDelta(previousIndex, selectedIndex, status);
+            RenderSetupHeaderAndStatus(status);
+            continue;
+        }
+        if (ch == 27) {
+            printf("\nSetup cancelled.\n");
+            return 1;
+        }
+        if (ch != 13)
+            continue;
 
-    if (!hwnd) return 0;
+        status[0] = '\0';
+        switch (selectedIndex) {
+        case 1:
+            PromptLineInput("Server executable path", sServer, sizeof(sServer));
+            if (!sCliPath[0] && sServer[0])
+                GetCliPathFromServerPath(sServer, sCliPath, sizeof(sCliPath));
+            break;
+        case 2:
+            PromptLineInput("CLI executable path", sCliPath, sizeof(sCliPath));
+            break;
+        case 3:
+            PromptLineInput("llama.cpp folder path", sLlamaCppPath, sizeof(sLlamaCppPath));
+            if (!sLlamaCppPath[0]) {
+                snprintf(status, sizeof(status), "\x1b[33mllama.cpp folder cleared.\x1b[0m");
+            } else if (DirectoryExistsA_(sLlamaCppPath) && SyncExecutablesFromLlamaCppPath()) {
+                snprintf(status, sizeof(status), "\x1b[32mllama.cpp folder linked to server and CLI.\x1b[0m");
+            } else {
+                snprintf(status, sizeof(status), "\x1b[33mFolder saved. Set server and CLI manually if needed.\x1b[0m");
+            }
+            break;
+        case 4:
+            PromptLineInput("Models folder path", sFolder, sizeof(sFolder));
+            ScanModels();
+            EnsureSelectedModelExists();
+            break;
+        case 5:
+        case 12:
+            if (!sFolder[0] || !DirectoryExistsA_(sFolder)) {
+                snprintf(status, sizeof(status), "\x1b[31mSet a valid models folder first.\x1b[0m");
+            } else {
+                ScanModels();
+                if (RunInteractiveModelSelector(sSelectedModel, sizeof(sSelectedModel)) < 0)
+                    snprintf(status, sizeof(status), "\x1b[33mModel selection cancelled.\x1b[0m");
+            }
+            break;
+        case 6:
+            PromptLineInput("Default context length", sConfiguredContext, sizeof(sConfiguredContext));
+            break;
+        case 7:
+            PromptLineInput("Default GPU layers (-1 for auto)", sConfiguredGpuLayers, sizeof(sConfiguredGpuLayers));
+            break;
+        case 8:
+            PromptLineInput("Default server port", sConfiguredPort, sizeof(sConfiguredPort));
+            break;
+        case 9:
+            PromptLineInput("Default threads", sConfiguredThreads, sizeof(sConfiguredThreads));
+            break;
+        case 10:
+            CycleCacheTypeValue(sConfiguredKvCacheK, sizeof(sConfiguredKvCacheK), 1);
+            break;
+        case 11:
+            CycleCacheTypeValue(sConfiguredKvCacheV, sizeof(sConfiguredKvCacheV), 1);
+            break;
+        case 13:
+            if (ValidateAndSaveTerminalSetup(status, sizeof(status)) == 0) {
+                RenderSetupWizard(selectedIndex, status);
+                printf("\n");
+                return 0;
+            }
+            break;
+        case 14:
+            printf("\nSetup cancelled.\n");
+            return 1;
+        }
 
-    ShowWindow(hwnd, nShow);
-    UpdateWindow(hwnd);
-
-    MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        RenderSetupWizard(selectedIndex, status);
     }
-
-    return (int)msg.wParam;
 }
 
 static int EnsureCliConfigReady(BOOL requireCliExecutable)
@@ -4762,7 +5379,7 @@ static int EnsureCliConfigReady(BOOL requireCliExecutable)
     }
 
     if (requireCliExecutable) {
-        GetCliPathFromServerPath(sServer, cliPath, sizeof(cliPath));
+        ResolveConfiguredCliPath(cliPath, sizeof(cliPath));
         if (!FileExistsA_(cliPath)) {
             fprintf(stderr, "Expected CLI executable was not found: %s\n", cliPath);
             return 1;
@@ -4794,7 +5411,7 @@ static int EnsureModelsFolderReady(void)
 
 static int RunCli(int argc, char **argv)
 {
-    /* When no arguments, show help (user can run 'valora setup' to open GUI) */
+    /* When no arguments, show help (user can run 'valora setup' to configure Valora) */
     if (argc <= 1) {
         AttachConsoleStreams(FALSE);
         return PrintUsage();
@@ -4805,8 +5422,8 @@ static int RunCli(int argc, char **argv)
             AttachConsoleStreams(TRUE);
             return SetupLlamaCpp();
         }
-        HideStandaloneConsoleWindow();
-        return RunGui(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+        AttachConsoleStreams(TRUE);
+        return RunTerminalSetupWizard();
     }
     
     if (lstrcmpiA(argv[1], "update") == 0) {
@@ -5272,7 +5889,7 @@ static int RunCli(int argc, char **argv)
    ────────────────────────────────────────────── */
 
 #define MAX_HISTORY 50
-#define MAX_MESSAGE_LEN 4096
+#define MAX_MESSAGE_LEN 32768
 
 typedef struct {
     char role[32];
@@ -5290,10 +5907,305 @@ static ChatHistory sChatHistory;
 static char sServerUrl[512] = "http://127.0.0.1:8000";
 static char sApiKey[256] = "";
 static BOOL sWebSearchEnabled = FALSE;
+static BOOL sWorkspaceLockEnabled = FALSE;
+static char sWorkspaceRoot[MAX_PATH * 4] = "";
+
+static void NormalizePathForCompare(char *path)
+{
+    char *p;
+    if (!path) return;
+    for (p = path; *p; ++p) {
+        if (*p == '/') *p = '\\';
+        *p = (char)tolower((unsigned char)*p);
+    }
+}
+
+static BOOL ResolveFullPathA_(const char *inputPath, char *outPath, int outLen)
+{
+    DWORD len;
+    if (!inputPath || !*inputPath || !outPath || outLen <= 0)
+        return FALSE;
+    len = GetFullPathNameA(inputPath, (DWORD)outLen, outPath, NULL);
+    if (len == 0 || len >= (DWORD)outLen)
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL InitWorkspaceSandbox(void)
+{
+    char cwd[MAX_PATH * 4];
+    if (!GetCurrentDirectoryA((DWORD)sizeof(cwd), cwd))
+        return FALSE;
+    if (!ResolveFullPathA_(cwd, sWorkspaceRoot, (int)sizeof(sWorkspaceRoot)))
+        return FALSE;
+    NormalizePathForCompare(sWorkspaceRoot);
+    {
+        size_t len = strlen(sWorkspaceRoot);
+        while (len > 3 && (sWorkspaceRoot[len - 1] == '\\' || sWorkspaceRoot[len - 1] == '/')) {
+            sWorkspaceRoot[len - 1] = '\0';
+            len--;
+        }
+    }
+    sWorkspaceLockEnabled = TRUE;
+    return TRUE;
+}
+
+static BOOL IsPathInsideWorkspace(const char *path)
+{
+    char full[MAX_PATH * 4];
+    char norm[MAX_PATH * 4];
+    size_t rootLen;
+
+    if (!sWorkspaceLockEnabled || !sWorkspaceRoot[0])
+        return TRUE;
+    if (!path || !*path)
+        return TRUE;
+    if (!ResolveFullPathA_(path, full, (int)sizeof(full)))
+        return FALSE;
+
+    lstrcpynA(norm, full, (int)sizeof(norm));
+    NormalizePathForCompare(norm);
+
+    rootLen = strlen(sWorkspaceRoot);
+    if (_strnicmp(norm, sWorkspaceRoot, rootLen) != 0)
+        return FALSE;
+
+    if (norm[rootLen] == '\0')
+        return TRUE;
+    return norm[rootLen] == '\\';
+}
+
+static BOOL ContainsTokenI(const char *text, const char *needle)
+{
+    const char *p;
+    int needleLen;
+    if (!text || !needle || !*needle) return FALSE;
+    needleLen = (int)strlen(needle);
+    for (p = text; *p; ++p) {
+        if (_strnicmp(p, needle, needleLen) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL ValidateToolArgsInWorkspace(const char *tool_name, const char *tool_args, char *err, int errLen)
+{
+    char pathA[MAX_PATH * 2] = "";
+    char pathB[MAX_PATH * 2] = "";
+    char command[2048] = "";
+
+    if (!sWorkspaceLockEnabled || !tool_name) return TRUE;
+
+    if (strcmp(tool_name, "read_file") == 0 ||
+        strcmp(tool_name, "write_file") == 0 ||
+        strcmp(tool_name, "patch_file") == 0 ||
+        strcmp(tool_name, "create_file") == 0 ||
+        strcmp(tool_name, "delete_file") == 0 ||
+        strcmp(tool_name, "create_folder") == 0 ||
+        strcmp(tool_name, "delete_folder") == 0 ||
+        strcmp(tool_name, "list_folder") == 0 ||
+        strcmp(tool_name, "file_exists") == 0 ||
+        strcmp(tool_name, "run_script") == 0) {
+        ExtractToolStringArg(tool_args, "path", pathA, sizeof(pathA));
+        if (pathA[0] && !IsPathInsideWorkspace(pathA)) {
+            snprintf(err, errLen, "Blocked by workspace sandbox: path outside folder");
+            return FALSE;
+        }
+    }
+
+    if (strcmp(tool_name, "rename_file") == 0) {
+        ExtractToolStringArg(tool_args, "old_path", pathA, sizeof(pathA));
+        ExtractToolStringArg(tool_args, "new_path", pathB, sizeof(pathB));
+        if ((pathA[0] && !IsPathInsideWorkspace(pathA)) || (pathB[0] && !IsPathInsideWorkspace(pathB))) {
+            snprintf(err, errLen, "Blocked by workspace sandbox: rename path outside folder");
+            return FALSE;
+        }
+    }
+
+    if (strcmp(tool_name, "run_shell") == 0) {
+        ExtractToolStringArg(tool_args, "command", command, sizeof(command));
+        if (command[0]) {
+            if (ContainsTokenI(command, "c:\\") ||
+                ContainsTokenI(command, "cd ") ||
+                ContainsTokenI(command, "pushd ") ||
+                ContainsTokenI(command, "popd ")) {
+                snprintf(err, errLen, "Blocked by workspace sandbox: shell command may escape folder");
+                return FALSE;
+            }
+        }
+    }
+
+    return TRUE;
+}
 
 static void ChatInit(void) {
     memset(&sChatHistory, 0, sizeof(sChatHistory));
     sChatHistory.max_tokens = 4096;
+}
+
+static void RenderConversationArea(void)
+{
+    int visibleIndices[MAX_HISTORY];
+    int visibleCount = 0;
+    int startVisible = 0;
+    int line = 0;
+    int i;
+
+    for (i = 0; i < sConversationRows; i++) {
+        ClearScreenLine(sConversationStartRow + i);
+    }
+
+    for (i = 0; i < sChatHistory.count; i++) {
+        if (strcmp(sChatHistory.messages[i].role, "tool") == 0)
+            continue;
+        visibleIndices[visibleCount++] = i;
+    }
+
+    if (visibleCount > sConversationRows)
+        startVisible = visibleCount - sConversationRows;
+
+    for (i = startVisible; i < visibleCount && line < sConversationRows; i++) {
+        char preview[4096];
+        int idx = visibleIndices[i];
+        const char *role = sChatHistory.messages[idx].role;
+        const char *label = role;
+        const char *color = "\x1b[90m";
+        int j = 0;
+        int limit = sTuiCols - 16;
+
+        if (limit < 20) limit = 20;
+        if (strcmp(role, "user") == 0) {
+            color = "\x1b[32m";
+            label = "You";
+        } else if (strcmp(role, "assistant") == 0) {
+            color = "\x1b[35m";
+            label = "Valora";
+        } else if (strcmp(role, "system") == 0) {
+            color = "\x1b[90m";
+            label = "Status";
+        }
+
+        while (sChatHistory.messages[idx].content[j] && j < (int)sizeof(preview) - 1 && j < limit) {
+            char ch = sChatHistory.messages[idx].content[j];
+            preview[j] = (ch == '\n' || ch == '\r') ? ' ' : ch;
+            j++;
+        }
+        preview[j] = '\0';
+
+        MoveCursorTo(sConversationStartRow + line, 1);
+        printf("\x1b[2K%s%-8s\x1b[0m > %s", color, label, preview);
+        line++;
+    }
+}
+
+static void RenderWorkflowPanel(void)
+{
+    int i;
+    int width = sTuiCols - 2;
+    int visibleStart = 0;
+
+    if (width < 20) width = 20;
+    for (i = 0; i < sWorkflowRows; i++) {
+        ClearScreenLine(sWorkflowRow + i);
+    }
+
+    MoveCursorTo(sWorkflowRow, 1);
+    printf("\x1b[36mWorkflow\x1b[0m");
+
+    if (sWorkflowCount > sWorkflowRows - 1)
+        visibleStart = sWorkflowCount - (sWorkflowRows - 1);
+
+    for (i = visibleStart; i < sWorkflowCount && (i - visibleStart + 1) < sWorkflowRows; i++) {
+        const char *icon = "  ";
+        const char *color = "\x1b[90m";
+        int row = sWorkflowRow + 1 + (i - visibleStart);
+
+        if (sWorkflowSteps[i].state == 1) {
+            icon = "> ";
+            color = "\x1b[36m";
+        } else if (sWorkflowSteps[i].state == 2) {
+            icon = "v ";
+            color = "\x1b[32m";
+        }
+
+        MoveCursorTo(row, 1);
+        printf("\x1b[2K%s%s\x1b[0m %.*s", color, icon, width - 4, sWorkflowSteps[i].text);
+    }
+}
+
+static void RenderStatusLine(void)
+{
+    const char *text = sStatusText[0] ? sStatusText : "Ready";
+    const char *color = sStatusBusy ? "\x1b[36m" : "\x1b[90m";
+    int width = sTuiCols - 2;
+
+    if (width < 20) width = 20;
+    ClearScreenLine(sStatusRow);
+    MoveCursorTo(sStatusRow, 1);
+    printf("%s%-*.*s\x1b[0m", color, width, width, text);
+    fflush(stdout);
+}
+
+static void RenderInputLine(const char *draftInput)
+{
+    ClearScreenLine(sInputRow);
+    MoveCursorTo(sInputRow, 1);
+    printf("\x1b[32mYou\x1b[0m \x1b[90m>\x1b[0m %s", draftInput ? draftInput : "");
+    fflush(stdout);
+}
+
+static void RenderChatTui(const char *draftInput)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    int cols = 100;
+    int rows = 30;
+    int i;
+
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    }
+    if (cols < 80) cols = 80;
+    if (rows < 24) rows = 24;
+    sTuiCols = cols;
+    sTuiRows = rows;
+    sWorkflowRows = 6;
+    if (rows < 28) sWorkflowRows = 5;
+    if (rows < 26) sWorkflowRows = 4;
+    sWorkflowRow = 11;
+    sConversationStartRow = sWorkflowRow + sWorkflowRows + 1;
+    sConversationRows = rows - (sConversationStartRow + 3);
+    if (sConversationRows < 8) sConversationRows = 8;
+    sStatusRow = sConversationStartRow + sConversationRows;
+    sInputRow = sConversationStartRow + sConversationRows + 1;
+
+    printf("\x1b[2J\x1b[H");
+    PrintChatBanner();
+    PrintChatCommandHint();
+    {
+        int inner = sTuiCols - 4;
+        char workspaceLine[MAX_PATH * 4 + 64];
+        if (inner < 20) inner = 20;
+        snprintf(workspaceLine, sizeof(workspaceLine), "Workspace: %s", sWorkspaceRoot);
+        printf("\x1b[90m| %-*.*s |\x1b[0m\n", inner, inner, workspaceLine);
+    }
+    PrintChatDashboardCard();
+    PrintChatFrameHeader();
+    for (i = 0; i < sWorkflowRows; i++) {
+        printf("\n");
+    }
+    PrintChatFrameHeader();
+    printf("\x1b[36mConversation\x1b[0m\n");
+    for (i = 0; i < sConversationRows; i++) {
+        printf("\n");
+    }
+
+    PrintChatFrameHeader();
+    printf("\n");
+    RenderWorkflowPanel();
+    RenderStatusLine();
+    RenderConversationArea();
+    RenderInputLine(draftInput);
 }
 
 static void JsonEscapeTextEx(const char *src, char *dst, size_t dstSize, BOOL escapeCR, BOOL escapeTab)
@@ -5474,14 +6386,18 @@ static char* BuildOllamaPayload(const char *user_message) {
     static char payload[32768];
     int offset;
     int i;
+    char escapedSystem[4096] = "";
+    char systemMessage[8192];
     
+    snprintf(systemMessage, sizeof(systemMessage), "%s %s", GetSystemPrompt(), GetToolProtocolText());
+    JsonEscapeTextEx(systemMessage, escapedSystem, sizeof(escapedSystem), FALSE, FALSE);
     offset = snprintf(payload, sizeof(payload),
-        "{\"model\":\"%s\",\"stream\":false,\"messages\":[", sSelectedOllamaModel);
+        "{\"model\":\"%s\",\"stream\":false,\"messages\":[{\"role\":\"system\",\"content\":\"%s\"}",
+        sSelectedOllamaModel,
+        escapedSystem);
     
     for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
-        if (i > 0) {
-            offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
-        }
+        offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
         
         char escaped[8192] = "";
         JsonEscapeTextEx(sChatHistory.messages[i].content, escaped, sizeof(escaped), FALSE, FALSE);
@@ -5495,8 +6411,8 @@ static char* BuildOllamaPayload(const char *user_message) {
         char escaped[8192] = "";
         JsonEscapeTextEx(user_message, escaped, sizeof(escaped), FALSE, FALSE);
         offset += snprintf(payload + offset, sizeof(payload) - offset,
-            "%s{\"role\":\"user\",\"content\":\"%s\"}]}",
-            sChatHistory.count > 0 ? "," : "", escaped);
+            ",{\"role\":\"user\",\"content\":\"%s\"}]}",
+            escaped);
     } else {
         offset += snprintf(payload + offset, sizeof(payload) - offset, "]}");
     }
@@ -5615,10 +6531,24 @@ static void ChatClear(void) {
 }
 
 static const char* GetSystemPrompt(void) {
-    return "You are Valora, a helpful AI assistant running locally. "
-           "Be concise, practical, and organized. "
-           "When tools are available, use them deliberately and explain the result clearly. "
-           "For technical tasks, prefer precise step-by-step guidance over vague advice.";
+    static char prompt[1536];
+    if (sWorkspaceLockEnabled && sWorkspaceRoot[0]) {
+        snprintf(prompt, sizeof(prompt),
+            "You are Valora, a helpful AI assistant running locally. "
+            "Be concise, practical, and organized. "
+            "When tools are available, use them deliberately and explain the result clearly. "
+            "For technical tasks, prefer precise step-by-step guidance over vague advice. "
+            "Workspace sandbox is active. You can only access files inside: %s. "
+            "Never request or use any path outside this folder.",
+            sWorkspaceRoot);
+    } else {
+        snprintf(prompt, sizeof(prompt),
+            "You are Valora, a helpful AI assistant running locally. "
+            "Be concise, practical, and organized. "
+            "When tools are available, use them deliberately and explain the result clearly. "
+            "For technical tasks, prefer precise step-by-step guidance over vague advice.");
+    }
+    return prompt;
 }
 
 static size_t HttpWriteCallback(void *contents, size_t size, size_t nmemb, char **output) {
@@ -5662,13 +6592,30 @@ static char* ReadInternetResponse(HINTERNET hRequest, int bufferSize)
     return response;
 }
 
+static const char* DescribeBackendStage(void)
+{
+    return sStatusText[0] ? sStatusText : "Waiting for model response";
+}
+
 static DWORD WINAPI ThinkingAnimationThread(LPVOID param) {
     int *running = (int*)param;
     const char *frames[] = {"[    ]", "[=   ]", "[==  ]", "[=== ]", "[ ===]", "[  ==]", "[   =]"};
-    const char *labels[] = {"Thinking", "Planning", "Checking context", "Writing reply"};
     int frame = 0;
+    if (sChatTuiActive) {
+        while (*running) {
+            char line[512];
+            snprintf(line, sizeof(line), "%s %s...", frames[frame % 7], DescribeBackendStage());
+            SetStatusLine(line, TRUE);
+            RenderStatusLine();
+            frame++;
+            Sleep(110);
+        }
+        SetStatusLine("Ready", FALSE);
+        RenderStatusLine();
+        return 0;
+    }
     while (*running) {
-        printf("\r\x1b[36m%s\x1b[0m \x1b[33m%s...\x1b[0m ", frames[frame % 7], labels[(frame / 6) % 4]);
+        printf("\r\x1b[36m%s\x1b[0m \x1b[33m%s...\x1b[0m ", frames[frame % 7], DescribeBackendStage());
         fflush(stdout);
         Sleep(110);
         frame++;
@@ -5681,7 +6628,6 @@ static DWORD WINAPI ThinkingAnimationThread(LPVOID param) {
 static char* HttpPost(const char *url, const char *json_data, const char *extraHeaders) {
     HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
     char *result = NULL;
-    DWORD dwSize, dwDownloaded;
     BOOL bResults;
     DWORD requestFlags = 0;
     char host[512] = "", path[1024] = "";
@@ -6176,27 +7122,52 @@ static BOOL FetchCloudModels(BOOL allowFallbackModels) {
 }
 
 static char* BuildCloudPayload(const char *userMessage) {
-    static char json[8192];
+    static char json[32768];
     char escapedMessage[4096];
     char escapedModel[512];
+    char escapedSystem[4096];
+    char systemMessage[8192];
     const char *model = sSelectedCloudModel[0] ? sSelectedCloudModel : sCloudModels[0];
+    int offset;
+    int i;
     
     if (!model || !model[0]) model = GetDefaultCloudModel(sCloudProvider);
     
     JsonEscapeTextEx(model, escapedModel, sizeof(escapedModel), FALSE, FALSE);
+    snprintf(systemMessage, sizeof(systemMessage), "%s %s", GetSystemPrompt(), GetToolProtocolText());
+    JsonEscapeTextEx(systemMessage, escapedSystem, sizeof(escapedSystem), TRUE, TRUE);
     JsonEscapeTextEx(userMessage ? userMessage : "", escapedMessage, sizeof(escapedMessage), TRUE, TRUE);
     
-    snprintf(json, sizeof(json),
+    offset = snprintf(json, sizeof(json),
         "{"
         "\"model\": \"%s\","
         "\"messages\": ["
-        "{\"role\": \"user\", \"content\": \"%s\"}"
+        "{\"role\": \"system\", \"content\": \"%s\"}",
+        escapedModel,
+        escapedSystem
+    );
+
+    for (i = 0; i < sChatHistory.count && offset < (int)sizeof(json) - 100; i++) {
+        char escaped[8192] = "";
+        JsonEscapeTextEx(sChatHistory.messages[i].content, escaped, sizeof(escaped), TRUE, TRUE);
+        offset += snprintf(json + offset, sizeof(json) - offset,
+            ",{\"role\":\"%s\",\"content\":\"%s\"}",
+            sChatHistory.messages[i].role,
+            escaped);
+    }
+
+    if (userMessage) {
+        offset += snprintf(json + offset, sizeof(json) - offset,
+            ",{\"role\": \"user\", \"content\": \"%s\"}",
+            escapedMessage
+        );
+    }
+
+    offset += snprintf(json + offset, sizeof(json) - offset,
         "],"
         "\"temperature\": 0.7,"
         "\"max_tokens\": 4096"
-        "}",
-        escapedModel,
-        escapedMessage
+        "}"
     );
     
     return json;
@@ -6260,12 +7231,41 @@ static BOOL sToolsEnabled = FALSE;
 static BOOL sToolsForcedDisabled = FALSE;
 
 static BOOL ShouldUseTools(void) {
-    /* Disable tools for small models that don't support function calling */
-    /* Models below 1B parameters typically can't handle tool calls */
-    if (sOllamaMode) return FALSE;
-    if (sCloudProvider != CLOUD_DISABLED) return FALSE;
     if (sToolsForcedDisabled) return FALSE;
     return sToolsEnabled;
+}
+
+static void PrintChatDashboardCard(void) {
+    const char *mode = "Local";
+    const char *model = "(none)";
+    char statusLine[512];
+    char modelLine[1024];
+    int inner = sTuiCols - 4;
+    int i;
+
+    if (sOllamaMode) mode = "Ollama";
+    else if (sCloudProvider != CLOUD_DISABLED) mode = GetCloudProviderName(sCloudProvider);
+    if (sSelectedModel[0]) model = sSelectedModel;
+    else if (sSelectedOllamaModel[0]) model = sSelectedOllamaModel;
+    else if (sSelectedCloudModel[0]) model = sSelectedCloudModel;
+
+    if (inner < 20) inner = 20;
+
+    snprintf(statusLine, sizeof(statusLine),
+        "Session | Mode: %s  Tools: %s  Sandbox: %s",
+        mode,
+        ShouldUseTools() ? "ON" : "OFF",
+        sWorkspaceLockEnabled ? "ON" : "OFF");
+    snprintf(modelLine, sizeof(modelLine), "Model: %s", model);
+
+    printf("\x1b[36m+");
+    for (i = 0; i < inner + 2; i++) putchar('-');
+    printf("+\x1b[0m\n");
+    printf("\x1b[36m| \x1b[0m%-*.*s\x1b[36m |\x1b[0m\n", inner, inner, statusLine);
+    printf("\x1b[36m| \x1b[0m%-*.*s\x1b[36m |\x1b[0m\n", inner, inner, modelLine);
+    printf("\x1b[36m+");
+    for (i = 0; i < inner + 2; i++) putchar('-');
+    printf("+\x1b[0m\n");
 }
 
 static const char* GetToolsDefinition(void) {
@@ -6273,6 +7273,153 @@ static const char* GetToolsDefinition(void) {
     
     static const char *tools = 
         "["
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"create_folder\","
+        "\"description\": \"Create a new folder inside the current workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Folder path relative to the current workspace, for example 'project' or 'src/components'\""
+        "}"
+        "},"
+        "\"required\": [\"path\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"list_folder\","
+        "\"description\": \"List files and folders inside a workspace folder. Use '.' for the current folder.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Folder path relative to the current workspace\""
+        "}"
+        "}"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"file_exists\","
+        "\"description\": \"Check whether a file or folder exists inside the workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Path relative to the current workspace\""
+        "}"
+        "},"
+        "\"required\": [\"path\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"read_file\","
+        "\"description\": \"Read the contents of a text file inside the workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"File path relative to the current workspace\""
+        "}"
+        "},"
+        "\"required\": [\"path\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"write_file\","
+        "\"description\": \"Overwrite a text file inside the workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"File path relative to the current workspace\""
+        "},"
+        "\"content\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Full text content to write into the file\""
+        "}"
+        "},"
+        "\"required\": [\"path\", \"content\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"create_file\","
+        "\"description\": \"Create a new text file inside the workspace. Fails if it already exists.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"File path relative to the current workspace\""
+        "},"
+        "\"content\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Optional initial text content\""
+        "}"
+        "},"
+        "\"required\": [\"path\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"rename_file\","
+        "\"description\": \"Rename or move a file or folder inside the workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"old_path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"Existing file or folder path relative to the current workspace\""
+        "},"
+        "\"new_path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"New file or folder path relative to the current workspace\""
+        "}"
+        "},"
+        "\"required\": [\"old_path\", \"new_path\"]"
+        "}"
+        "}"
+        "},"
+        "{"
+        "\"type\": \"function\","
+        "\"function\": {"
+        "\"name\": \"delete_file\","
+        "\"description\": \"Delete a file inside the workspace.\","
+        "\"parameters\": {"
+        "\"type\": \"object\","
+        "\"properties\": {"
+        "\"path\": {"
+        "\"type\": \"string\","
+        "\"description\": \"File path relative to the current workspace\""
+        "}"
+        "},"
+        "\"required\": [\"path\"]"
+        "}"
+        "}"
+        "},"
         "{"
         "\"type\": \"function\","
         "\"function\": {"
@@ -6368,8 +7515,9 @@ static char* BuildChatPayload(const char *user_message) {
     
     offset = snprintf(payload, sizeof(payload),
         "{\"model\":\"auto\",\"messages\":["
-        "{\"role\":\"system\",\"content\":\"%s. Available tools: wikipedia(topic), web_search(query), current_time(), system_info(), list_models(). Use tools only when they improve the answer.\"},",
-        GetSystemPrompt());
+        "{\"role\":\"system\",\"content\":\"%s. When tools are available, use them to perform real workspace actions like reading files, creating folders, and editing files instead of only describing commands. %s\"},",
+        GetSystemPrompt(),
+        GetToolProtocolText());
     
     for (i = 0; i < sChatHistory.count && offset < (int)sizeof(payload) - 100; i++) {
         if (i > 0)
@@ -6393,18 +7541,15 @@ static char* BuildChatPayload(const char *user_message) {
         }
     }
     
-    if (user_message) {
+    {
         const char *tools = GetToolsDefinition();
         if (tools && tools[0]) {
             offset += snprintf(payload + offset, sizeof(payload) - offset,
-                "],\"tools\":%s,\"max_tokens\":%d}", tools, sChatHistory.max_tokens);
+                "],\"tools\":%s,\"tool_choice\":\"auto\",\"max_tokens\":%d}", tools, sChatHistory.max_tokens);
         } else {
             offset += snprintf(payload + offset, sizeof(payload) - offset,
                 "],\"max_tokens\":%d}", sChatHistory.max_tokens);
         }
-    } else {
-        offset += snprintf(payload + offset, sizeof(payload) - offset,
-            "],\"max_tokens\":%d}", sChatHistory.max_tokens);
     }
     
     return payload;
@@ -6454,15 +7599,87 @@ static char* ParseChatResponse(const char *json_response) {
     return NULL;
 }
 
+static BOOL ExtractExecutableToolPayload(const char *response, BOOL isOllama, BOOL isCloud, char *out, int outLen)
+{
+    const char *parsed = NULL;
+
+    if (!response || !out || outLen <= 0)
+        return FALSE;
+
+    out[0] = '\0';
+    if (HasToolCall(response)) {
+        lstrcpynA(out, response, outLen);
+        return TRUE;
+    }
+
+    if (isOllama) {
+        parsed = ParseOllamaResponse(response);
+    } else if (isCloud) {
+        parsed = response;
+    } else {
+        parsed = ParseChatResponse(response);
+    }
+
+    if (parsed && HasToolCall(parsed)) {
+        lstrcpynA(out, parsed, outLen);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void BuildToolSuccessMessage(const char *tool_name, const char *tool_args, const char *tool_result, char *out, int outLen)
+{
+    char path[512] = "";
+
+    if (!out || outLen <= 0)
+        return;
+
+    out[0] = '\0';
+    ExtractToolStringArg(tool_args, "path", path, sizeof(path));
+
+    if (strcmp(tool_name, "create_folder") == 0) {
+        snprintf(out, outLen, "Created the folder%s%s successfully.", path[0] ? " " : "", path[0] ? path : "");
+    } else if (strcmp(tool_name, "create_file") == 0) {
+        snprintf(out, outLen, "Created the file%s%s successfully.", path[0] ? " " : "", path[0] ? path : "");
+    } else if (strcmp(tool_name, "write_file") == 0) {
+        snprintf(out, outLen, "Updated the file%s%s successfully.", path[0] ? " " : "", path[0] ? path : "");
+    } else if (strcmp(tool_name, "delete_file") == 0) {
+        snprintf(out, outLen, "Deleted the file%s%s successfully.", path[0] ? " " : "", path[0] ? path : "");
+    } else {
+        snprintf(out, outLen, "%s", tool_result && tool_result[0] ? tool_result : "Completed the requested tool action.");
+    }
+}
+
+static const char* DescribeToolAction(const char *tool_name)
+{
+    if (!tool_name || !tool_name[0]) return "Running tool";
+    if (strcmp(tool_name, "create_folder") == 0) return "Creating folder";
+    if (strcmp(tool_name, "list_folder") == 0) return "Listing folder";
+    if (strcmp(tool_name, "read_file") == 0) return "Reading file";
+    if (strcmp(tool_name, "write_file") == 0) return "Writing file";
+    if (strcmp(tool_name, "create_file") == 0) return "Creating file";
+    if (strcmp(tool_name, "rename_file") == 0) return "Renaming path";
+    if (strcmp(tool_name, "delete_file") == 0) return "Deleting file";
+    if (strcmp(tool_name, "web_search") == 0) return "Searching web";
+    if (strcmp(tool_name, "wikipedia_search") == 0) return "Searching Wikipedia";
+    if (strcmp(tool_name, "wikipedia_page") == 0) return "Reading Wikipedia page";
+    return "Running tool";
+}
+
 static char* DoWikiPage(const char *pageInput) {
     char *result = NULL;
     char url[2048];
     char encodedInput[512] = "";
+    SearchAnimationState anim;
     
     if (!pageInput || !*pageInput) return NULL;
     
-    int running = 1;
-    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &running, 0, NULL);
+    ZeroMemory(&anim, sizeof(anim));
+    anim.running = 1;
+    anim.stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    anim.timeout_ms = 30000;
+    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &anim, 0, NULL);
     
     printf("\x1b[90mWiki Page: \x1b[33m%s\x1b[0m\n", pageInput);
     fflush(stdout);
@@ -6511,15 +7728,16 @@ static char* DoWikiPage(const char *pageInput) {
     
     result = HttpGetUrl(url);
     
-    running = 0;
+    InterlockedExchange(&anim.running, 0);
+    if (anim.stop_event) SetEvent(anim.stop_event);
     if (hThread) {
-        Sleep(200);
+        WaitForSingleObject(hThread, 1000);
         CloseHandle(hThread);
     }
+    if (anim.stop_event) CloseHandle(anim.stop_event);
     
     if (result) {
         static char formatted[16384] = "";
-        char *extract;
         
         formatted[0] = '\0';
         
@@ -6583,11 +7801,15 @@ static char* DoWikiSearch(const char *searchQuery) {
     char *result = NULL;
     char url[2048];
     char encodedQuery[512] = "";
+    SearchAnimationState anim;
     
     if (!searchQuery || !*searchQuery) return NULL;
     
-    int running = 1;
-    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &running, 0, NULL);
+    ZeroMemory(&anim, sizeof(anim));
+    anim.running = 1;
+    anim.stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    anim.timeout_ms = 30000;
+    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &anim, 0, NULL);
     
     printf("\x1b[90mWiki Search: \x1b[33m%s\x1b[0m\n", searchQuery);
     fflush(stdout);
@@ -6621,11 +7843,13 @@ static char* DoWikiSearch(const char *searchQuery) {
         encodedQuery);
     result = HttpGetUrl(url);
     
-    running = 0;
+    InterlockedExchange(&anim.running, 0);
+    if (anim.stop_event) SetEvent(anim.stop_event);
     if (hThread) {
-        Sleep(200);
+        WaitForSingleObject(hThread, 1000);
         CloseHandle(hThread);
     }
+    if (anim.stop_event) CloseHandle(anim.stop_event);
     
     if (result) {
         static char formatted[8192] = "";
@@ -6735,11 +7959,15 @@ static char* DoWikiSearch(const char *searchQuery) {
 
 static char* DoWebSearch(const char *searchQuery) {
     char *result = NULL;
+    SearchAnimationState anim;
     
     if (!searchQuery || !*searchQuery) return NULL;
     
-    int running = 1;
-    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &running, 0, NULL);
+    ZeroMemory(&anim, sizeof(anim));
+    anim.running = 1;
+    anim.stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    anim.timeout_ms = 30000;
+    HANDLE hThread = CreateThread(NULL, 0, SearchAnimationThread, &anim, 0, NULL);
     
     printf("\x1b[90mQuery: \x1b[33m%s\x1b[0m\n", searchQuery);
     fflush(stdout);
@@ -6754,11 +7982,13 @@ static char* DoWebSearch(const char *searchQuery) {
         result = HttpGet(searchQuery);
     }
     
-    running = 0;
+    InterlockedExchange(&anim.running, 0);
+    if (anim.stop_event) SetEvent(anim.stop_event);
     if (hThread) {
-        Sleep(200);
+        WaitForSingleObject(hThread, 1000);
         CloseHandle(hThread);
     }
+    if (anim.stop_event) CloseHandle(anim.stop_event);
     
     if (result) {
         static char formatted[16384] = "";
@@ -6826,7 +8056,6 @@ static char* HttpGet(const char *query) {
     char host[256] = {0}, path[1024] = {0};
     const char *p;
     BOOL bResults;
-    DWORD bytesRead;
     
     if (!query || !*query) return NULL;
     
@@ -7065,8 +8294,15 @@ static int StartServerForChat(const char *customCtx) {
     printf("\x1b[32mKV Cache K:\x1b[0m %s\n", kvCacheK);
     printf("\x1b[32mKV Cache V:\x1b[0m %s\n\n", kvCacheV);
     
-    if (EnsureCliConfigReady(FALSE) != 0)
+    if (EnsureCliConfigReady(FALSE) != 0) {
+        if (sCloudProvider != CLOUD_DISABLED && sCloudApiKey[0]) {
+            fprintf(stderr, "\x1b[33mLocal llama.cpp is not configured; falling back to configured cloud chat.\x1b[0m\n");
+            return -2;
+        }
+        fprintf(stderr, "\x1b[31mLocal llama.cpp chat needs both a server executable and a models folder.\x1b[0m\n");
+        fprintf(stderr, "\x1b[90mUse 'valora setup' to configure local chat, or run 'valora chat --cloud'.\x1b[0m\n");
         return -1;
+    }
     
     SafetyInit();
     
@@ -7210,6 +8446,15 @@ static int RunChatMode(void) {
     ChatInit();
     sToolsEnabled = TRUE;
     sServerStartedByUs = FALSE;
+    LoadConfigFromDisk();
+    if (sDebugMode) {
+        /* Full-screen TUI keeps debug logs off to avoid layout corruption. */
+        sDebugMode = FALSE;
+    }
+    if (!InitWorkspaceSandbox()) {
+        fprintf(stderr, "\x1b[31mFailed to initialize workspace sandbox.\x1b[0m\n");
+        return 1;
+    }
     
     if (sOllamaMode) {
 ClearConsole();
@@ -7228,60 +8473,33 @@ ClearConsole();
         ClearConsole();
         snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     } else {
-        if (StartServerForChat(NULL) != 0) {
+        int startResult = StartServerForChat(NULL);
+        if (startResult == -2) {
+            sCloudProvider = sCloudProvider;
+            ClearConsole();
+            snprintf(url, sizeof(url), "%s", GetCloudProviderChatUrl(sCloudProvider));
+        } else if (startResult != 0) {
             return 1;
+        } else {
+            serverStartedByUs = TRUE;
+            sServerStartedByUs = TRUE;
+            SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+            ClearConsole();
+            snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
         }
-        serverStartedByUs = TRUE;
-        sServerStartedByUs = TRUE;
-        SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-        ClearConsole();
-        snprintf(url, sizeof(url), "%s/v1/chat/completions", sServerUrl);
     }
     
-    PrintChatBanner();
-    PrintChatCommandHint();
+    RenderChatTui("");
     
     while (1) {
-        printf("\x1b[32mYou \x1b[0m> ");
-        if (!fgets(input, sizeof(input), stdin)) {
+        if (!ReadChatInput(input, sizeof(input))) {
             exitCode = 0;
             break;
         }
         
-input[strcspn(input, "\n")] = '\0';
-        
         char *p = input;
         while (*p == ' ') p++;
         if (p != input) memmove(input, p, strlen(p) + 1);
-        
-        if (input[0] == '/' && input[1] == '\0') {
-printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
-            printf("  /exit              Exit and stop server\n");
-            printf("  /clear             Clear chat history\n");
-            printf("  /cls               Clear terminal\n");
-            printf("  /status            Show chat + system status\n");
-            printf("  /history           Show recent messages\n");
-            printf("  /tools on|off      Toggle tool calling\n");
-            printf("  /model             Change model\n");
-            printf("  /restart           Restart llama server\n");
-            printf("  /restart --context N  Restart with context N\n");
-            if (sOllamaMode) {
-                printf("  /restart --ollama   Change Ollama model\n");
-            }
-            printf("  /models            Show available models\n");
-            printf("  /websearch <query> Search web (optional query)\n");
-            printf("  /search <query>    Same as /websearch\n");
-            printf("  /web <query>       Same as /websearch\n");
-            printf("  /wsearch           Configure search engine\n");
-            printf("  /wiki search <q>   Search Wikipedia pages\n");
-            printf("  /wiki page <title> Get page content\n");
-            printf("  /wiki <title>      Get page content (shortcut)\n");
-            printf("  /cloud             Change cloud provider\n");
-            printf("  /help              Show help\n\n");
-            printf("\x1b[32mYou \x1b[0m> ");
-            if (!fgets(input, sizeof(input), stdin)) { exitCode = 0; break; }
-            input[strcspn(input, "\n")] = '\0';
-        }
         
         if (strcmp(input, "/exit") == 0 || strcmp(input, "exit") == 0) {
             exitCode = 0;
@@ -7289,41 +8507,44 @@ printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
         }
         
         if (strcmp(input, "/cls") == 0) {
-            ClearConsole();
-            PrintChatBanner();
-            PrintChatCommandHint();
+            RenderChatTui("");
             continue;
         }
         
         if (strcmp(input, "/clear") == 0 || strcmp(input, "clear") == 0) {
             ChatClear();
-            printf("\x1b[90mChat history cleared.\x1b[0m\n");
+            RenderConversationArea();
+            RenderInputLine("");
             continue;
         }
 
         if (strcmp(input, "/status") == 0) {
             char status[4096];
             BuildSystemInfoReport(status, sizeof(status));
-            printf("\n\x1b[36m=== Status ===\x1b[0m\n");
-            PrintWrapped(status, 88);
-            printf("\n\n");
+            {
+                char msg[4608];
+                snprintf(msg, sizeof(msg), "%s | Workspace sandbox: %s", status, sWorkspaceRoot);
+                ChatAddMessage("system", msg);
+            }
+            RenderConversationArea();
+            RenderInputLine("");
+            continue;
+        }
+
+        if (strcmp(input, "/workspace") == 0) {
+            {
+                char msg[1024];
+                snprintf(msg, sizeof(msg), "Workspace sandbox | Root: %s | Outside-path access: blocked", sWorkspaceRoot);
+                ChatAddMessage("system", msg);
+            }
+            RenderConversationArea();
+            RenderInputLine("");
             continue;
         }
 
         if (strcmp(input, "/history") == 0) {
-            printf("\n\x1b[36m=== Recent History ===\x1b[0m\n");
-            if (sChatHistory.count == 0) {
-                printf("\x1b[90mNo messages yet.\x1b[0m\n\n");
-            } else {
-                int startIdx = sChatHistory.count > 8 ? sChatHistory.count - 8 : 0;
-                for (int i = startIdx; i < sChatHistory.count; i++) {
-                    printf("\x1b[90m[%s", sChatHistory.messages[i].role);
-                    if (sChatHistory.messages[i].name[0])
-                        printf(":%s", sChatHistory.messages[i].name);
-                    printf("]\x1b[0m %.120s\n", sChatHistory.messages[i].content);
-                }
-                printf("\n");
-            }
+            RenderConversationArea();
+            RenderInputLine("");
             continue;
         }
 
@@ -7332,14 +8553,17 @@ printf("\n\x1b[36m=== Commands ===\x1b[0m\n");
             while (*mode == ' ') mode++;
             if (strcmp(mode, "on") == 0) {
                 sToolsEnabled = TRUE;
-                printf("\x1b[32mTool calling enabled.\x1b[0m\n");
+                ChatAddMessage("system", "Tool calling enabled.");
             } else if (strcmp(mode, "off") == 0) {
                 sToolsEnabled = FALSE;
-                printf("\x1b[33mTool calling disabled.\x1b[0m\n");
+                ChatAddMessage("system", "Tool calling disabled.");
             } else {
-                printf("\x1b[90mTools are currently %s.\x1b[0m Use /tools on or /tools off\n",
-                       ShouldUseTools() ? "on" : "off");
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Tools are currently %s. Use /tools on or /tools off", ShouldUseTools() ? "on" : "off");
+                ChatAddMessage("system", msg);
             }
+            RenderConversationArea();
+            RenderInputLine("");
             continue;
         }
         
@@ -7626,11 +8850,13 @@ if (strcmp(input, "/model") == 0) {
         
         if (strcmp(input, "/help") == 0 || strcmp(input, "/?") == 0) {
 printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
+            printf("\n\x1b[33mSession:\x1b[0m\n");
             printf("  /exit     - Exit chat and stop server\n");
             printf("  /clear    - Clear chat history\n");
             printf("  /cls      - Clear terminal screen\n");
             printf("  /status   - Show local system + chat status\n");
             printf("  /history  - Show recent messages\n");
+            printf("\n\x1b[33mModel & Tools:\x1b[0m\n");
             printf("  /tools    - Toggle tool calling\n");
             printf("  /model    - Change model\n");
             printf("  /restart  - Restart llama server\n");
@@ -7646,14 +8872,25 @@ printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
             printf("  /wiki page <t>  - Get Wikipedia page content\n");
             printf("  /wiki <title>   - Get page content (shortcut)\n");
             printf("  /cloud    - Change cloud provider\n");
-            printf("  /help     - Show this help\n\n");
+            printf("  /workspace - Show locked workspace folder\n");
+            printf("  /         - Open command palette\n");
+            printf("  /help     - Show full help list\n\n");
+            printf("\x1b[33mDaemon Management (CLI):\x1b[0m\n");
+            printf("  valora daemon start|stop|status|restart|log [N]\n");
+            printf("  valora daemon --log-lines <N>\n\n");
             continue;
         }
         
         if (strlen(input) == 0)
             continue;
         
+        WorkflowReset();
+        WorkflowAdvance("Task received", TRUE);
+        WorkflowAdvance("Preparing request", FALSE);
         ChatAddMessage("user", input);
+        RenderWorkflowPanel();
+        RenderConversationArea();
+        RenderInputLine("");
         
         if (sDebugMode) {
             printf("\x1b[90m[DEBUG] Sending to URL: %s\x1b[0m\n", url);
@@ -7662,16 +8899,30 @@ printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
         response = NULL;
         for (int retry = 0; retry < 3 && !response; retry++) {
             if (retry > 0) {
-                printf("\x1b[90m[Retry %d/3]...\x1b[0m\n", retry);
+                char retryMsg[128];
+                snprintf(retryMsg, sizeof(retryMsg), "Retry %d/3...", retry);
+                SetStatusLine(retryMsg, TRUE);
+                WorkflowAdvance(retryMsg, FALSE);
+                RenderWorkflowPanel();
+                RenderStatusLine();
                 Sleep(1000);
             }
             
+            SetStatusLine("Sending request to backend", TRUE);
+            WorkflowCompleteActive("Prepared request");
+            WorkflowAdvance("Sending request to backend", FALSE);
+            RenderWorkflowPanel();
+            RenderStatusLine();
             BOOL thinking = TRUE;
             HANDLE hThread = CreateThread(NULL, 0, ThinkingAnimationThread, &thinking, 0, NULL);
             
             if (sCloudProvider != CLOUD_DISABLED) {
-                static char cloudResponse[8192];
+                static char cloudResponse[TOOL_RESULT_BUFFER_LEN];
                 cloudResponse[0] = '\0';
+                SetStatusLine("Waiting for cloud model response", TRUE);
+                WorkflowCompleteActive("Request sent");
+                WorkflowAdvance("Waiting for cloud model response", FALSE);
+                RenderWorkflowPanel();
                 CallCloudAPI(input, cloudResponse, sizeof(cloudResponse));
                 
                 if (cloudResponse[0]) {
@@ -7681,17 +8932,32 @@ printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
                     response = NULL;
                 }
             } else if (sOllamaMode) {
+                SetStatusLine("Waiting for Ollama model response", TRUE);
+                WorkflowCompleteActive("Request sent");
+                WorkflowAdvance("Waiting for Ollama model response", FALSE);
+                RenderWorkflowPanel();
                 response = HttpPost(url, BuildOllamaPayload(input), NULL);
             } else {
+                SetStatusLine("Waiting for model response", TRUE);
+                WorkflowCompleteActive("Request sent");
+                WorkflowAdvance("Waiting for model response", FALSE);
+                RenderWorkflowPanel();
                 response = HttpPost(url, BuildChatPayload(input), NULL);
             }
             
             thinking = FALSE;
             if (hThread) { WaitForSingleObject(hThread, INFINITE); CloseHandle(hThread); }
+            if (response) {
+                WorkflowCompleteActive("Received backend response");
+                SetStatusLine("Ready", FALSE);
+                RenderWorkflowPanel();
+                RenderStatusLine();
+            }
         }
         
         if (!response) {
             DWORD err = GetLastError();
+            char failMsg[512];
             if (sDebugMode) {
                 if (err == 0) {
                     printf("\x1b[31m[DEBUG] HttpPost returned NULL, no Win32 error set - possible connection reset or timeout\x1b[0m\n");
@@ -7701,8 +8967,15 @@ printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
                     printf("\x1b[31m[DEBUG] HTTP POST failed. LastError: %lu - %s\x1b[0m\n", err, buffer);
                 }
             }
-            printf("\x1b[31mFailed to get response. Is the server running?\x1b[0m\n");
-            ChatAddMessage("assistant", "");
+            snprintf(failMsg, sizeof(failMsg),
+                "Request failed. I could not get a response from the active backend. Check that the model/provider is reachable and try again.");
+            WorkflowCompleteActive("Backend request failed");
+            SetStatusLine("Request failed", FALSE);
+            ChatAddMessage("system", failMsg);
+            RenderWorkflowPanel();
+            RenderConversationArea();
+            RenderStatusLine();
+            RenderInputLine("");
             continue;
         }
         
@@ -7715,47 +8988,112 @@ printf("\n\x1b[36mAvailable Commands:\x1b[0m\n");
             }
         }
         
-        if (!sOllamaMode && sCloudProvider == CLOUD_DISABLED && HasToolCall(response)) {
-            char tool_name[256] = "";
-            char tool_args[4096] = "";
-            char tool_result[8192] = "";
-            ToolAnimationState toolState;
-            HANDLE hToolThread = NULL;
-            
-            strncpy(tool_name, ExtractToolCall(response), sizeof(tool_name) - 1);
-            tool_name[sizeof(tool_name) - 1] = '\0';
-            strncpy(tool_args, ExtractToolArgs(response), sizeof(tool_args) - 1);
-            tool_args[sizeof(tool_args) - 1] = '\0';
-            
-            ZeroMemory(&toolState, sizeof(toolState));
-            if (tool_name[0]) {
+        {
+            char toolPayload[8192] = "";
+            char lastToolPayload[8192] = "";
+            char fallbackAssistant[1024] = "";
+            BOOL hadSuccessfulTool = FALSE;
+            if (ExtractExecutableToolPayload(response, sOllamaMode, sCloudProvider != CLOUD_DISABLED, toolPayload, sizeof(toolPayload))) {
+            int toolRound = 0;
+            const int maxToolRounds = 10;
+
+            while (toolPayload[0] && HasToolCall(toolPayload) && toolRound < maxToolRounds) {
+                char tool_name[256] = "";
+                char tool_args[TOOL_ARG_BUFFER_LEN] = "";
+                char tool_result[TOOL_RESULT_BUFFER_LEN] = "";
+                ToolAnimationState toolState;
+                HANDLE hToolThread = NULL;
+                char toolStatus[256];
+
+                strncpy(tool_name, ExtractToolCall(toolPayload), sizeof(tool_name) - 1);
+                tool_name[sizeof(tool_name) - 1] = '\0';
+                strncpy(tool_args, ExtractToolArgs(toolPayload), sizeof(tool_args) - 1);
+                tool_args[sizeof(tool_args) - 1] = '\0';
+
+                if (lastToolPayload[0] && strcmp(lastToolPayload, toolPayload) == 0) {
+                    PrintToolEvent("warn", tool_name, "duplicate tool call suppressed");
+                    break;
+                }
+                lstrcpynA(lastToolPayload, toolPayload, (int)sizeof(lastToolPayload));
+
+                ZeroMemory(&toolState, sizeof(toolState));
+                if (!tool_name[0]) {
+                    PrintToolEvent("error", "tool_parser", "no tool name found");
+                    break;
+                }
+
                 toolState.running = 1;
+                toolState.stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+                toolState.timeout_ms = 30000;
                 strncpy(toolState.title, tool_name, sizeof(toolState.title) - 1);
+                snprintf(toolStatus, sizeof(toolStatus), "%s", DescribeToolAction(tool_name));
+                SetStatusLine(toolStatus, TRUE);
+                RenderStatusLine();
                 PrintToolEvent("tool", tool_name, tool_args[0] ? tool_args : NULL);
                 hToolThread = CreateThread(NULL, 0, ToolAnimationThread, &toolState, 0, NULL);
-            }
-            
-            if (tool_name[0] && ExecuteToolCall(tool_name, tool_args, tool_result, sizeof(tool_result))) {
-                toolState.running = 0;
-                if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
-                PrintToolEvent("done", tool_name, "result captured");
-                ChatAddToolMessage(tool_name, tool_result);
-                
-free(response);
-                if (sOllamaMode) {
-                    response = HttpPost(url, BuildOllamaPayload(NULL), NULL);
+
+                if (ExecuteToolCall(tool_name, tool_args, tool_result, sizeof(tool_result))) {
+                    InterlockedExchange(&toolState.running, 0);
+                    if (toolState.stop_event) SetEvent(toolState.stop_event);
+                    if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
+                    if (toolState.stop_event) CloseHandle(toolState.stop_event);
+                    PrintToolEvent("done", tool_name, "result captured");
+                    ChatAddToolMessage(tool_name, tool_result);
+                    BuildToolSuccessMessage(tool_name, tool_args, tool_result, fallbackAssistant, sizeof(fallbackAssistant));
+                    hadSuccessfulTool = TRUE;
+
+                    free(response);
+                    if (sCloudProvider != CLOUD_DISABLED) {
+                        static char cloudFollowup[8192];
+                        cloudFollowup[0] = '\0';
+                        CallCloudAPI(NULL, cloudFollowup, sizeof(cloudFollowup));
+                        response = NULL;
+                        if (cloudFollowup[0]) {
+                            response = (char*)malloc(strlen(cloudFollowup) + 1);
+                            if (response) strcpy(response, cloudFollowup);
+                        }
+                    } else if (sOllamaMode) {
+                        response = HttpPost(url, BuildOllamaPayload(NULL), NULL);
+                    } else {
+                        response = HttpPost(url, BuildChatPayload(NULL), NULL);
+                    }
+                    if (!response) {
+                        printf("\x1b[31mFailed to get follow-up response\x1b[0m\n");
+                        WorkflowCompleteActive("Tool follow-up failed");
+                        break;
+                    }
+                    SetStatusLine("Integrating tool result into response", TRUE);
+                    WorkflowAdvance("Integrating tool result into response", FALSE);
+                    RenderWorkflowPanel();
+                    RenderStatusLine();
+                    toolPayload[0] = '\0';
+                    ExtractExecutableToolPayload(response, sOllamaMode, sCloudProvider != CLOUD_DISABLED, toolPayload, sizeof(toolPayload));
+                    WorkflowCompleteActive("Integrated tool result");
                 } else {
-                    response = HttpPost(url, BuildChatPayload(NULL), NULL);
+                    InterlockedExchange(&toolState.running, 0);
+                    if (toolState.stop_event) SetEvent(toolState.stop_event);
+                    if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
+                    if (toolState.stop_event) CloseHandle(toolState.stop_event);
+                    PrintToolEvent("error", tool_name, "tool execution failed");
+                    break;
                 }
-                
-                if (!response) {
-                    printf("\x1b[31mFailed to get follow-up response\x1b[0m\n");
-                    continue;
+
+                toolRound++;
+            }
+
+            if (toolRound >= maxToolRounds) {
+                PrintToolEvent("warn", "tool_limit", "max tool rounds reached");
+            }
+            if (hadSuccessfulTool && (!response || !response[0] || HasToolCall(response))) {
+                if (response) {
+                    free(response);
+                    response = NULL;
                 }
-            } else if (tool_name[0]) {
-                toolState.running = 0;
-                if (hToolThread) { WaitForSingleObject(hToolThread, INFINITE); CloseHandle(hToolThread); }
-                PrintToolEvent("error", tool_name, "tool execution failed");
+                response = (char*)malloc(strlen(fallbackAssistant) + 1);
+                if (response) {
+                    strcpy(response, fallbackAssistant);
+                }
+            }
             }
         }
         
@@ -7766,6 +9104,8 @@ free(response);
         } else {
             assistant_msg = ParseChatResponse(response);
         }
+        WorkflowAdvance("Preparing final response", FALSE);
+        RenderWorkflowPanel();
         
         if (!assistant_msg || !assistant_msg[0]) {
             if (sCloudProvider != CLOUD_DISABLED) {
@@ -7786,15 +9126,18 @@ free(response);
             }
             free(response);
             ChatAddMessage("assistant", "");
+            WorkflowCompleteActive("Final response unavailable");
+            RenderWorkflowPanel();
+            RenderConversationArea();
+            RenderInputLine("");
             continue;
         }
         
         ChatAddMessage("assistant", assistant_msg);
-        
-        PrintAssistantHeader();
-        PrintWrapped(assistant_msg, 88);
-        printf("\n\n");
-        fflush(stdout);
+        WorkflowCompleteActive("Done");
+        RenderWorkflowPanel();
+        RenderConversationArea();
+        RenderInputLine("");
         
         free(response);
     }
@@ -8877,7 +10220,6 @@ static int DaemonSwapModel(const char *modelName)
     int result;
     SafetyDecision safety;
     char ctx[32], gpu[32], threads[32];
-    ULONGLONG startTime;
     
     WaitForSingleObject(sDaemonModelMutex, INFINITE);
     
@@ -8901,7 +10243,6 @@ static int DaemonSwapModel(const char *modelName)
         return -1;
     }
     
-    startTime = GetTickCount();
     result = DaemonLaunchModel(modelName);
     
     ReleaseMutex(sDaemonModelMutex);
@@ -9475,8 +10816,6 @@ static void StreamProxyRequest(SOCKET clientSock, const char *llamaUrl, const ch
     
     send(proxySock, httpRequest, reqLen, 0);
     
-    char header[4096];
-    int headerLen = 0;
     int contentLength = -1;
     int bodyReceived = 0;
     BOOL inBody = FALSE;
@@ -9493,7 +10832,6 @@ static void StreamProxyRequest(SOCKET clientSock, const char *llamaUrl, const ch
             if (headerEnd) {
                 inBody = TRUE;
                 
-                char *headerPortion = buffer;
                 int headerPortionLen = (int)(headerEnd - buffer);
                 char save = buffer[headerPortionLen];
                 buffer[headerPortionLen] = '\0';
@@ -9528,9 +10866,9 @@ static void StreamProxyRequest(SOCKET clientSock, const char *llamaUrl, const ch
                 const char *lineStart = buffer;
                 for (int i = 0; i < bytes; i++) {
                     if (buffer[i] == '\n') {
-                        int lineLen = (int)(lineStart - buffer);
+                        int lineLen = (int)(&buffer[i] - lineStart);
                         char line[4096];
-                        if (lineLen < sizeof(line)) {
+                        if (lineLen > 0 && lineLen < (int)sizeof(line)) {
                             memcpy(line, lineStart, lineLen);
                             line[lineLen] = '\0';
                             
@@ -9994,7 +11332,7 @@ static DWORD WINAPI DaemonListenThread(LPVOID param)
         
         if (threadCount >= DAEMON_THREAD_POOL_SIZE) {
             DWORD waitResult = WaitForMultipleObjects(threadCount, threads, FALSE, 100);
-            if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + (DWORD)threadCount) {
+            if (waitResult < WAIT_OBJECT_0 + (DWORD)threadCount) {
                 int index = (int)(waitResult - WAIT_OBJECT_0);
                 CloseHandle(threads[index]);
                 threads[index] = threads[threadCount - 1];
@@ -10275,6 +11613,7 @@ static int DaemonStop(void)
     DWORD pid = ReadPidFile();
     int port = sDaemonPort > 0 ? sDaemonPort : GetConfiguredDaemonPort();
     BOOL stoppedByHttp = FALSE;
+    BOOL forceStopped = FALSE;
 
     if (pid == 0 && !IsDaemonPortOpen(port)) {
         printf("Daemon is not running.\n");
@@ -10315,20 +11654,32 @@ static int DaemonStop(void)
     Sleep(500);
     
     if (pid != 0) {
-        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        HANDLE hProc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (hProc) {
+            DWORD wait = WaitForSingleObject(hProc, 0);
             CloseHandle(hProc);
-            
-            printf("[*] Graceful stop failed, forcing termination...\n");
+            if (wait == WAIT_TIMEOUT) {
+                printf("[*] Graceful stop failed, forcing termination...\n");
+                fflush(stdout);
+                forceStopped = KillProcessTree(pid);
+            }
+        } else if (GetLastError() == ERROR_ACCESS_DENIED) {
+            printf("[*] Process access denied for probe, forcing termination...\n");
             fflush(stdout);
-            KillProcessTree(pid);
+            forceStopped = KillProcessTree(pid);
         }
     }
     
     if (stoppedByHttp || pid != 0)
         DeletePidFile();
     
-    printf("[*] Daemon stopped.\n\n\n");
+    if (stoppedByHttp) {
+        printf("[*] Daemon stopped gracefully.\n\n\n");
+    } else if (forceStopped) {
+        printf("[*] Daemon stopped by forced termination.\n\n\n");
+    } else {
+        printf("[*] Daemon stop signal sent.\n\n\n");
+    }
     fflush(stdout);
     
     return 0;
@@ -10427,10 +11778,18 @@ static int RunDaemonLoop(int port)
 
 static int RunDaemonCommand(int argc, char **argv)
 {
+    enum {
+        DAEMON_CMD_START = 0,
+        DAEMON_CMD_STOP,
+        DAEMON_CMD_STATUS,
+        DAEMON_CMD_RESTART,
+        DAEMON_CMD_LOG
+    };
     int i;
+    int command = DAEMON_CMD_START;
+    BOOL commandSet = FALSE;
     int port = GetConfiguredDaemonPort();
     BOOL foreground = FALSE;
-    BOOL showLog = FALSE;
     int logLines = 50;
     
     AttachConsoleStreams(FALSE);
@@ -10439,6 +11798,8 @@ static int RunDaemonCommand(int argc, char **argv)
     
     for (i = 2; i < argc; i++) {
         if (lstrcmpiA(argv[i], "start") == 0) {
+            command = DAEMON_CMD_START;
+            commandSet = TRUE;
         }
         else if (lstrcmpiA(argv[i], "--port") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
@@ -10453,16 +11814,40 @@ static int RunDaemonCommand(int argc, char **argv)
             sDaemonQuietStartup = TRUE;
         }
         else if (lstrcmpiA(argv[i], "stop") == 0) {
-            return DaemonStop();
+            if (commandSet && command != DAEMON_CMD_STOP) {
+                fprintf(stderr, "Conflicting daemon subcommands.\n");
+                fflush(stderr);
+                return 1;
+            }
+            command = DAEMON_CMD_STOP;
+            commandSet = TRUE;
         }
         else if (lstrcmpiA(argv[i], "status") == 0) {
-            return DaemonStatus();
+            if (commandSet && command != DAEMON_CMD_STATUS) {
+                fprintf(stderr, "Conflicting daemon subcommands.\n");
+                fflush(stderr);
+                return 1;
+            }
+            command = DAEMON_CMD_STATUS;
+            commandSet = TRUE;
         }
         else if (lstrcmpiA(argv[i], "restart") == 0) {
-            return DaemonRestart(port);
+            if (commandSet && command != DAEMON_CMD_RESTART) {
+                fprintf(stderr, "Conflicting daemon subcommands.\n");
+                fflush(stderr);
+                return 1;
+            }
+            command = DAEMON_CMD_RESTART;
+            commandSet = TRUE;
         }
         else if (lstrcmpiA(argv[i], "log") == 0) {
-            showLog = TRUE;
+            if (commandSet && command != DAEMON_CMD_LOG) {
+                fprintf(stderr, "Conflicting daemon subcommands.\n");
+                fflush(stderr);
+                return 1;
+            }
+            command = DAEMON_CMD_LOG;
+            commandSet = TRUE;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 logLines = atoi(argv[++i]);
                 if (logLines <= 0) logLines = 50;
@@ -10470,7 +11855,8 @@ static int RunDaemonCommand(int argc, char **argv)
         }
         else if (lstrcmpiA(argv[i], "--log-lines") == 0 && i + 1 < argc) {
             logLines = atoi(argv[++i]);
-            showLog = TRUE;
+            command = DAEMON_CMD_LOG;
+            commandSet = TRUE;
         }
         else {
             fprintf(stderr, "Unknown daemon command: %s\n", argv[i]);
@@ -10480,20 +11866,24 @@ static int RunDaemonCommand(int argc, char **argv)
         }
     }
     
-    if (showLog) {
+    if (command == DAEMON_CMD_STOP) {
+        return DaemonStop();
+    }
+    if (command == DAEMON_CMD_STATUS) {
+        return DaemonStatus();
+    }
+    if (command == DAEMON_CMD_RESTART) {
+        return DaemonRestart(port);
+    }
+    if (command == DAEMON_CMD_LOG) {
         return DaemonLogPrint(logLines);
     }
     
     return DaemonStart(port, foreground);
 }
 
-int main(int argc, char **argv)
+static int RunAppLikeMain(int argc, char **argv)
 {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-
-    AttachConsoleStreams(FALSE);
-    
     if (argc > 1 && lstrcmpiA(argv[1], "daemon") == 0) {
         return RunDaemonCommand(argc, argv);
     }
@@ -10505,16 +11895,18 @@ int main(int argc, char **argv)
     return RunCli(argc, argv);
 }
 
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    AttachConsoleStreams(FALSE);
+    return RunAppLikeMain(argc, argv);
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
     int argc;
     char **argv;
-    
-    FILE *f = fopen("B:\\llama_setup\\debug.txt", "w");
-    if (f) {
-        fprintf(f, "WinMain started, argc=%d\n", __argc);
-        fclose(f);
-    }
 
     (void)hInst;
     (void)hPrev;
@@ -10524,14 +11916,5 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     argv = __argv;
     argc = __argc;
     AttachConsoleStreams(FALSE);
-
-    if (argc > 1 && lstrcmpiA(argv[1], "daemon") == 0) {
-        return RunDaemonCommand(argc, argv);
-    }
-
-    if (argc > 2 && lstrcmpiA(argv[1], "serve") == 0 && lstrcmpiA(argv[2], "--daemon") == 0) {
-        return RunDaemonCommand(argc, argv);
-    }
-
-    return RunCli(argc, argv);
+    return RunAppLikeMain(argc, argv);
 }
