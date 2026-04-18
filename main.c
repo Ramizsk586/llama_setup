@@ -505,6 +505,9 @@ static BOOL IsDaemonPortOpen(int port);
 static int DaemonStart(int port, BOOL foreground);
 static int DaemonStop(void);
 static int DaemonRestart(int port);
+static void WriteServePidFile(DWORD pid);
+static DWORD ReadServePidFile(void);
+static void DeleteServePidFile(void);
 
 static BOOL ResolveToolPathArg(const char *tool_args, const char *key, BOOL allowEmpty, char *resolved, int resolvedLen)
 {
@@ -1222,6 +1225,7 @@ static void SafetyInit(void);
 static void SafetyShutdown(void);
 static BOOL KillProcessTree(DWORD pid);
 static BOOL TerminateActiveProcess(void);
+static int StopTrackedServeProcess(void);
 static ULONGLONG GetSystemRamMB(void);
 static ULONGLONG GetAvailableRamMB(void);
 static ULONGLONG GetCommitChargeMB(void);
@@ -3241,6 +3245,7 @@ static int RunDetachedChildProcess(const char *commandLine, int waitPort)
 
         while (waited < 30000) {
             if (IsDaemonPortOpen(waitPort)) {
+                WriteServePidFile(pi.dwProcessId);
                 printf("\n\n\x1b[32mServer is running in background.\x1b[0m\n");
                 printf("PID: %lu\n", pi.dwProcessId);
                 printf("URL: http://127.0.0.1:%d\n\n", waitPort);
@@ -3251,6 +3256,7 @@ static int RunDetachedChildProcess(const char *commandLine, int waitPort)
             if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
                 printf("\n");
                 fprintf(stderr, "\x1b[31mServer process exited early (code %lu).\x1b[0m\n", exitCode);
+                DeleteServePidFile();
                 CloseHandle(pi.hProcess);
                 return 1;
             }
@@ -3263,6 +3269,7 @@ static int RunDetachedChildProcess(const char *commandLine, int waitPort)
 
         printf("\n");
         fprintf(stderr, "\x1b[31mServer did not open port %d within 30 seconds.\x1b[0m\n", waitPort);
+        DeleteServePidFile();
         CloseHandle(pi.hProcess);
         return 1;
     }
@@ -4665,6 +4672,7 @@ static int PrintUsage(void)
     
     printf("\n\x1b[33mServer:\x1b[0m\n");
     printf("  valora serve [model]  Start model in llama-server (background by default)\n");
+    printf("  valora serve stop     Stop the last background server started by 'valora serve'\n");
     printf("    Options (all optional):\n");
     printf("      --context <n>     Context length (default: 2048)\n");
     printf("      --gpu-layers <n>  GPU layers (default: -1 for auto)\n");
@@ -5638,6 +5646,9 @@ static int RunCli(int argc, char **argv)
         SafetyDecision safety;
 
         SafetyInit();
+
+        if (argc > 2 && lstrcmpiA(argv[2], "stop") == 0)
+            return StopTrackedServeProcess();
 
         if (EnsureCliConfigReady(FALSE) != 0)
             return 1;
@@ -9180,7 +9191,7 @@ static char    sCurrentDaemonModel[MAX_PATH] = "";
 static HANDLE  sDaemonChildHandle = NULL;
 static DWORD   sDaemonChildPid = 0;
 static HANDLE  sDaemonModelMutex = NULL;
-static BOOL    sDaemonRunning = FALSE;
+static volatile BOOL sDaemonRunning = FALSE;
 static int     sDaemonPort = DAEMON_DEFAULT_PORT;
 static int     sDaemonInternalPort = DAEMON_INTERNAL_PORT;
 static HANDLE  sDaemonLogFile = INVALID_HANDLE_VALUE;
@@ -9193,6 +9204,10 @@ static CRITICAL_SECTION sDaemonLogCS;
 
 static void GetDirectoryFromPath(const char *path, char *dir, int dirLen);
 static BOOL BuildPidFilePath(char *path, int len);
+static BOOL BuildServePidFilePath(char *path, int len);
+static void WriteServePidFile(DWORD pid);
+static DWORD ReadServePidFile(void);
+static void DeleteServePidFile(void);
 
 static void ResetScannedModels(void)
 {
@@ -9710,11 +9725,33 @@ static BOOL BuildPidFilePath(char *path, int len)
     return TRUE;
 }
 
+static BOOL BuildServePidFilePath(char *path, int len)
+{
+    char appData[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appData) != S_OK)
+        return FALSE;
+    snprintf(path, len, "%s\\%s\\server.pid", appData, VALORA_APP_DIR);
+    return TRUE;
+}
+
 static void WritePidFile(DWORD pid)
 {
     char path[MAX_PATH];
     FILE *fp;
     if (!BuildPidFilePath(path, sizeof(path)))
+        return;
+    fp = fopen(path, "w");
+    if (fp) {
+        fprintf(fp, "%lu", pid);
+        fclose(fp);
+    }
+}
+
+static void WriteServePidFile(DWORD pid)
+{
+    char path[MAX_PATH];
+    FILE *fp;
+    if (!BuildServePidFilePath(path, sizeof(path)))
         return;
     fp = fopen(path, "w");
     if (fp) {
@@ -9738,10 +9775,32 @@ static DWORD ReadPidFile(void)
     return pid;
 }
 
+static DWORD ReadServePidFile(void)
+{
+    char path[MAX_PATH];
+    FILE *fp;
+    DWORD pid = 0;
+    if (!BuildServePidFilePath(path, sizeof(path)))
+        return 0;
+    fp = fopen(path, "r");
+    if (fp) {
+        fscanf(fp, "%lu", &pid);
+        fclose(fp);
+    }
+    return pid;
+}
+
 static void DeletePidFile(void)
 {
     char path[MAX_PATH];
     if (BuildPidFilePath(path, sizeof(path)))
+        DeleteFileA(path);
+}
+
+static void DeleteServePidFile(void)
+{
+    char path[MAX_PATH];
+    if (BuildServePidFilePath(path, sizeof(path)))
         DeleteFileA(path);
 }
 
@@ -9756,6 +9815,50 @@ static BOOL IsDaemonRunning(void)
         return TRUE;
     }
     return FALSE;
+}
+
+static int StopTrackedServeProcess(void)
+{
+    DWORD pid = ReadServePidFile();
+    HANDLE hProc;
+    DWORD waitResult;
+
+    if (pid == 0) {
+        printf("No background server is currently running.\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    hProc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) {
+        DeleteServePidFile();
+        printf("No background server is currently running.\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    waitResult = WaitForSingleObject(hProc, 0);
+    CloseHandle(hProc);
+    if (waitResult != WAIT_TIMEOUT) {
+        DeleteServePidFile();
+        printf("No background server is currently running.\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    printf("\n[*] Stopping background server (PID: %lu)...\n", pid);
+    fflush(stdout);
+
+    if (!KillProcessTree(pid)) {
+        fprintf(stderr, "[*] Failed to stop background server.\n");
+        fflush(stderr);
+        return 1;
+    }
+
+    DeleteServePidFile();
+    printf("[*] Background server stopped.\n\n");
+    fflush(stdout);
+    return 0;
 }
 
 static BOOL IsDaemonPortOpen(int port)
@@ -11502,14 +11605,6 @@ static int DaemonStatus(void)
 
 static int DaemonStart(int port, BOOL foreground)
 {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD consoleMode = 0;
-    if (hConsole != INVALID_HANDLE_VALUE) {
-        GetConsoleMode(hConsole, &consoleMode);
-        consoleMode |= ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
-        SetConsoleMode(hConsole, consoleMode);
-    }
-    
     if (IsDaemonAvailable(port)) {
         sDaemonPort = port;
         printf("Valora daemon is already running.\n");
@@ -11519,93 +11614,70 @@ static int DaemonStart(int port, BOOL foreground)
     }
 
     SaveDaemonPortToConfig(port);
-    
-    if (!foreground) {
+
+    if (foreground) {
+        sDaemonQuietStartup = FALSE;
+        return RunDaemonLoop(port);
+    }
+
+    {
         char selfPath[MAX_PATH];
         char workDir[MAX_PATH];
         char commandLine[MAX_PATH * 2];
-        char parameters[256];
         STARTUPINFOA si;
         PROCESS_INFORMATION pi;
-        SHELLEXECUTEINFOA sei;
-        DWORD exitCode = STILL_ACTIVE;
-        int waitMs = 0;
+        HANDLE hCheck;
+        DWORD waitResult;
 
         GetModuleFileNameA(NULL, selfPath, sizeof(selfPath));
         GetDirectoryFromPath(selfPath, workDir, sizeof(workDir));
-        snprintf(commandLine, sizeof(commandLine), "\"%s\" daemon --fg --quiet-startup --port %d", selfPath, port);
-        snprintf(parameters, sizeof(parameters), "daemon --fg --quiet-startup --port %d", port);
+        snprintf(commandLine, sizeof(commandLine),
+                 "\"%s\" daemon start --daemon-child --port %d --quiet-startup",
+                 selfPath, port);
 
         ZeroMemory(&si, sizeof(si));
         ZeroMemory(&pi, sizeof(pi));
         si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
 
-        ZeroMemory(&sei, sizeof(sei));
-        sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpFile = selfPath;
-        sei.lpParameters = parameters;
-        sei.lpDirectory = workDir;
-        sei.nShow = SW_HIDE;
-
-        if (ShellExecuteExA(&sei) && sei.hProcess) {
-            pi.hProcess = sei.hProcess;
-            pi.dwProcessId = GetProcessId(sei.hProcess);
-            pi.hThread = NULL;
-        } else {
-            if (!CreateProcessA(NULL, commandLine, NULL, NULL, FALSE,
-                                CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
-                                NULL, workDir, &si, &pi)) {
-                fprintf(stderr, "Failed to start daemon process\n\n");
-                fflush(stderr);
-                return 1;
-            }
-        }
-
-        if (pi.hThread)
-            CloseHandle(pi.hThread);
-        while (waitMs < 5000) {
-            if (IsDaemonPortOpen(port))
-                break;
-
-            GetExitCodeProcess(pi.hProcess, &exitCode);
-            if (exitCode != STILL_ACTIVE) {
-                fprintf(stderr, "Failed to start daemon process (exit code %lu)\n\n", exitCode);
-                fflush(stderr);
-                CloseHandle(pi.hProcess);
-                DeletePidFile();
-                return 1;
-            }
-
-            Sleep(100);
-            waitMs += 100;
-        }
-
-        if (!IsDaemonPortOpen(port)) {
-            fprintf(stderr, "Failed to start daemon process (port %d did not open)\n\n", port);
+        if (!CreateProcessA(NULL, commandLine, NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW | DETACHED_PROCESS |
+                            CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+                            NULL, workDir, &si, &pi)) {
+            fprintf(stderr, "[ERROR] Failed to launch daemon process: %lu\n", GetLastError());
             fflush(stderr);
-            TerminateProcess(pi.hProcess, 1);
-            CloseHandle(pi.hProcess);
-            DeletePidFile();
             return 1;
         }
 
-        WritePidFile(pi.dwProcessId);
+        Sleep(1200);
+
+        if (pi.hThread)
+            CloseHandle(pi.hThread);
+        if (pi.hProcess)
+            CloseHandle(pi.hProcess);
+
+        hCheck = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pi.dwProcessId);
+        if (!hCheck) {
+            fprintf(stderr, "[ERROR] Daemon process did not stay running (PID %lu).\n", pi.dwProcessId);
+            fflush(stderr);
+            return 1;
+        }
+
+        waitResult = WaitForSingleObject(hCheck, 0);
+        CloseHandle(hCheck);
+        if (waitResult != WAIT_TIMEOUT) {
+            fprintf(stderr, "[ERROR] Daemon exited immediately. Check config with: valora daemon log\n");
+            fflush(stderr);
+            return 1;
+        }
+
         RegisterDaemonStartup(port);
-
         sDaemonPort = port;
-        printf("\n[*] Valora daemon started\n");
-        printf("    PID : %lu\n", pi.dwProcessId);
-        PrintDaemonEndpoints(port);
+        printf("[*] Valora daemon started (PID %lu) on port %d\n", pi.dwProcessId, port);
+        printf("[*] Endpoints: http://localhost:%d\n", port);
+        printf("[*] Stop with: valora daemon stop\n\n");
         fflush(stdout);
-
-        CloseHandle(pi.hProcess);
         return 0;
     }
-    
-    return RunDaemonLoop(port);
 }
 
 static int DaemonStop(void)
@@ -11695,7 +11767,20 @@ static int DaemonRestart(int port)
 static int RunDaemonLoop(int port)
 {
     char ctx[32], gpu[32], threads[32];
-    
+
+    FreeConsole();
+    SetConsoleCtrlHandler(NULL, TRUE);
+
+    if (sDaemonQuietStartup) {
+        FILE *nul = fopen("NUL", "w");
+        if (nul) {
+            fclose(stdout);
+            fclose(stderr);
+            *stdout = *nul;
+            *stderr = *nul;
+        }
+    }
+
     sDaemonPort = port;
     sDaemonStartTime = GetTickCount64();
     WritePidFile(GetCurrentProcessId());
@@ -11790,6 +11875,7 @@ static int RunDaemonCommand(int argc, char **argv)
     BOOL commandSet = FALSE;
     int port = GetConfiguredDaemonPort();
     BOOL foreground = FALSE;
+    BOOL isChild = FALSE;
     int logLines = 50;
     
     AttachConsoleStreams(FALSE);
@@ -11812,6 +11898,9 @@ static int RunDaemonCommand(int argc, char **argv)
         }
         else if (lstrcmpiA(argv[i], "--quiet-startup") == 0) {
             sDaemonQuietStartup = TRUE;
+        }
+        else if (lstrcmpiA(argv[i], "--daemon-child") == 0) {
+            isChild = TRUE;
         }
         else if (lstrcmpiA(argv[i], "stop") == 0) {
             if (commandSet && command != DAEMON_CMD_STOP) {
@@ -11878,7 +11967,12 @@ static int RunDaemonCommand(int argc, char **argv)
     if (command == DAEMON_CMD_LOG) {
         return DaemonLogPrint(logLines);
     }
-    
+
+    if (command == DAEMON_CMD_START && isChild) {
+        sDaemonQuietStartup = TRUE;
+        return RunDaemonLoop(port);
+    }
+
     return DaemonStart(port, foreground);
 }
 
