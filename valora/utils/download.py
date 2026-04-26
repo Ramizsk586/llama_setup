@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Mapping
 
 import httpx
 from rich.console import Console
@@ -9,7 +10,11 @@ from rich.progress import BarColumn, DownloadColumn, Progress, TaskID, TextColum
 console = Console()
 
 
-def download_with_progress(url: str, dest_path: Path) -> None:
+def download_with_progress(
+    url: str,
+    dest_path: Path,
+    headers: Mapping[str, str] | None = None,
+) -> None:
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     progress = Progress(
@@ -22,7 +27,13 @@ def download_with_progress(url: str, dest_path: Path) -> None:
     )
 
     try:
-        with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as response:
+        with httpx.stream(
+            "GET",
+            url,
+            follow_redirects=True,
+            timeout=60.0,
+            headers=dict(headers or {}),
+        ) as response:
             response.raise_for_status()
             total = int(response.headers.get("Content-Length", 0))
             with progress:

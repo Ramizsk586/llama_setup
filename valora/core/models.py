@@ -31,6 +31,8 @@ class RecommendedModel:
     params: str
     approx_q4_mb: int
     tags: str
+    hf_repo: str = ""
+    hf_pattern: str = "*Q4_K_M*.gguf"
 
 
 def detect_quantization(path: str) -> str:
@@ -51,11 +53,19 @@ def get_model_size_mb(path: str) -> int:
 
 def is_vision_model(name: str) -> bool:
     lowered = name.lower()
-    return any(token in lowered for token in ("mmproj", "vision", "llava", "minicpm"))
+    if any(token in lowered for token in ("mmproj", "vision", "llava", "minicpm")):
+        return True
+    return bool(re.search(r"(^|[-_.])vl([-. _]|$)", lowered))
+
+
+def is_projector_file(name: str) -> bool:
+    return "mmproj" in name.lower()
 
 
 def _detect_model_type(name: str) -> str:
     lowered = name.lower()
+    if is_projector_file(lowered):
+        return "Projector"
     if is_vision_model(lowered):
         return "Vision"
     if any(token in lowered for token in ("embed", "bge-", "nomic-embed")):
@@ -83,12 +93,15 @@ def scan_models(folder: str) -> list[ModelInfo]:
         return []
 
     found: list[Path] = []
+    all_gguf_names: list[str] = []
     for path in root.rglob("*.gguf"):
+        all_gguf_names.append(path.name)
+        if is_projector_file(path.name):
+            continue
         found.append(path)
         if len(found) >= MAX_MODELS:
             break
 
-    names = [path.name for path in found]
     models: list[ModelInfo] = []
     for path in sorted(found, key=lambda item: item.name.lower()):
         model = ModelInfo(
@@ -100,7 +113,7 @@ def scan_models(folder: str) -> list[ModelInfo]:
             projector="",
         )
         if model.model_type == "Vision":
-            model.projector = find_projector(str(path), names)
+            model.projector = find_projector(str(path), all_gguf_names)
         models.append(model)
     return models
 
@@ -160,19 +173,83 @@ def _default_catalog() -> list[RecommendedModel]:
     return [
         RecommendedModel("Qwen", "Qwen3.5-0.8B-Instruct", "Chat", "0.8B", 900, "tiny, multilingual"),
         RecommendedModel("Qwen", "Qwen3.5-2B-Instruct", "Chat", "2B", 1800, "balanced, multilingual"),
-        RecommendedModel("Qwen", "Qwen3.5-4B-Instruct", "Chat", "4B", 3200, "strong small generalist"),
+        RecommendedModel(
+            "Qwen",
+            "Qwen3.5-4B-Instruct",
+            "Chat",
+            "4B",
+            3200,
+            "strong small generalist",
+            hf_repo="openresearchtools/Qwen3.5-4B-Instruct-GGUF",
+        ),
         RecommendedModel("Qwen", "Qwen3.6-35B-A3B", "Reasoning", "35B-A3B", 21000, "latest Qwen family, agentic"),
         RecommendedModel("Gemma", "Gemma 3 270M", "Chat", "270M", 500, "ultra-light"),
-        RecommendedModel("Gemma", "Gemma 3 1B", "Chat", "1B", 1100, "fast text-only"),
+        RecommendedModel(
+            "Gemma",
+            "Gemma 3 1B",
+            "Chat",
+            "1B",
+            1100,
+            "fast text-only",
+            hf_repo="gguf-org/gemma-3-1b-it-gguf",
+        ),
         RecommendedModel("Gemma", "Gemma 3 4B", "Multimodal", "4B", 3400, "vision + chat"),
         RecommendedModel("Gemma", "Gemma 3n E2B", "On-device", "E2B", 2200, "mobile-friendly"),
-        RecommendedModel("LiquidAI", "LFM2.5-350M", "Chat", "350M", 450, "very fast edge model"),
-        RecommendedModel("LiquidAI", "LFM2.5-1.2B-Instruct", "Chat", "1.2B", 950, "efficient, recent"),
+        RecommendedModel(
+            "LiquidAI",
+            "LFM2.5-350M",
+            "Chat",
+            "350M",
+            450,
+            "very fast edge model",
+            hf_repo="LiquidAI/LFM2.5-350M-GGUF",
+        ),
+        RecommendedModel(
+            "LiquidAI",
+            "LFM2.5-1.2B-Instruct",
+            "Chat",
+            "1.2B",
+            950,
+            "efficient, recent",
+            hf_repo="LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+        ),
         RecommendedModel("LiquidAI", "LFM2-VL-3B", "Multimodal", "3B", 2600, "vision + text"),
-        RecommendedModel("Llama", "Llama 3.2 1B", "Chat", "1B", 850, "popular local starter"),
-        RecommendedModel("Llama", "Llama 3.2 3B", "Chat", "3B", 1500, "popular everyday chat"),
-        RecommendedModel("Phi", "Phi-4-mini-instruct", "Reasoning", "3.8B", 3200, "small reasoning/coding"),
-        RecommendedModel("Mistral", "Ministral 3 3B", "Chat", "3B", 2400, "recent Mistral small model"),
+        RecommendedModel(
+            "Llama",
+            "Llama 3.2 1B",
+            "Chat",
+            "1B",
+            850,
+            "popular local starter",
+            hf_repo="unsloth/Llama-3.2-1B-Instruct-GGUF",
+        ),
+        RecommendedModel(
+            "Llama",
+            "Llama 3.2 3B",
+            "Chat",
+            "3B",
+            1500,
+            "popular everyday chat",
+            hf_repo="merterbak/Llama-3.2-3B-Instruct-GGUF",
+        ),
+        RecommendedModel(
+            "Phi",
+            "Phi-4-mini-instruct",
+            "Reasoning",
+            "3.8B",
+            3200,
+            "small reasoning/coding",
+            hf_repo="llmware/phi-4-mini-gguf",
+        ),
+        RecommendedModel(
+            "Mistral",
+            "Ministral 3 3B",
+            "Chat",
+            "3B",
+            2400,
+            "recent Mistral small model",
+            hf_repo="mistralai/Ministral-3-3B-Instruct-2512-GGUF",
+        ),
         RecommendedModel("Mistral", "Ministral 3 8B", "Chat", "8B", 5200, "stronger quality tier"),
     ]
 

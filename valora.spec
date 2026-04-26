@@ -30,6 +30,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,
+    icon='A:\\Valora\\assets\\llama.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

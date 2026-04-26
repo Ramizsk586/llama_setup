@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import json
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,10 @@ DEFAULT_STATE: dict[str, Any] = {
     "cloud_provider": "disabled",
     "cloud_api_key": "",
     "cloud_model": "",
+    "hf_api_token": "",
+    "provider_profiles": {},
+    "chat_provider": "",
+    "chat_model": "",
     "mcp_enabled": False,
     "mcp_serpapi_api_key": "",
     "mcp_server_template": "https://mcp.serpapi.com/{api_key}/mcp",
@@ -72,6 +77,21 @@ def _build_mcp_server_url(api_key: str, template: str) -> str:
     return cleaned_template.format(api_key=cleaned_key)
 
 
+def _coerce_dict(value: str | dict[str, Any], default: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    cleaned = str(value).strip()
+    if not cleaned:
+        return default.copy()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return default.copy()
+    if not isinstance(parsed, dict):
+        return default.copy()
+    return parsed
+
+
 def _apply_parser(parser: configparser.ConfigParser) -> None:
     state.update(DEFAULT_STATE)
     state["config_path"] = str(get_config_path())
@@ -79,6 +99,7 @@ def _apply_parser(parser: configparser.ConfigParser) -> None:
     paths = parser["paths"] if parser.has_section("paths") else {}
     server = parser["server"] if parser.has_section("server") else {}
     cloud = parser["cloud"] if parser.has_section("cloud") else {}
+    providers = parser["providers"] if parser.has_section("providers") else {}
     mcp = parser["mcp"] if parser.has_section("mcp") else {}
     daemon = parser["daemon"] if parser.has_section("daemon") else {}
 
@@ -103,6 +124,13 @@ def _apply_parser(parser: configparser.ConfigParser) -> None:
     state["cloud_provider"] = str(cloud.get("provider", state["cloud_provider"]))
     state["cloud_api_key"] = str(cloud.get("api_key", state["cloud_api_key"]))
     state["cloud_model"] = str(cloud.get("model", state["cloud_model"]))
+    state["hf_api_token"] = str(cloud.get("hf_api_token", state["hf_api_token"]))
+    state["provider_profiles"] = _coerce_dict(
+        providers.get("profiles_json", ""),
+        {},
+    )
+    state["chat_provider"] = str(providers.get("chat_provider", state["chat_provider"]))
+    state["chat_model"] = str(providers.get("chat_model", state["chat_model"]))
 
     state["mcp_enabled"] = _coerce_bool(mcp.get("enabled", state["mcp_enabled"]), False)
     state["mcp_serpapi_api_key"] = str(mcp.get("serpapi_api_key", state["mcp_serpapi_api_key"]))
@@ -167,6 +195,12 @@ def save_config() -> bool:
         "provider": str(state["cloud_provider"]),
         "api_key": str(state["cloud_api_key"]),
         "model": str(state["cloud_model"]),
+        "hf_api_token": str(state["hf_api_token"]),
+    }
+    parser["providers"] = {
+        "profiles_json": json.dumps(state.get("provider_profiles", {}), ensure_ascii=True),
+        "chat_provider": str(state.get("chat_provider", "")),
+        "chat_model": str(state.get("chat_model", "")),
     }
     parser["mcp"] = {
         "enabled": str(state["mcp_enabled"]),
