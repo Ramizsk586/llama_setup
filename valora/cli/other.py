@@ -10,7 +10,6 @@ import time
 
 import httpx
 import psutil
-import readchar
 import typer
 from rich.columns import Columns
 from rich.console import Console
@@ -67,6 +66,11 @@ LOCAL_SETUP_COMMAND_HELP: dict[str, str] = {
     "/start": "Launch chat in a new terminal",
     "/exit": "Leave setup",
 }
+KEY_ENTER = "ENTER"
+KEY_BACKSPACE = "BACKSPACE"
+KEY_CTRL_C = "CTRL_C"
+KEY_CTRL_D = "CTRL_D"
+KEY_ESC = "ESC"
 SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 
 
@@ -666,45 +670,73 @@ def _print_input_area(
     user_input: str,
     command_help: dict[str, str],
     floating_items: list[tuple[str, str]] | None = None,
-    prompt_prefix: str = "> ",
+    prompt_prefix: str = "❯ ",
 ) -> None:
     console.print(Rule(style="white"))
     matches = floating_items if floating_items is not None else _command_matches(user_input, command_help)
-    if matches:
-        for command, description in matches:
-            console.print(f"[bold bright_blue]{command}[/bold bright_blue]  {description}")
-        console.print(Rule(style="white"))
     console.print(f"{prompt_prefix}{user_input}", style="bold white", end="")
     console.print()
-    if not matches:
-        console.print("[dim]? for shortcuts[/dim]")
+    if matches:
+        console.print(Rule(style="white"))
+        for command, description in matches:
+            console.print(f"[bold bright_blue]{command}[/bold bright_blue]  {description}")
 
 
-def _interactive_prompt(render_screen, command_help: dict[str, str]) -> str:
+def _ansi_write(text: str) -> None:
+    console.file.write(text)
+    console.file.flush()
+
+
+def _begin_overlay_region() -> None:
+    _ansi_write("\x1b[s")
+
+
+def _refresh_overlay(
+    user_input: str,
+    command_help: dict[str, str],
+    floating_items: list[tuple[str, str]] | None = None,
+    prompt_prefix: str = "❯ ",
+) -> None:
+    _ansi_write("\x1b[u\x1b[J")
+    _print_input_area(
+        user_input,
+        command_help,
+        floating_items=floating_items,
+        prompt_prefix=prompt_prefix,
+    )
+
+
+def _interactive_prompt(render_static, command_help: dict[str, str], prompt_prefix: str = "❯ ") -> str:
     buffer = ""
+    render_static()
+    console.print()
+    _begin_overlay_region()
     while True:
-        render_screen(buffer, _command_matches(buffer, command_help))
-        key = readchar.readkey()
-        if key in {readchar.key.ENTER, readchar.key.CR, "\n", "\r"}:
+        _refresh_overlay(buffer, command_help, _command_matches(buffer, command_help), prompt_prefix=prompt_prefix)
+        key = _read_key()
+        if key == KEY_ENTER:
             return buffer.strip()
-        if key in {readchar.key.CTRL_C, readchar.key.CTRL_D}:
+        if key in {KEY_CTRL_C, KEY_CTRL_D}:
             raise typer.Exit(code=0)
-        if key in {readchar.key.BACKSPACE, readchar.key.DELETE}:
+        if key == KEY_BACKSPACE:
             buffer = buffer[:-1]
             continue
-        if key == readchar.key.ESC:
+        if key == KEY_ESC:
             continue
         if len(key) == 1 and key.isprintable():
             buffer += key
 
 
-def _interactive_choice_prompt(render_screen, choices: list[tuple[str, str]]) -> tuple[str, str] | None:
+def _interactive_choice_prompt(render_static, choices: list[tuple[str, str]], prompt_prefix: str = "❯ /models ") -> tuple[str, str] | None:
     buffer = ""
+    render_static()
+    console.print()
+    _begin_overlay_region()
     while True:
         matches = _filter_choice_matches(buffer, choices)
-        render_screen(buffer, matches)
-        key = readchar.readkey()
-        if key in {readchar.key.ENTER, readchar.key.CR, "\n", "\r"}:
+        _refresh_overlay(buffer, {}, matches, prompt_prefix=prompt_prefix)
+        key = _read_key()
+        if key == KEY_ENTER:
             if not matches:
                 return None
             lowered = buffer.strip().lower()
@@ -712,12 +744,12 @@ def _interactive_choice_prompt(render_screen, choices: list[tuple[str, str]]) ->
                 if label.lower() == lowered:
                     return label, description
             return matches[0]
-        if key in {readchar.key.CTRL_C, readchar.key.CTRL_D}:
+        if key in {KEY_CTRL_C, KEY_CTRL_D}:
             raise typer.Exit(code=0)
-        if key in {readchar.key.BACKSPACE, readchar.key.DELETE}:
+        if key == KEY_BACKSPACE:
             buffer = buffer[:-1]
             continue
-        if key == readchar.key.ESC:
+        if key == KEY_ESC:
             return None
         if len(key) == 1 and key.isprintable():
             buffer += key
@@ -812,6 +844,49 @@ def _parse_bar_args(raw: str, expected_parts: int) -> list[str] | None:
     return parts
 
 
+def _read_key() -> str:
+    if os.name == "nt":
+        import msvcrt
+
+        key = msvcrt.getwch()
+        if key in {"\r", "\n"}:
+            return KEY_ENTER
+        if key == "\x08":
+            return KEY_BACKSPACE
+        if key == "\x03":
+            return KEY_CTRL_C
+        if key == "\x04":
+            return KEY_CTRL_D
+        if key == "\x1b":
+            return KEY_ESC
+        if key in {"\x00", "\xe0"}:
+            extended = msvcrt.getwch()
+            return f"EXT:{ord(extended)}"
+        return key
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        key = sys.stdin.read(1)
+        if key in {"\r", "\n"}:
+            return KEY_ENTER
+        if key in {"\x7f", "\b"}:
+            return KEY_BACKSPACE
+        if key == "\x03":
+            return KEY_CTRL_C
+        if key == "\x04":
+            return KEY_CTRL_D
+        if key == "\x1b":
+            return KEY_ESC
+        return key
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
 def _tool_web_search(query: str) -> tuple[str, str]:
     api_key = str(state.get("mcp_serpapi_api_key", "")).strip()
     if not api_key:
@@ -902,9 +977,6 @@ def _tool_delete_path(path_arg: str, session_root: Path) -> tuple[str, str]:
 
 def _render_transcript(transcript: list[tuple[str, str]]) -> None:
     if not transcript:
-        console.print("Welcome back!\n", style="bold white")
-        console.print("Start typing to chat with your selected model.", style="white")
-        console.print("Use /help to see slash commands.\n", style="dim")
         return
 
     for role, content in transcript[-10:]:
@@ -947,11 +1019,13 @@ def _render_local_setup_ui(
     user_input: str = "",
     floating_items: list[tuple[str, str]] | None = None,
     prompt_prefix: str = "> ",
+    render_input: bool = True,
 ) -> None:
     console.clear()
     console.print(_build_local_setup_panel(model_name, runtime_profile, status))
-    console.print()
-    _print_input_area(user_input, LOCAL_SETUP_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
+    if render_input:
+        console.print()
+        _print_input_area(user_input, LOCAL_SETUP_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
 
 
 def _render_chat_ui(
@@ -965,6 +1039,7 @@ def _render_chat_ui(
     floating_items: list[tuple[str, str]] | None = None,
     prompt_prefix: str = "> ",
     tool_events: list[dict[str, str]] | None = None,
+    render_input: bool = True,
 ) -> None:
     console.clear()
     left = Text()
@@ -991,7 +1066,8 @@ def _render_chat_ui(
     console.print(Rule(style="white"))
     _render_tool_events(tool_events or [])
     _render_transcript(transcript)
-    _print_input_area(user_input, CHAT_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
+    if render_input:
+        _print_input_area(user_input, CHAT_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
 
 
 def _chat_help_text() -> str:
@@ -1410,13 +1486,14 @@ def register_other_commands(app: typer.Typer) -> None:
             while True:
                 runtime_profile = _resolved_local_runtime_profile(local_model, local_runtime_overrides)
                 user_message = _interactive_prompt(
-                    lambda current_input, _matches: _render_local_setup_ui(
+                    lambda: _render_local_setup_ui(
                         local_model.name,
                         runtime_profile,
                         status_message,
-                        current_input,
+                        render_input=False,
                     ),
                     LOCAL_SETUP_COMMAND_HELP,
+                    prompt_prefix="❯ ",
                 )
                 if not user_message:
                     continue
@@ -1442,14 +1519,14 @@ def register_other_commands(app: typer.Typer) -> None:
                         status_message = "No local models are available."
                         continue
                     picked = _interactive_choice_prompt(
-                        lambda query, matches: _render_local_setup_ui(
+                        lambda: _render_local_setup_ui(
                             local_model.name,
                             runtime_profile,
                             "Search local models and press Enter.",
-                            f"/models {query}".strip(),
-                            floating_items=matches,
+                            render_input=False,
                         ),
                         local_choices,
+                        prompt_prefix="❯ /models ",
                     )
                     if picked is None:
                         status_message = "Model search cancelled."
@@ -1562,17 +1639,18 @@ def register_other_commands(app: typer.Typer) -> None:
                 if local_model is not None:
                     local_runtime_profile = _resolved_local_runtime_profile(local_model, local_runtime_overrides)
             user_message = _interactive_prompt(
-                lambda current_input, _matches: _render_chat_ui(
+                lambda: _render_chat_ui(
                     session_provider,
                     session_model,
                     session_system,
                     transcript,
                     status_message,
                     local_runtime_profile,
-                    current_input,
                     tool_events=tool_events,
+                    render_input=False,
                 ),
                 CHAT_COMMAND_HELP,
+                prompt_prefix="❯ ",
             )
             if user_message.lower() in {"exit", "quit"}:
                 break
@@ -1787,18 +1865,18 @@ def register_other_commands(app: typer.Typer) -> None:
                         status_message = "No saved local or cloud models are available."
                         continue
                     picked = _interactive_choice_prompt(
-                        lambda query, matches: _render_chat_ui(
+                        lambda: _render_chat_ui(
                             session_provider,
                             session_model,
                             session_system,
                             transcript,
                             "Search models and press Enter.",
                             local_runtime_profile,
-                            f"/models {query}".strip(),
-                            floating_items=matches,
                             tool_events=tool_events,
+                            render_input=False,
                         ),
                         choices,
+                        prompt_prefix="❯ /models ",
                     )
                     if picked is None:
                         status_message = "Model search cancelled."
