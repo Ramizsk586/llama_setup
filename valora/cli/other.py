@@ -1,25 +1,73 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+import time
 
 import httpx
 import psutil
+import readchar
 import typer
 from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
 from valora import __version__
 from valora.core.config import get_config_path, load_config, save_config, state
 from valora.core.gpu import detect_vulkan_support, get_gpu_name, get_total_vram_mb
-from valora.core.models import estimate_context_overhead_mb, format_size_mb, is_model_usable, recommend_models_for_device, scan_models
+from valora.core.models import ModelInfo, estimate_context_overhead_mb, format_size_mb, is_model_usable, pick_best_model, recommend_models_for_device, resolve_auto_runtime_settings, scan_models
 from valora.core.providers import PROVIDERS, ProviderSpec, get_provider
 from valora.utils.download import download_with_progress
 from valora.utils.huggingface import HfGgufFile, HfRepoManifest, build_auth_headers, fetch_repo_manifest, normalize_repo_id
 
 console = Console()
+LOCAL_KV_CACHE_CHOICES = ("f16", "q8_0", "q4_0", "q4_1")
+CHAT_COMMAND_HELP: dict[str, str] = {
+    "/help": "Show available slash commands",
+    "/models": "Search available local and saved cloud models",
+    "/allow-dir": "Allow one extra directory for file tools",
+    "/web": "Search the web with SerpApi",
+    "/read": "Read a local text file",
+    "/write": "Write a file with /write path | content",
+    "/edit": "Edit a file with /edit path | find | replace",
+    "/mkdir": "Create a folder in the current chat directory",
+    "/delete": "Delete a file or folder in the current chat directory",
+    "/provider": "Switch backend",
+    "/model": "Set the active model",
+    "/system": "Set or clear the system prompt",
+    "/ctx": "Change local context size",
+    "/gpu-layers": "Set GPU layers or use -1 for auto",
+    "/threads": "Set local CPU threads",
+    "/kv-k": "Set KV cache K type",
+    "/kv-v": "Set KV cache V type",
+    "/auto": "Restore automatic local defaults",
+    "/clear": "Clear the transcript",
+    "/api": "Show the API setup table",
+    "/save": "Save the current chat default",
+    "/exit": "Leave chat",
+}
+LOCAL_SETUP_COMMAND_HELP: dict[str, str] = {
+    "/help": "Show available slash commands",
+    "/models": "Search local models",
+    "/model": "Switch the local model",
+    "/ctx": "Change local context size",
+    "/gpu-layers": "Set GPU layers or use -1 for auto",
+    "/threads": "Set local CPU threads",
+    "/kv-k": "Set KV cache K type",
+    "/kv-v": "Set KV cache V type",
+    "/auto": "Restore automatic local defaults",
+    "/save": "Save the current local defaults",
+    "/start": "Launch chat in a new terminal",
+    "/exit": "Leave setup",
+}
+SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 
 
 def _mask_secret(value: str) -> str:
@@ -29,6 +77,61 @@ def _mask_secret(value: str) -> str:
     if len(cleaned) <= 6:
         return "*" * len(cleaned)
     return f"{cleaned[:3]}...{cleaned[-3:]}"
+
+
+def _normalize_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _protected_roots() -> list[Path]:
+    roots: list[Path] = []
+    candidates = {
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        r"C:\Windows",
+        r"C:\Windows\System32",
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    }
+    for candidate in candidates:
+        cleaned = str(candidate).strip()
+        if cleaned:
+            roots.append(_normalize_path(Path(cleaned)))
+    return roots
+
+
+def _resolve_scoped_path(path_arg: str, session_root: Path, allowed_dirs: set[Path], mode: str) -> Path:
+    candidate = Path(path_arg).expanduser()
+    if not candidate.is_absolute():
+        candidate = session_root / candidate
+    resolved = _normalize_path(candidate)
+
+    for protected in _protected_roots():
+        if _is_relative_to(resolved, protected) or resolved == protected:
+            raise ValueError(f"{mode.capitalize()} access is blocked for protected system paths like `{protected}`.")
+
+    for allowed in allowed_dirs:
+        if _is_relative_to(resolved, allowed) or resolved == allowed:
+            return resolved
+
+    raise ValueError(
+        f"{mode.capitalize()} access is limited to `{session_root}`. "
+        f"Use `/allow-dir {resolved.parent}` first if you want to grant access to another folder."
+    )
+
+
+def _resolve_main_dir_path(path_arg: str, session_root: Path, mode: str) -> Path:
+    resolved = _resolve_scoped_path(path_arg, session_root, {session_root}, mode)
+    if resolved == session_root:
+        raise ValueError(f"You cannot {mode} the main chat directory itself.")
+    return resolved
 
 
 def _get_ctx_len() -> int:
@@ -111,6 +214,103 @@ def _provider_is_configured(spec: ProviderSpec) -> bool:
     if spec.auth_kind == "none":
         return has_saved_profile or bool(_provider_model(spec.slug).strip()) or state.get("chat_provider") == spec.slug
     return has_saved_profile or bool(_provider_api_key(spec.slug)) or bool(_provider_model(spec.slug).strip())
+
+
+def _local_models() -> list[ModelInfo]:
+    folder = str(state.get("folder", "")).strip()
+    if not folder:
+        return []
+    return scan_models(folder)
+
+
+def _pick_local_model(requested_model: str = "") -> ModelInfo | None:
+    models = _local_models()
+    if not models:
+        return None
+
+    requested = requested_model.strip().lower()
+    if requested:
+        for model in models:
+            if requested in {model.name.lower(), str(model.path).lower(), model.path.stem.lower()}:
+                return model
+        for model in models:
+            if requested in model.name.lower():
+                return model
+
+    preferred_name = str(state.get("selected_model", "")).strip().lower()
+    if preferred_name:
+        for model in models:
+            if preferred_name in {model.name.lower(), str(model.path).lower(), model.path.stem.lower()}:
+                return model
+
+    best_index = pick_best_model(models, get_total_vram_mb())
+    if best_index < 0:
+        return models[0]
+    return models[best_index]
+
+
+def _local_chat_ready() -> tuple[bool, str]:
+    llama_cli = str(state.get("llama_cli", "")).strip()
+    if not llama_cli or not Path(llama_cli).is_file():
+        return False, "llama.cpp is not set up yet. Run `valora setup --llama.cpp`."
+    if not _local_models():
+        return False, "No local GGUF models were found. Run `valora get <huggingface-repo>` or `valora setup --models`."
+    return True, ""
+
+
+def _suggest_local_runtime_profile(model: ModelInfo) -> dict[str, str]:
+    memory = psutil.virtual_memory()
+    available_ram_mb = int(memory.available / (1024 * 1024))
+    resolved_gpu_layers, resolved_threads = resolve_auto_runtime_settings(
+        model,
+        "auto",
+        "auto",
+    )
+
+    if available_ram_mb >= 16384 and model.size_mb <= 4096:
+        ctx = "8192"
+    else:
+        ctx = "4096"
+
+    return {
+        "ctx": ctx,
+        "gpu_layers": "-1",
+        "threads": resolved_threads or "4",
+        "kv_cache_k": "f16",
+        "kv_cache_v": "f16",
+    }
+
+
+def _resolved_local_runtime_profile(model: ModelInfo, overrides: dict[str, str] | None = None) -> dict[str, str]:
+    profile = _suggest_local_runtime_profile(model)
+    source = {
+        "ctx": str(state.get("ctx", "")).strip(),
+        "gpu_layers": str(state.get("gpu_layers", "")).strip(),
+        "threads": str(state.get("threads", "")).strip(),
+        "kv_cache_k": str(state.get("kv_cache_k", "")).strip(),
+        "kv_cache_v": str(state.get("kv_cache_v", "")).strip(),
+    }
+    if overrides:
+        source.update({key: str(value).strip() for key, value in overrides.items()})
+
+    if source.get("ctx") and source["ctx"].lower() != "auto":
+        profile["ctx"] = source["ctx"]
+
+    gpu_input = source.get("gpu_layers", "auto") or "auto"
+    threads_input = source.get("threads", "auto") or "auto"
+    resolved_gpu_layers, resolved_threads = resolve_auto_runtime_settings(model, "auto", threads_input)
+    if gpu_input.lower() in {"auto", "-1"}:
+        profile["gpu_layers"] = "-1"
+    else:
+        profile["gpu_layers"] = gpu_input
+    profile["threads"] = resolved_threads or profile["threads"]
+
+    if source.get("kv_cache_k"):
+        profile["kv_cache_k"] = source["kv_cache_k"]
+    if source.get("kv_cache_v"):
+        profile["kv_cache_v"] = source["kv_cache_v"]
+
+    return profile
 
 
 def _sync_special_provider_state(slug: str, profile: dict[str, str]) -> None:
@@ -311,6 +511,74 @@ def _resolve_chat_runtime(provider_slug: str, model_override: str, base_url_over
     return spec, model, base_url, api_key
 
 
+def _run_local_llama_cli(prompt: str, system_prompt: str, requested_model: str, runtime_overrides: dict[str, str] | None = None) -> str:
+    llama_cli = str(state.get("llama_cli", "")).strip()
+    if not llama_cli or not Path(llama_cli).is_file():
+        raise ValueError("Local llama.cpp runtime is not configured. Run `valora setup --llama.cpp`.")
+
+    model = _pick_local_model(requested_model)
+    if model is None:
+        raise ValueError("No local GGUF model is available. Download one with `valora get <huggingface-repo>`.")
+
+    runtime_profile = _resolved_local_runtime_profile(model, runtime_overrides)
+    resolved_gpu_layers = runtime_profile["gpu_layers"]
+    resolved_threads = runtime_profile["threads"]
+    ctx_len = runtime_profile["ctx"]
+    final_prompt = prompt.strip()
+    if system_prompt.strip():
+        final_prompt = f"System: {system_prompt.strip()}\n\nUser: {prompt.strip()}\nAssistant:"
+
+    command = [
+        llama_cli,
+        "-m",
+        str(model.path),
+        "-c",
+        ctx_len,
+        "-n",
+        "512",
+        "-p",
+        final_prompt,
+    ]
+    if resolved_threads.strip():
+        command.extend(["-t", resolved_threads.strip()])
+    normalized_gpu_layers = resolved_gpu_layers.strip().lower()
+    if normalized_gpu_layers == "auto":
+        normalized_gpu_layers = "-1"
+    if normalized_gpu_layers:
+        command.extend(["-ngl", normalized_gpu_layers])
+    if runtime_profile["kv_cache_k"].strip():
+        command.extend(["--cache-type-k", runtime_profile["kv_cache_k"].strip()])
+    if runtime_profile["kv_cache_v"].strip():
+        command.extend(["--cache-type-v", runtime_profile["kv_cache_v"].strip()])
+    if model.projector:
+        command.extend(["--mmproj", model.projector])
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "Unknown llama.cpp error."
+        raise ValueError(stderr)
+
+    output = result.stdout.strip()
+    if not output:
+        raise ValueError("Local model returned an empty response.")
+    return output
+
+
+def _pick_fallback_chat_provider() -> tuple[str, str]:
+    ready, reason = _local_chat_ready()
+    if ready:
+        return "valora-local", ""
+    return "", reason
+
+
 def _chat_openai_compatible(base_url: str, api_key: str, model: str, prompt: str, system_prompt: str) -> str:
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -353,67 +621,337 @@ def _chat_gemini(base_url: str, api_key: str, model: str, prompt: str, system_pr
 
 
 def _run_chat(provider_slug: str, model_override: str, base_url_override: str, prompt: str, system_prompt: str) -> str:
+    if provider_slug == "valora-local":
+        return _run_local_llama_cli(prompt, system_prompt, model_override)
     spec, model, base_url, api_key = _resolve_chat_runtime(provider_slug, model_override, base_url_override)
     if spec.protocol == "gemini":
         return _chat_gemini(base_url, api_key, model, prompt, system_prompt)
     return _chat_openai_compatible(base_url, api_key, model, prompt, system_prompt)
 
 
-def _chat_transcript_panel(transcript: list[tuple[str, str]]) -> Panel:
-    body = Text()
-    if not transcript:
-        body.append("Welcome back!\n\n", style="bold white")
-        body.append("Start typing to chat with your selected model.\n", style="white")
-        body.append("Use /help to see slash commands.\n", style="dim")
+def _hero_panel(left: Text, right: Text, title: str) -> Panel:
+    return Panel(Columns([left, right], expand=True), title=title, border_style="red")
+
+
+def _command_matches(user_input: str, command_help: dict[str, str]) -> list[tuple[str, str]]:
+    if not user_input.startswith("/"):
+        return []
+    typed = user_input.lower()
+    matches = [
+        (command, description)
+        for command, description in command_help.items()
+        if command.startswith(typed)
+    ]
+    if matches:
+        return matches[:6]
+    return list(command_help.items())[:6]
+
+
+def _filter_choice_matches(query: str, choices: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    lowered = query.strip().lower()
+    if not lowered:
+        return choices[:8]
+    exact: list[tuple[str, str]] = []
+    fuzzy: list[tuple[str, str]] = []
+    for label, description in choices:
+        haystack = f"{label} {description}".lower()
+        if label.lower() == lowered:
+            exact.append((label, description))
+        elif lowered in haystack:
+            fuzzy.append((label, description))
+    return (exact + fuzzy)[:8]
+
+
+def _print_input_area(
+    user_input: str,
+    command_help: dict[str, str],
+    floating_items: list[tuple[str, str]] | None = None,
+    prompt_prefix: str = "> ",
+) -> None:
+    console.print(Rule(style="white"))
+    matches = floating_items if floating_items is not None else _command_matches(user_input, command_help)
+    if matches:
+        for command, description in matches:
+            console.print(f"[bold bright_blue]{command}[/bold bright_blue]  {description}")
+        console.print(Rule(style="white"))
+    console.print(f"{prompt_prefix}{user_input}", style="bold white", end="")
+    console.print()
+    if not matches:
+        console.print("[dim]? for shortcuts[/dim]")
+
+
+def _interactive_prompt(render_screen, command_help: dict[str, str]) -> str:
+    buffer = ""
+    while True:
+        render_screen(buffer, _command_matches(buffer, command_help))
+        key = readchar.readkey()
+        if key in {readchar.key.ENTER, readchar.key.CR, "\n", "\r"}:
+            return buffer.strip()
+        if key in {readchar.key.CTRL_C, readchar.key.CTRL_D}:
+            raise typer.Exit(code=0)
+        if key in {readchar.key.BACKSPACE, readchar.key.DELETE}:
+            buffer = buffer[:-1]
+            continue
+        if key == readchar.key.ESC:
+            continue
+        if len(key) == 1 and key.isprintable():
+            buffer += key
+
+
+def _interactive_choice_prompt(render_screen, choices: list[tuple[str, str]]) -> tuple[str, str] | None:
+    buffer = ""
+    while True:
+        matches = _filter_choice_matches(buffer, choices)
+        render_screen(buffer, matches)
+        key = readchar.readkey()
+        if key in {readchar.key.ENTER, readchar.key.CR, "\n", "\r"}:
+            if not matches:
+                return None
+            lowered = buffer.strip().lower()
+            for label, description in matches:
+                if label.lower() == lowered:
+                    return label, description
+            return matches[0]
+        if key in {readchar.key.CTRL_C, readchar.key.CTRL_D}:
+            raise typer.Exit(code=0)
+        if key in {readchar.key.BACKSPACE, readchar.key.DELETE}:
+            buffer = buffer[:-1]
+            continue
+        if key == readchar.key.ESC:
+            return None
+        if len(key) == 1 and key.isprintable():
+            buffer += key
+
+
+def _shorten_line(text: str, limit: int = 92) -> str:
+    cleaned = " ".join(text.strip().split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _new_tool_event(kind: str, label: str, detail: str = "") -> dict[str, str]:
+    return {
+        "kind": kind,
+        "label": label,
+        "detail": detail,
+        "status": "running",
+        "spinner": SPINNER_FRAMES[0],
+    }
+
+
+def _render_tool_events(tool_events: list[dict[str, str]]) -> None:
+    if not tool_events:
+        return
+    for event in tool_events[-6:]:
+        status = event.get("status", "done")
+        if status == "running":
+            prefix = f"[bold yellow]{event.get('spinner', SPINNER_FRAMES[0])}[/bold yellow]"
+        elif status == "done":
+            prefix = "[bold green]●[/bold green]"
+        else:
+            prefix = "[bold red]●[/bold red]"
+        console.print(f"{prefix} {event.get('label', '')}")
+        detail = str(event.get("detail", "")).strip()
+        if detail:
+            for line in detail.splitlines()[:4]:
+                console.print(f"  [dim]{_shorten_line(line)}[/dim]")
+        console.print()
+
+
+def _run_tool_with_animation(
+    tool_events: list[dict[str, str]],
+    label: str,
+    detail: str,
+    action,
+    render_frame,
+):
+    event = _new_tool_event("tool", label, detail)
+    tool_events.append(event)
+    result_box: dict[str, object] = {"value": None, "error": None}
+
+    def worker() -> None:
+        try:
+            result_box["value"] = action()
+        except Exception as exc:  # noqa: BLE001
+            result_box["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    frame_index = 0
+    while thread.is_alive():
+        event["spinner"] = SPINNER_FRAMES[frame_index % len(SPINNER_FRAMES)]
+        render_frame(tool_events)
+        time.sleep(0.12)
+        frame_index += 1
+    thread.join()
+
+    error = result_box["error"]
+    if error is not None:
+        event["status"] = "error"
+        event["detail"] = str(error)
+        render_frame(tool_events)
+        raise error
+
+    value = result_box["value"]
+    if isinstance(value, tuple) and len(value) == 2:
+        summary, transcript_note = value
     else:
-        for role, content in transcript[-10:]:
-            style = "bold cyan" if role == "You" else "bold green"
-            body.append(f"{role}\n", style=style)
-            body.append(f"{content.strip()}\n\n", style="white")
-    return Panel(body, title="Valora Chat", border_style="red")
+        summary = str(value) if value is not None else ""
+        transcript_note = summary
+    event["status"] = "done"
+    event["detail"] = summary
+    render_frame(tool_events)
+    return summary, str(transcript_note).strip()
 
 
-def _chat_home_panel(provider_slug: str, model_name: str, system_prompt: str, status: str) -> Columns:
-    provider_label = provider_slug or "Not configured"
+def _parse_bar_args(raw: str, expected_parts: int) -> list[str] | None:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) != expected_parts or not all(parts):
+        return None
+    return parts
+
+
+def _tool_web_search(query: str) -> tuple[str, str]:
+    api_key = str(state.get("mcp_serpapi_api_key", "")).strip()
+    if not api_key:
+        raise ValueError("Configure SerpApi first with `valora api --provider serpapi --api-key YOUR_SERPAPI_KEY`.")
+    response = httpx.get(
+        "https://serpapi.com/search.json",
+        params={"engine": "google", "q": query, "api_key": api_key, "num": 5},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    data = response.json()
+    results = data.get("organic_results", [])[:5]
+    if not results:
+        return ("No web results found.", "Web search returned no results.")
+
+    lines: list[str] = []
+    markdown_lines: list[str] = [f"# Web search: {query}", ""]
+    for index, item in enumerate(results, start=1):
+        title = str(item.get("title", "Untitled result")).strip()
+        link = str(item.get("link", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
+        lines.append(f'{index}. {title}')
+        if link:
+            lines.append(link)
+        if snippet:
+            lines.append(snippet)
+        markdown_lines.append(f"## {index}. {title}")
+        if link:
+            markdown_lines.append(link)
+        if snippet:
+            markdown_lines.append(snippet)
+        markdown_lines.append("")
+    return ("\n".join(lines[:9]), "\n".join(markdown_lines).strip())
+
+
+def _tool_read_file(path_arg: str, session_root: Path, allowed_dirs: set[Path]) -> tuple[str, str]:
+    path = _resolve_scoped_path(path_arg, session_root, allowed_dirs, "read")
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    content = path.read_text(encoding="utf-8", errors="replace")
+    preview = content[:2000].strip()
+    summary = f"Read {path.name}\n{preview}"
+    return summary, f"Read `{path}`\n\n{preview}"
+
+
+def _tool_write_file(path_arg: str, content: str, session_root: Path, allowed_dirs: set[Path]) -> tuple[str, str]:
+    path = _resolve_scoped_path(path_arg, session_root, allowed_dirs, "write")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    line_count = len(content.splitlines()) or 1
+    summary = f"Wrote {line_count} line(s) to {path.name}"
+    return summary, f"Wrote `{path}` with {line_count} line(s)."
+
+
+def _tool_edit_file(path_arg: str, find_text: str, replace_text: str, session_root: Path, allowed_dirs: set[Path]) -> tuple[str, str]:
+    path = _resolve_scoped_path(path_arg, session_root, allowed_dirs, "edit")
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    content = path.read_text(encoding="utf-8", errors="replace")
+    if find_text not in content:
+        raise ValueError(f"Text not found in {path.name}.")
+    updated = content.replace(find_text, replace_text)
+    count = content.count(find_text)
+    path.write_text(updated, encoding="utf-8")
+    summary = f"Edited {path.name}\nReplaced {count} occurrence(s)."
+    return summary, f"Edited `{path}` and replaced {count} occurrence(s)."
+
+
+def _tool_make_dir(path_arg: str, session_root: Path) -> tuple[str, str]:
+    path = _resolve_main_dir_path(path_arg, session_root, "create")
+    path.mkdir(parents=True, exist_ok=True)
+    summary = f"Created folder {path.name}"
+    return summary, f"Created folder `{path}`."
+
+
+def _tool_delete_path(path_arg: str, session_root: Path) -> tuple[str, str]:
+    path = _resolve_main_dir_path(path_arg, session_root, "delete")
+    if not path.exists():
+        raise ValueError(f"Path not found: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+        summary = f"Deleted folder {path.name}"
+        return summary, f"Deleted folder `{path}`."
+    path.unlink()
+    summary = f"Deleted file {path.name}"
+    return summary, f"Deleted file `{path}`."
+
+
+def _render_transcript(transcript: list[tuple[str, str]]) -> None:
+    if not transcript:
+        console.print("Welcome back!\n", style="bold white")
+        console.print("Start typing to chat with your selected model.", style="white")
+        console.print("Use /help to see slash commands.\n", style="dim")
+        return
+
+    for role, content in transcript[-10:]:
+        style = "bold cyan" if role == "You" else "bold green" if role == "Assistant" else "bold yellow"
+        console.print(role, style=style)
+        console.print(content.strip())
+        console.print()
+
+
+def _build_local_setup_panel(model_name: str, runtime_profile: dict[str, str], status: str) -> Panel:
     left = Text()
-    left.append("VALORA\n", style="bold red")
-    left.append("Local + cloud model chat\n\n", style="white")
-    left.append(f"Provider: {provider_label}\n", style="white")
-    left.append(f"Model: {model_name or 'Not configured'}\n", style="white")
-    left.append(f"Context: {_get_ctx_len()}\n", style="white")
-    left.append(f"Folder: {_preferred_models_dir()}\n", style="dim")
-    if system_prompt.strip():
-        left.append("\nSystem prompt active\n", style="yellow")
+    left.append("Welcome back!\n\n", style="bold white")
+    left.append(f"{model_name or 'No model selected'}\n", style="white")
+    left.append(f"ctx {runtime_profile['ctx']}  ", style="dim")
+    gpu_label = runtime_profile["gpu_layers"]
+    if gpu_label == "-1":
+        gpu_label = "auto"
+    left.append(f"gpu {gpu_label}  ", style="dim")
+    left.append(f"thr {runtime_profile['threads']}\n", style="dim")
+    left.append(f"k {runtime_profile['kv_cache_k']}  v {runtime_profile['kv_cache_v']}\n", style="dim")
+    left.append(f"{_preferred_models_dir()}", style="dim")
 
     right = Text()
-    right.append("Slash Commands\n", style="bold red")
-    right.append("/help", style="bold white")
-    right.append("  show commands\n", style="white")
-    right.append("/provider NAME", style="bold white")
-    right.append("  switch backend\n", style="white")
-    right.append("/model NAME", style="bold white")
-    right.append("  switch model\n", style="white")
-    right.append("/system TEXT", style="bold white")
-    right.append("  set system prompt\n", style="white")
-    right.append("/clear", style="bold white")
-    right.append("  clear transcript\n", style="white")
-    right.append("/api", style="bold white")
-    right.append("  show API table\n", style="white")
-    right.append("/save", style="bold white")
-    right.append("  save current chat default\n", style="white")
-    right.append("/exit", style="bold white")
-    right.append("  leave chat\n", style="white")
+    right.append("Tips for getting started\n", style="bold red")
+    right.append("Tune the local runtime, then run /start\n", style="white")
+    right.append("Use /model to switch local models\n", style="white")
+    right.append("Use /auto to restore best defaults\n", style="white")
+    right.append("Supported KV: f16, q8_0, q4_0, q4_1\n", style="dim")
     if status.strip():
-        right.append("\nStatus\n", style="bold red")
+        right.append("\nRecent activity\n", style="bold red")
         right.append(status, style="white")
 
-    return Columns(
-        [
-            Panel(left, border_style="red", title="Session"),
-            Panel(right, border_style="red", title="Controls"),
-        ],
-        expand=True,
-    )
+    return _hero_panel(left, right, f"Valora Chat v{__version__}")
+
+
+def _render_local_setup_ui(
+    model_name: str,
+    runtime_profile: dict[str, str],
+    status: str,
+    user_input: str = "",
+    floating_items: list[tuple[str, str]] | None = None,
+    prompt_prefix: str = "> ",
+) -> None:
+    console.clear()
+    console.print(_build_local_setup_panel(model_name, runtime_profile, status))
+    console.print()
+    _print_input_area(user_input, LOCAL_SETUP_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
 
 
 def _render_chat_ui(
@@ -422,17 +960,142 @@ def _render_chat_ui(
     system_prompt: str,
     transcript: list[tuple[str, str]],
     status: str,
+    local_runtime_profile: dict[str, str] | None = None,
+    user_input: str = "",
+    floating_items: list[tuple[str, str]] | None = None,
+    prompt_prefix: str = "> ",
+    tool_events: list[dict[str, str]] | None = None,
 ) -> None:
     console.clear()
-    console.print(f"[bold red]Valora Chat[/bold red]  [dim]Provider:[/dim] {provider_slug}  [dim]Model:[/dim] {model_name or '-'}")
-    console.print(_chat_home_panel(provider_slug, model_name, system_prompt, status))
-    console.print(_chat_transcript_panel(transcript))
-    console.print("[dim]Type a message or use /help. /exit closes chat.[/dim]")
+    left = Text()
+    left.append("Welcome back!\n\n", style="bold white")
+    left.append(f"{model_name or 'No model selected'}\n", style="white")
+    left.append(f"{provider_slug}", style="dim")
+    if provider_slug == "valora-local" and local_runtime_profile is not None:
+        left.append(
+            f"\nctx {local_runtime_profile['ctx']}  gpu {local_runtime_profile['gpu_layers']}  thr {local_runtime_profile['threads']}",
+            style="dim",
+        )
+
+    right = Text()
+    right.append("Tips for getting started\n", style="bold red")
+    right.append("Use /help to view slash commands\n", style="white")
+    right.append("Use /model to switch models\n", style="white")
+    right.append("Use /provider to change backend\n", style="white")
+    if status.strip():
+        right.append("\nRecent activity\n", style="bold red")
+        right.append(status, style="white")
+
+    console.print(_hero_panel(left, right, f"Valora Chat v{__version__}"))
+    console.print()
+    console.print(Rule(style="white"))
+    _render_tool_events(tool_events or [])
+    _render_transcript(transcript)
+    _print_input_area(user_input, CHAT_COMMAND_HELP, floating_items=floating_items, prompt_prefix=prompt_prefix)
 
 
 def _chat_help_text() -> str:
     return (
-        "/help, /provider NAME, /model NAME, /system TEXT, /clear, /api, /save, /exit"
+        "/help, /models, /allow-dir PATH, /web QUERY, /read PATH, /write PATH | CONTENT, /edit PATH | FIND | REPLACE, /mkdir PATH, /delete PATH, /provider NAME, /model NAME, /system TEXT, /ctx N, /gpu-layers N|-1|auto, /threads N|auto, /kv-k f16|q8_0|q4_0|q4_1, /kv-v f16|q8_0|q4_0|q4_1, /auto, /clear, /api, /save, /exit"
+    )
+
+
+def _local_model_short_name(model: ModelInfo) -> str:
+    return model.path.stem
+
+
+def _saved_cloud_model_choices() -> list[tuple[str, str, str]]:
+    choices: list[tuple[str, str, str]] = []
+    for spec in PROVIDERS.values():
+        if not spec.supports_chat or spec.slug == "valora-local":
+            continue
+        configured_model = _provider_model(spec.slug)
+        if not configured_model.strip():
+            continue
+        label = configured_model.strip()
+        description = f"{spec.slug} cloud"
+        choices.append((label, description, spec.slug))
+    return choices
+
+
+def _chat_model_picker_choices() -> tuple[list[tuple[str, str]], dict[str, tuple[str, str]]]:
+    choices: list[tuple[str, str]] = []
+    mapping: dict[str, tuple[str, str]] = {}
+
+    for model in _local_models():
+        short_name = _local_model_short_name(model)
+        description = "local gguf"
+        choices.append((short_name, description))
+        mapping[short_name.lower()] = ("valora-local", model.name)
+
+    for label, description, provider_slug in _saved_cloud_model_choices():
+        dedupe_label = label
+        if dedupe_label.lower() in mapping:
+            dedupe_label = f"{label} [{provider_slug}]"
+        choices.append((dedupe_label, description))
+        mapping[dedupe_label.lower()] = (provider_slug, label)
+
+    return choices, mapping
+
+
+def _build_chat_launch_command(
+    provider_slug: str,
+    model_name: str,
+    system_prompt: str,
+    local_runtime_overrides: dict[str, str],
+) -> list[str]:
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "chat"]
+    else:
+        command = [sys.executable, "-m", "valora", "chat"]
+
+    command.extend(
+        [
+            "--provider",
+            provider_slug,
+            "--model",
+            model_name,
+            "--launch-chat",
+        ]
+    )
+    if system_prompt.strip():
+        command.extend(["--system-override", system_prompt.strip()])
+    for option_name, key in (
+        ("--ctx-override", "ctx"),
+        ("--gpu-layers-override", "gpu_layers"),
+        ("--threads-override", "threads"),
+        ("--kv-k-override", "kv_cache_k"),
+        ("--kv-v-override", "kv_cache_v"),
+    ):
+        value = local_runtime_overrides.get(key, "").strip()
+        if value:
+            command.extend([option_name, value])
+    return command
+
+
+def _start_chat_in_new_terminal(
+    provider_slug: str,
+    model_name: str,
+    system_prompt: str,
+    local_runtime_overrides: dict[str, str],
+) -> None:
+    command = _build_chat_launch_command(provider_slug, model_name, system_prompt, local_runtime_overrides)
+    command_line = subprocess.list2cmdline(command)
+    powershell_command = f"& {command_line}"
+    child_env = os.environ.copy()
+    child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    child_env.pop("PYTHONHOME", None)
+    child_env.pop("PYTHONPATH", None)
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoExit",
+            "-Command",
+            powershell_command,
+        ],
+        cwd=os.getcwd(),
+        env=child_env,
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
     )
 
 
@@ -666,18 +1329,46 @@ def register_other_commands(app: typer.Typer) -> None:
         model: str = typer.Option("", "--model", help="Override the configured model for this chat request."),
         base_url: str = typer.Option("", "--base-url", help="Override the configured base URL for this chat request."),
         system: str = typer.Option("", "--system", help="Optional system prompt."),
+        launch_chat: bool = typer.Option(False, "--launch-chat", hidden=True),
+        ctx_override: str = typer.Option("", "--ctx-override", hidden=True),
+        gpu_layers_override: str = typer.Option("", "--gpu-layers-override", hidden=True),
+        threads_override: str = typer.Option("", "--threads-override", hidden=True),
+        kv_k_override: str = typer.Option("", "--kv-k-override", hidden=True),
+        kv_v_override: str = typer.Option("", "--kv-v-override", hidden=True),
+        system_override: str = typer.Option("", "--system-override", hidden=True),
     ) -> None:
         load_config()
         provider_slug = provider.strip() or str(state.get("chat_provider", "")).strip()
         if not provider_slug:
-            console.print("[bold red]Error:[/bold red] No default chat provider is configured.")
-            console.print("Set one with: [bold]valora api --provider ... --model ... --use-for-chat[/bold]")
-            raise typer.Exit(code=2)
+            fallback_provider, fallback_reason = _pick_fallback_chat_provider()
+            if fallback_provider:
+                provider_slug = fallback_provider
+            else:
+                console.print("[bold red]Error:[/bold red] No default chat provider is configured.")
+                console.print(fallback_reason)
+                console.print(
+                    "Or configure a cloud/local API with: [bold]valora api --provider ... --model ... --use-for-chat[/bold]"
+                )
+                raise typer.Exit(code=2)
+
+        if system_override.strip():
+            system = system_override.strip()
+
+        hidden_local_overrides = {
+            "ctx": ctx_override.strip(),
+            "gpu_layers": gpu_layers_override.strip(),
+            "threads": threads_override.strip(),
+            "kv_cache_k": kv_k_override.strip(),
+            "kv_cache_v": kv_v_override.strip(),
+        }
 
         if prompt.strip():
             user_message = prompt
             try:
-                reply = _run_chat(provider_slug, model, base_url, user_message, system)
+                if provider_slug == "valora-local":
+                    reply = _run_local_llama_cli(user_message, system, model, hidden_local_overrides)
+                else:
+                    reply = _run_chat(provider_slug, model, base_url, user_message, system)
             except httpx.HTTPError as exc:
                 console.print(f"[bold red]Error:[/bold red] Chat request failed: {exc}")
                 raise typer.Exit(code=2)
@@ -689,14 +1380,200 @@ def register_other_commands(app: typer.Typer) -> None:
 
         session_provider = provider_slug
         session_model = model.strip() or _provider_model(session_provider) or str(state.get("chat_model", "")).strip()
+        session_root = _normalize_path(Path.cwd())
+        allowed_dirs: set[Path] = {session_root}
+        if session_provider == "valora-local" and not session_model:
+            local_model = _pick_local_model()
+            session_model = local_model.name if local_model else ""
         session_base_url = base_url.strip()
         session_system = system.strip()
+        saved_local_default = (
+            str(state.get("chat_provider", "")).strip() == "valora-local"
+            and bool(str(state.get("chat_model", "")).strip())
+        )
+        local_runtime_overrides = {
+            "ctx": hidden_local_overrides["ctx"] or str(state.get("ctx", "4096")).strip(),
+            "gpu_layers": hidden_local_overrides["gpu_layers"] or str(state.get("gpu_layers", "auto")).strip(),
+            "threads": hidden_local_overrides["threads"] or str(state.get("threads", "auto")).strip(),
+            "kv_cache_k": hidden_local_overrides["kv_cache_k"] or str(state.get("kv_cache_k", "f16")).strip(),
+            "kv_cache_v": hidden_local_overrides["kv_cache_v"] or str(state.get("kv_cache_v", "f16")).strip(),
+        }
+
+        if session_provider == "valora-local" and not launch_chat and not saved_local_default:
+            local_model = _pick_local_model(session_model)
+            if local_model is None:
+                console.print("[bold red]Error:[/bold red] No local GGUF model is available.")
+                console.print("Download one with: [bold]valora get <huggingface-repo>[/bold]")
+                raise typer.Exit(code=2)
+
+            status_message = "Tune local settings, then use /start to launch chat."
+            while True:
+                runtime_profile = _resolved_local_runtime_profile(local_model, local_runtime_overrides)
+                user_message = _interactive_prompt(
+                    lambda current_input, _matches: _render_local_setup_ui(
+                        local_model.name,
+                        runtime_profile,
+                        status_message,
+                        current_input,
+                    ),
+                    LOCAL_SETUP_COMMAND_HELP,
+                )
+                if not user_message:
+                    continue
+                if user_message.lower() == ".start":
+                    user_message = "/start"
+                if user_message.lower() in {"exit", "quit", "/exit", "/quit"}:
+                    raise typer.Exit(code=0)
+                if not user_message.startswith("/"):
+                    status_message = "Use /start to launch chat after reviewing the configuration."
+                    continue
+
+                command, _, arg = user_message[1:].partition(" ")
+                command = command.strip().lower()
+                arg = arg.strip()
+
+                if command in {"help", "?"}:
+                    status_message = "/ctx N, /gpu-layers N|-1|auto, /threads N|auto, /kv-k f16|q8_0|q4_0|q4_1, /kv-v f16|q8_0|q4_0|q4_1, /auto, /model NAME, /save, /start, /exit"
+                    continue
+                if command == "models":
+                    choices, mapping = _chat_model_picker_choices()
+                    local_choices = [(label, description) for label, description in choices if description == "local gguf"]
+                    if not local_choices:
+                        status_message = "No local models are available."
+                        continue
+                    picked = _interactive_choice_prompt(
+                        lambda query, matches: _render_local_setup_ui(
+                            local_model.name,
+                            runtime_profile,
+                            "Search local models and press Enter.",
+                            f"/models {query}".strip(),
+                            floating_items=matches,
+                        ),
+                        local_choices,
+                    )
+                    if picked is None:
+                        status_message = "Model search cancelled."
+                        continue
+                    target = mapping.get(picked[0].lower())
+                    if target is None:
+                        status_message = "Model selection failed."
+                        continue
+                    picked_model = _pick_local_model(target[1])
+                    if picked_model is None:
+                        status_message = f"Local model not found: {picked[0]}"
+                        continue
+                    local_model = picked_model
+                    session_model = picked_model.name
+                    state["selected_model"] = picked_model.name
+                    state["model_loaded"] = True
+                    save_config()
+                    status_message = f"Using local model {picked[0]}."
+                    continue
+                if command == "auto":
+                    local_runtime_overrides = {
+                        "ctx": "auto",
+                        "gpu_layers": "auto",
+                        "threads": "auto",
+                        "kv_cache_k": "f16",
+                        "kv_cache_v": "f16",
+                    }
+                    status_message = "Restored the best automatic local configuration."
+                    continue
+                if command == "ctx":
+                    status_message = f"Current context: {runtime_profile['ctx']}" if not arg else f"Context set to {arg}."
+                    if arg:
+                        local_runtime_overrides["ctx"] = arg
+                    continue
+                if command == "gpu-layers":
+                    status_message = f"Current GPU layers: {runtime_profile['gpu_layers']}" if not arg else f"GPU layers set to {arg}."
+                    if arg:
+                        local_runtime_overrides["gpu_layers"] = arg
+                    continue
+                if command == "threads":
+                    status_message = f"Current threads: {runtime_profile['threads']}" if not arg else f"Threads set to {arg}."
+                    if arg:
+                        local_runtime_overrides["threads"] = arg
+                    continue
+                if command == "kv-k":
+                    if not arg:
+                        status_message = f"Current KV cache K: {runtime_profile['kv_cache_k']}"
+                        continue
+                    lowered = arg.lower()
+                    if lowered not in LOCAL_KV_CACHE_CHOICES:
+                        status_message = "KV cache K must be one of: " + ", ".join(LOCAL_KV_CACHE_CHOICES)
+                        continue
+                    local_runtime_overrides["kv_cache_k"] = lowered
+                    status_message = f"KV cache K set to {lowered}."
+                    continue
+                if command == "kv-v":
+                    if not arg:
+                        status_message = f"Current KV cache V: {runtime_profile['kv_cache_v']}"
+                        continue
+                    lowered = arg.lower()
+                    if lowered not in LOCAL_KV_CACHE_CHOICES:
+                        status_message = "KV cache V must be one of: " + ", ".join(LOCAL_KV_CACHE_CHOICES)
+                        continue
+                    local_runtime_overrides["kv_cache_v"] = lowered
+                    status_message = f"KV cache V set to {lowered}."
+                    continue
+                if command == "model":
+                    if not arg:
+                        status_message = f"Current model: {local_model.name}"
+                        continue
+                    picked = _pick_local_model(arg)
+                    if picked is None:
+                        status_message = f"Local model not found: {arg}"
+                        continue
+                    local_model = picked
+                    session_model = picked.name
+                    state["selected_model"] = picked.name
+                    state["model_loaded"] = True
+                    save_config()
+                    status_message = f"Using local model {_local_model_short_name(picked)}."
+                    continue
+                if command == "save":
+                    state["chat_provider"] = "valora-local"
+                    state["chat_model"] = local_model.name
+                    state["ctx"] = local_runtime_overrides.get("ctx", state["ctx"])
+                    state["gpu_layers"] = local_runtime_overrides.get("gpu_layers", state["gpu_layers"])
+                    state["threads"] = local_runtime_overrides.get("threads", state["threads"])
+                    state["kv_cache_k"] = local_runtime_overrides.get("kv_cache_k", state["kv_cache_k"])
+                    state["kv_cache_v"] = local_runtime_overrides.get("kv_cache_v", state["kv_cache_v"])
+                    save_config()
+                    status_message = "Saved local chat settings."
+                    continue
+                if command == "start":
+                    state["selected_model"] = local_model.name
+                    save_config()
+                    _start_chat_in_new_terminal("valora-local", local_model.name, session_system, local_runtime_overrides)
+                    console.print("[green]Launched local chat in a new terminal.[/green]")
+                    raise typer.Exit(code=0)
+
+                status_message = f"Unknown command: /{command}"
+
         transcript: list[tuple[str, str]] = []
-        status_message = "Ready."
+        tool_events: list[dict[str, str]] = []
+        status_message = "Using local llama.cpp model." if session_provider == "valora-local" else "Ready."
 
         while True:
-            _render_chat_ui(session_provider, session_model, session_system, transcript, status_message)
-            user_message = typer.prompt(">").strip()
+            local_runtime_profile = None
+            if session_provider == "valora-local":
+                local_model = _pick_local_model(session_model)
+                if local_model is not None:
+                    local_runtime_profile = _resolved_local_runtime_profile(local_model, local_runtime_overrides)
+            user_message = _interactive_prompt(
+                lambda current_input, _matches: _render_chat_ui(
+                    session_provider,
+                    session_model,
+                    session_system,
+                    transcript,
+                    status_message,
+                    local_runtime_profile,
+                    current_input,
+                    tool_events=tool_events,
+                ),
+                CHAT_COMMAND_HELP,
+            )
             if user_message.lower() in {"exit", "quit"}:
                 break
             if not user_message:
@@ -711,9 +1588,259 @@ def register_other_commands(app: typer.Typer) -> None:
                 if command in {"help", "?"}:
                     status_message = _chat_help_text()
                     continue
+                if command == "allow-dir":
+                    if not arg:
+                        extras = [str(path) for path in sorted(allowed_dirs) if path != session_root]
+                        status_message = (
+                            f"Current tool scope: {session_root}"
+                            if not extras
+                            else f"Current tool scope: {session_root} | Extra: {', '.join(extras)}"
+                        )
+                        continue
+                    raw_candidate = Path(arg).expanduser()
+                    if not raw_candidate.is_absolute():
+                        raw_candidate = session_root / raw_candidate
+                    candidate = _normalize_path(raw_candidate)
+                    for protected in _protected_roots():
+                        if _is_relative_to(candidate, protected) or candidate == protected:
+                            status_message = f"Access is blocked for protected system paths like {protected}."
+                            break
+                    else:
+                        allowed_dirs.add(candidate)
+                        status_message = f"Approved extra directory: {candidate}"
+                    continue
+                if command == "web":
+                    if not arg:
+                        status_message = "Usage: /web your search query"
+                        continue
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f'Web Search("{arg}")',
+                            "Searching the web with SerpApi",
+                            lambda: _tool_web_search(arg),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Running web search...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except (httpx.HTTPError, ValueError) as exc:
+                        transcript.append(("Tool", f"Web Search failed: {exc}"))
+                        status_message = "Web search failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Web search completed."
+                    continue
+                if command == "read":
+                    if not arg:
+                        status_message = "Usage: /read path/to/file"
+                        continue
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f"Read({arg})",
+                            "Reading local file",
+                            lambda: _tool_read_file(arg, session_root, allowed_dirs),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Reading file...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except ValueError as exc:
+                        transcript.append(("Tool", f"Read failed: {exc}"))
+                        status_message = "Read failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Read completed."
+                    continue
+                if command == "write":
+                    parts = _parse_bar_args(arg, 2)
+                    if parts is None:
+                        status_message = "Usage: /write path/to/file | content"
+                        continue
+                    target_path, content = parts
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f"Write({target_path})",
+                            "Creating or replacing file contents",
+                            lambda: _tool_write_file(target_path, content, session_root, allowed_dirs),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Writing file...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except ValueError as exc:
+                        transcript.append(("Tool", f"Write failed: {exc}"))
+                        status_message = "Write failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Write completed."
+                    continue
+                if command == "edit":
+                    parts = _parse_bar_args(arg, 3)
+                    if parts is None:
+                        status_message = "Usage: /edit path/to/file | find text | replace text"
+                        continue
+                    target_path, find_text, replace_text = parts
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f"Edit({target_path})",
+                            "Applying text replacement",
+                            lambda: _tool_edit_file(target_path, find_text, replace_text, session_root, allowed_dirs),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Editing file...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except ValueError as exc:
+                        transcript.append(("Tool", f"Edit failed: {exc}"))
+                        status_message = "Edit failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Edit completed."
+                    continue
+                if command == "mkdir":
+                    if not arg:
+                        status_message = "Usage: /mkdir folder/path"
+                        continue
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f"Create Folder({arg})",
+                            "Creating folder in the main chat directory",
+                            lambda: _tool_make_dir(arg, session_root),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Creating folder...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except ValueError as exc:
+                        transcript.append(("Tool", f"Create folder failed: {exc}"))
+                        status_message = "Create folder failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Folder created."
+                    continue
+                if command in {"delete", "del", "rm", "remove"}:
+                    if not arg:
+                        status_message = "Usage: /delete file-or-folder"
+                        continue
+                    try:
+                        _summary, transcript_note = _run_tool_with_animation(
+                            tool_events,
+                            f"Delete({arg})",
+                            "Deleting from the main chat directory",
+                            lambda: _tool_delete_path(arg, session_root),
+                            lambda current_events: _render_chat_ui(
+                                session_provider,
+                                session_model,
+                                session_system,
+                                transcript,
+                                "Deleting path...",
+                                local_runtime_profile,
+                                "",
+                                tool_events=current_events,
+                            ),
+                        )
+                    except ValueError as exc:
+                        transcript.append(("Tool", f"Delete failed: {exc}"))
+                        status_message = "Delete failed."
+                        continue
+                    transcript.append(("Tool", transcript_note))
+                    status_message = "Delete completed."
+                    continue
+                if command == "models":
+                    choices, mapping = _chat_model_picker_choices()
+                    if not choices:
+                        status_message = "No saved local or cloud models are available."
+                        continue
+                    picked = _interactive_choice_prompt(
+                        lambda query, matches: _render_chat_ui(
+                            session_provider,
+                            session_model,
+                            session_system,
+                            transcript,
+                            "Search models and press Enter.",
+                            local_runtime_profile,
+                            f"/models {query}".strip(),
+                            floating_items=matches,
+                            tool_events=tool_events,
+                        ),
+                        choices,
+                    )
+                    if picked is None:
+                        status_message = "Model search cancelled."
+                        continue
+                    target = mapping.get(picked[0].lower())
+                    if target is None:
+                        status_message = "Model selection failed."
+                        continue
+                    next_provider, next_model = target
+                    if next_provider == "valora-local":
+                        previous_model = session_model
+                        session_provider = "valora-local"
+                        session_model = next_model
+                        state["selected_model"] = next_model
+                        state["model_loaded"] = True
+                        save_config()
+                        previous_short = previous_model
+                        if previous_model:
+                            existing = _pick_local_model(previous_model)
+                            previous_short = _local_model_short_name(existing) if existing else previous_model
+                        status_message = f"Switched local model from {previous_short or 'none'} to {picked[0]}. Next reply will use the new GPU load."
+                    else:
+                        session_provider = next_provider
+                        session_model = next_model
+                        session_base_url = _provider_base_url(next_provider)
+                        state["model_loaded"] = False
+                        save_config()
+                        status_message = f"Using saved cloud model {picked[0]} via {next_provider}."
+                    continue
                 if command == "clear":
                     transcript.clear()
                     status_message = "Transcript cleared."
+                    continue
+                if command == "auto":
+                    local_runtime_overrides = {
+                        "ctx": "auto",
+                        "gpu_layers": "auto",
+                        "threads": "auto",
+                        "kv_cache_k": "f16",
+                        "kv_cache_v": "f16",
+                    }
+                    status_message = "Restored the best automatic local configuration."
                     continue
                 if command == "provider":
                     if not arg:
@@ -727,15 +1854,70 @@ def register_other_commands(app: typer.Typer) -> None:
                         continue
                     session_provider = spec.slug
                     session_model = _provider_model(session_provider) or session_model
+                    if session_provider == "valora-local" and not session_model:
+                        local_model = _pick_local_model()
+                        session_model = local_model.name if local_model else ""
+                        if local_model is not None:
+                            state["selected_model"] = local_model.name
+                            state["model_loaded"] = True
+                    elif session_provider != "valora-local":
+                        state["model_loaded"] = False
                     session_base_url = ""
+                    save_config()
                     status_message = f"Using provider {session_provider}."
                     continue
                 if command == "model":
                     if not arg:
                         status_message = f"Current model: {session_model or 'Not configured'}"
                         continue
+                    if session_provider == "valora-local":
+                        picked = _pick_local_model(arg)
+                        if picked is None:
+                            status_message = f"Local model not found: {arg}"
+                            continue
+                        session_model = picked.name
+                        state["selected_model"] = picked.name
+                        state["model_loaded"] = True
+                        save_config()
+                        status_message = f"Switched local model to {_local_model_short_name(picked)}."
+                        continue
                     session_model = arg
                     status_message = f"Using model {session_model}."
+                    continue
+                if command == "ctx":
+                    if not arg:
+                        status_message = f"Current context: {local_runtime_overrides.get('ctx', 'auto')}"
+                        continue
+                    local_runtime_overrides["ctx"] = arg
+                    status_message = f"Context set to {arg}."
+                    continue
+                if command == "gpu-layers":
+                    if not arg:
+                        status_message = f"Current GPU layers: {local_runtime_overrides.get('gpu_layers', 'auto')}"
+                        continue
+                    local_runtime_overrides["gpu_layers"] = arg
+                    status_message = f"GPU layers set to {arg}."
+                    continue
+                if command == "threads":
+                    if not arg:
+                        status_message = f"Current threads: {local_runtime_overrides.get('threads', 'auto')}"
+                        continue
+                    local_runtime_overrides["threads"] = arg
+                    status_message = f"Threads set to {arg}."
+                    continue
+                if command == "kv-k":
+                    if not arg:
+                        status_message = f"Current KV cache K: {local_runtime_overrides.get('kv_cache_k', 'f16')}"
+                        continue
+                    local_runtime_overrides["kv_cache_k"] = arg
+                    status_message = f"KV cache K set to {arg}."
+                    continue
+                if command == "kv-v":
+                    if not arg:
+                        status_message = f"Current KV cache V: {local_runtime_overrides.get('kv_cache_v', 'f16')}"
+                        continue
+                    local_runtime_overrides["kv_cache_v"] = arg
+                    status_message = f"KV cache V set to {arg}."
                     continue
                 if command == "system":
                     session_system = "" if arg.lower() in {"off", "clear", "none"} else arg
@@ -744,6 +1926,11 @@ def register_other_commands(app: typer.Typer) -> None:
                 if command == "save":
                     state["chat_provider"] = session_provider
                     state["chat_model"] = session_model
+                    state["ctx"] = local_runtime_overrides.get("ctx", state["ctx"])
+                    state["gpu_layers"] = local_runtime_overrides.get("gpu_layers", state["gpu_layers"])
+                    state["threads"] = local_runtime_overrides.get("threads", state["threads"])
+                    state["kv_cache_k"] = local_runtime_overrides.get("kv_cache_k", state["kv_cache_k"])
+                    state["kv_cache_v"] = local_runtime_overrides.get("kv_cache_v", state["kv_cache_v"])
                     save_config()
                     status_message = f"Saved {session_provider} / {session_model} as the default chat backend."
                     continue
@@ -758,7 +1945,10 @@ def register_other_commands(app: typer.Typer) -> None:
 
             transcript.append(("You", user_message))
             try:
-                reply = _run_chat(session_provider, session_model, session_base_url, user_message, session_system)
+                if session_provider == "valora-local":
+                    reply = _run_local_llama_cli(user_message, session_system, session_model, local_runtime_overrides)
+                else:
+                    reply = _run_chat(session_provider, session_model, session_base_url, user_message, session_system)
             except httpx.HTTPError as exc:
                 transcript.append(("System", f"Chat request failed: {exc}"))
                 status_message = "Request failed."
